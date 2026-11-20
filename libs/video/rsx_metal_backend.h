@@ -30,6 +30,25 @@
 extern "C" {
 #endif
 
+enum rsx_metal_aa_mode {
+    RSX_METAL_AA_OFF,
+    RSX_METAL_AA_FXAA,
+    RSX_METAL_AA_SMAA,
+};
+
+typedef struct rsx_metal_present_options {
+    enum rsx_metal_aa_mode aa;
+    float sharpen, vibrance, contrast;
+    unsigned post_scale_percent; /* 50..200; 100 is the native scanout size. */
+    int stretch;
+    int vsync;
+} rsx_metal_present_options;
+
+/* Queue options for the next register-file present. Thread-safe. A title
+ * that does not call this API keeps the environment-based defaults. */
+void rsx_metal_backend_set_present_options(const rsx_metal_present_options* options);
+int rsx_metal_backend_has_register_present(void);
+
 /* Create the device, surface and command queue, and register the backend with
  * the RSX command processor. Returns 0 on success, -1 on failure. */
 int  rsx_metal_backend_init(u32 width, u32 height, const char* title);

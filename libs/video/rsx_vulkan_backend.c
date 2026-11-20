@@ -1745,6 +1745,29 @@ static void vk_window_drop(const char* why)
     s_vk.windowed = 0;
 }
 
+/* Auto follows the desktop. Explicit sizes request an exact fullscreen
+ * display mode only when the window's current display advertises one. */
+static int vk_window_fullscreen(SDL_Window* window)
+{
+    const char* setting = getenv("PS3RECOMP_FULLSCREEN_SIZE");
+    unsigned w, h;
+    char extra;
+    if (setting && sscanf(setting, "%ux%u%c", &w, &h, &extra) == 2 &&
+        w >= 160 && h >= 90 && w <= 16384 && h <= 16384) {
+        const int display = SDL_GetWindowDisplayIndex(window);
+        SDL_DisplayMode requested = { .w = (int)w, .h = (int)h };
+        SDL_DisplayMode closest;
+        if (display >= 0 && SDL_GetClosestDisplayMode(display, &requested, &closest) &&
+            closest.w == requested.w && closest.h == requested.h &&
+            SDL_SetWindowDisplayMode(window, &closest) == 0 &&
+            SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN) == 0)
+            return 0;
+        SDL_SetWindowDisplayMode(window, NULL);
+        VK_LOG("fullscreen %ux%u unavailable; using desktop mode\n", w, h);
+    }
+    return SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+}
+
 static void vk_window_open(const char* title)
 {
     if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
@@ -1756,8 +1779,8 @@ static void vk_window_open(const char* title)
         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
         return;
     }
-    /* Resizable and maximizable; F11 or Alt+Enter switches to borderless fullscreen and back. The frame keeps its
-     * aspect ratio inside whatever size the window has (vk_window_fit). */
+    /* Resizable and maximizable; F11 or Alt+Enter switches to fullscreen and
+     * back. The frame is fitted to the swapchain extent by vk_window_fit. */
     const char* size = getenv("PS3RECOMP_WINDOW_SIZE");
     unsigned width = s_vk.width, height = s_vk.height;
     unsigned w, h;
@@ -1766,9 +1789,8 @@ static void vk_window_open(const char* title)
         width = w;
         height = h;
     }
-    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
-    /* PS3RECOMP_FULLSCREEN=1 (--fullscreen), the same for every backend; PS3RECOMP_VK_FULLSCREEN is the older name. */
-    if (vk_env_on("PS3RECOMP_FULLSCREEN") || vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    const Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+    const int fullscreen = vk_env_on("PS3RECOMP_FULLSCREEN") || vk_env_on("PS3RECOMP_VK_FULLSCREEN");
     s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
                                    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                    (int)width, (int)height, flags);
@@ -1780,7 +1802,10 @@ static void vk_window_open(const char* title)
         return;
     }
     SDL_SetWindowMinimumSize(s_vk.window, 320, 180);
-    if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) SDL_ShowCursor(SDL_DISABLE);
+    if (fullscreen) {
+        if (vk_window_fullscreen(s_vk.window) == 0) SDL_ShowCursor(SDL_DISABLE);
+        else VK_LOG("fullscreen failed; keeping window: %s\n", SDL_GetError());
+    }
     unsigned n = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
         !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {
@@ -4195,9 +4220,8 @@ int rsx_vulkan_backend_pump_messages(void)
         else if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
                  (e.key.keysym.sym == SDLK_F11 ||
                   (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
-            /* Borderless fullscreen on the window's display, and back. */
-            const int full = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
-            if (SDL_SetWindowFullscreen(s_vk.window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) == 0)
+            const int full = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_FULLSCREEN) != 0;
+            if ((full ? SDL_SetWindowFullscreen(s_vk.window, 0) : vk_window_fullscreen(s_vk.window)) == 0)
                 SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
             s_vk_resized = 1;
         } else if (e.type == SDL_WINDOWEVENT &&

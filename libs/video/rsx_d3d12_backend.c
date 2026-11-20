@@ -710,7 +710,11 @@ static HWND create_window(u32 width, u32 height, const char* title)
 static int d3d12_vsync_off(void)
 {
     static int off = -1;
-    if (off < 0) { const char* e = getenv("D3D12_VSYNC"); off = e && *e == '0'; }
+    if (off < 0) {
+        const char* e = getenv("PS3RECOMP_VSYNC");
+        if (!e) e = getenv("D3D12_VSYNC");
+        off = e && *e == '0';
+    }
     return off;
 }
 

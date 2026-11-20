@@ -99,7 +99,9 @@ static id                  s_window_close_observer;
 #endif
 /* The window's content size in device pixels, kept current by the message pump (main thread) and read
  * by the present path, which sizes the drawable to it. 0 until the first pump. */
-static volatile u32        s_win_px_w, s_win_px_h;
+static _Atomic u64         s_win_px;
+static _Atomic int         s_window_fullscreen;
+static u32                 s_fullscreen_w, s_fullscreen_h;
 static int                 s_ready;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
@@ -877,8 +879,12 @@ static int create_window_impl(const char* title)
         unsigned ww = 0, wh = 0;
         const char* ws = getenv("PS3RECOMP_WINDOW_SIZE");
         if (!ws) ws = getenv("PS3RECOMP_METAL_WINDOW");
-        if (ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 160 && wh >= 90 && ww <= 16384 && wh <= 16384)
-            frame.size = NSMakeSize((CGFloat)ww, (CGFloat)wh);
+        if (ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 160 && wh >= 90 && ww <= 16384 && wh <= 16384) {
+            const char* pixels = getenv("PS3RECOMP_WINDOW_PIXELS");
+            const CGFloat scale = pixels && !strcmp(pixels, "1")
+                ? fmax(1.0, [[NSScreen mainScreen] backingScaleFactor]) : 1.0;
+            frame.size = NSMakeSize((CGFloat)ww / scale, (CGFloat)wh / scale);
+        }
     }
     s_window = [[NSWindow alloc]
         initWithContentRect:frame
@@ -919,6 +925,15 @@ static int create_window_impl(const char* title)
     [view setWantsLayer:YES];
     [view setLayer:s_layer];
 
+    s_fullscreen_w = s_fullscreen_h = 0;
+    const char* output = getenv("PS3RECOMP_FULLSCREEN_SIZE");
+    unsigned fw, fh;
+    char extra;
+    if (output && sscanf(output, "%ux%u%c", &fw, &fh, &extra) == 2 &&
+        fw >= 160 && fh >= 90 && fw <= 8192 && fh <= 8192) {
+        s_fullscreen_w = fw;
+        s_fullscreen_h = fh;
+    }
     [s_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
     [s_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
@@ -2552,7 +2567,12 @@ static void release_surfaces(void)
  * groups" once the orphanage workload filled the D3D12 engine's ring. */
 #define ENG_STAGE_MAX    (384u << 20)
 
-static int s_eng_active;
+static _Atomic int s_eng_active;
+
+int rsx_metal_backend_has_register_present(void)
+{
+    return atomic_load_explicit(&s_eng_active, memory_order_relaxed);
+}
 /* Certificate for synchronous submissions used by depth readback. */
 static int s_eng_checked_completed;
 /* Owner-thread encoding failures remain sticky until backend reinitialization. */
@@ -2660,7 +2680,7 @@ static struct { MTLPixelFormat fmt; id<MTLRenderPipelineState> pso; } s_eng_clea
 static u32 s_eng_clear_pso_count;
 static id<MTLDepthStencilState>   s_eng_clear_ds[4];
 
-/* Post-processing in the present, read once; unset, the present is the plain
+/* Post-processing in the present; unset, the present is the plain
  * sample (and gamma) it always was.
  *   PS3_AA=fxaa        FXAA 3.11 (quality preset 29) on the display buffer,
  *                      at the guest's resolution, before the present
@@ -2679,6 +2699,23 @@ static int   s_eng_smaa;                 /* read with s_eng_fxaa */
 static float s_eng_sharpen = -1.0f;
 static float s_eng_vibrance = -2.0f;
 static float s_eng_contrast = -1.0f;
+static unsigned s_eng_post_scale;
+static id<MTLTexture> s_eng_post_source;
+static id<MTLRenderPipelineState> s_eng_post_resample;
+static MTLPixelFormat s_eng_post_resample_fmt;
+static pthread_mutex_t s_eng_post_lock = PTHREAD_MUTEX_INITIALIZER;
+static rsx_metal_present_options s_eng_post_pending;
+static _Atomic int s_eng_post_changed;
+
+void rsx_metal_backend_set_present_options(const rsx_metal_present_options* options)
+{
+    if (!options) return;
+    pthread_mutex_lock(&s_eng_post_lock);
+    s_eng_post_pending = *options;
+    atomic_store_explicit(&s_eng_post_changed, 1, memory_order_release);
+    pthread_mutex_unlock(&s_eng_post_lock);
+}
+
 static id<MTLRenderPipelineState> s_eng_fxaa_pso;
 static MTLPixelFormat             s_eng_fxaa_pso_fmt;
 static id<MTLTexture>             s_eng_fxaa_tex;
@@ -2721,12 +2758,37 @@ static void eng_post_options(void)
     if (s_eng_sharpen < 0.0f) s_eng_sharpen = eng_sharpen_from(getenv("PS3_SHARPEN"));
     if (s_eng_vibrance < -1.0f) s_eng_vibrance = eng_vibrance_from(getenv("PS3_VIBRANCE"));
     if (s_eng_contrast < 0.0f) s_eng_contrast = eng_contrast_from(getenv("PS3_CONTRAST"));
+    if (!s_eng_post_scale) {
+        const char* scale = getenv("PS3_POST_SCALE");
+        const long percent = scale ? strtol(scale, NULL, 10) : 100;
+        s_eng_post_scale = percent >= 50 && percent <= 200 ? (unsigned)percent : 100;
+    }
+    int changed = 0;
+    if (atomic_load_explicit(&s_eng_post_changed, memory_order_acquire)) {
+        pthread_mutex_lock(&s_eng_post_lock);
+        const rsx_metal_present_options next = s_eng_post_pending;
+        atomic_store_explicit(&s_eng_post_changed, 0, memory_order_relaxed);
+        pthread_mutex_unlock(&s_eng_post_lock);
+        s_eng_fxaa = next.aa == RSX_METAL_AA_FXAA;
+        s_eng_smaa = next.aa == RSX_METAL_AA_SMAA;
+        s_eng_sharpen = fminf(fmaxf(next.sharpen, 0.0f), 1.0f);
+        s_eng_vibrance = fminf(fmaxf(next.vibrance, -1.0f), 1.0f);
+        s_eng_contrast = fminf(fmaxf(next.contrast, 0.5f), 1.5f);
+        s_eng_post_scale = next.post_scale_percent >= 50 && next.post_scale_percent <= 200
+            ? next.post_scale_percent : 100;
+        s_stretch = next.stretch != 0;
+        if (s_layer) s_layer.displaySyncEnabled = next.vsync != 0;
+        changed = 1;
+    }
     static int logged;
-    if (!logged++ && (s_eng_fxaa || s_eng_smaa || s_eng_sharpen > 0.0f ||
-                      s_eng_vibrance != 0.0f || s_eng_contrast != 1.0f))
-        fprintf(stderr, "[RSX metal] present: AA %s, sharpen %.2f, vibrance %.2f, contrast %.2f\n",
+    if (changed || (!logged && (s_eng_fxaa || s_eng_smaa || s_eng_sharpen > 0.0f ||
+                                s_eng_vibrance != 0.0f || s_eng_contrast != 1.0f ||
+                                s_eng_post_scale != 100)))
+        fprintf(stderr, "[RSX metal] present: AA %s, sharpen %.2f, vibrance %.2f, contrast %.2f, post scale %u%%, aspect %s, vsync %s\n",
                 s_eng_fxaa ? "FXAA" : s_eng_smaa ? "SMAA" : "off", (double)s_eng_sharpen,
-                (double)s_eng_vibrance, (double)s_eng_contrast);
+                (double)s_eng_vibrance, (double)s_eng_contrast, s_eng_post_scale,
+                s_stretch ? "stretch" : "fit", s_layer && s_layer.displaySyncEnabled ? "on" : "off");
+    logged = 1;
 }
 
 static NSString* const kEngHelperMSL = @
@@ -3127,6 +3189,8 @@ static void eng_shutdown(void* user)
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
     s_eng_helper_lib = nil;
     s_eng_blit_pso = nil;
+    s_eng_post_source = nil;
+    s_eng_post_resample = nil;
     s_eng_depth_pso = nil;
     s_eng_depth_color_pso[0] = s_eng_depth_color_pso[1] = nil;
     s_eng_depth_color_failed = 0;
@@ -4409,12 +4473,68 @@ static id<MTLTexture> eng_smaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
     return s_eng_smaa_out;
 }
 
+/* Resize the post-processing work surface before the AA passes. Guest
+ * geometry, render targets, pitches, and readbacks keep their RSX dimensions. */
+static id<MTLTexture> eng_resample_scanout(id<MTLCommandBuffer> cb, id<MTLTexture> src)
+{
+    if (s_eng_post_scale == 100) {
+        s_eng_post_source = nil;
+        return src;
+    }
+    const MTLPixelFormat format = [src pixelFormat];
+    if (!s_eng_post_resample || s_eng_post_resample_fmt != format) {
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_blit_fs"];
+        pd.colorAttachments[0].pixelFormat = format;
+        NSError* error = nil;
+        s_eng_post_resample = [s_dev newRenderPipelineStateWithDescriptor:pd error:&error];
+        if (!s_eng_post_resample) {
+            static u32 warned;
+            if (PS3_LOG_FIRST(warned, 4))
+                fprintf(stderr, "[RSX metal] post scale pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            return src;
+        }
+        s_eng_post_resample_fmt = format;
+    }
+    const NSUInteger w = ([src width] * s_eng_post_scale + 50) / 100;
+    const NSUInteger h = ([src height] * s_eng_post_scale + 50) / 100;
+    if (!w || !h || w > 8192 || h > 8192) return src;
+    const int resized = !s_eng_post_source || [s_eng_post_source width] != w ||
+                        [s_eng_post_source height] != h || [s_eng_post_source pixelFormat] != format;
+    s_eng_post_source = eng_smaa_target(s_eng_post_source, format, w, h);
+    if (!s_eng_post_source) {
+        static u32 warned;
+        if (PS3_LOG_FIRST(warned, 4))
+            fprintf(stderr, "[RSX metal] could not allocate post surface %lux%lu\n",
+                    (unsigned long)w, (unsigned long)h);
+        return src;
+    }
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = s_eng_post_source;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> encoder = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!encoder) return src;
+    [encoder setRenderPipelineState:s_eng_post_resample];
+    [encoder setFragmentTexture:src atIndex:0];
+    [encoder setFragmentSamplerState:s_eng_linear_sampler atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+    if (resized)
+        fprintf(stderr, "[RSX metal] post surface %lux%lu (scanout %lux%lu)\n",
+                (unsigned long)w, (unsigned long)h,
+                (unsigned long)[src width], (unsigned long)[src height]);
+    return s_eng_post_source;
+}
+
 /* Put a surface on the drawable. A straight blit would need matching formats
  * and sizes; a full-screen sample needs neither, and the guest's surfaces are
  * routinely a different size from the window.
  *
  * With PS3_AA=fxaa (or smaa) the surface goes through FXAA (or SMAA) first,
- * at its own size; with PS3_SHARPEN this pass sharpens it as it samples, and
+ * at the post surface size; with PS3_SHARPEN this pass sharpens it as it samples, and
  * PS3_VIBRANCE / PS3_CONTRAST adjust it before the gamma. Any one that is off
  * or fails is skipped. */
 static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
@@ -4422,6 +4542,8 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
 {
     if (!src || !dst || !s_eng_helper_lib) return;
     eng_post_options();
+    const double sw = (double)[src width], sh = (double)[src height];
+    src = eng_resample_scanout(cb, src);
     if (s_eng_fxaa) { id<MTLTexture> t = eng_fxaa(cb, src); if (t) src = t; }
     else if (s_eng_smaa) { id<MTLTexture> t = eng_smaa(cb, src); if (t) src = t; }
     if (!s_eng_blit_pso || s_eng_blit_pso_fmt != [dst pixelFormat]) {
@@ -4448,15 +4570,24 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     /* The default window fit preserves aspect with black bars. Stretch
      * covers the drawable, as do the fixed-size headless and host targets. */
     const double dw = (double)[dst width], dh = (double)[dst height];
-    const double sw = (double)[src width], sh = (double)[src height];
     const int fixed = s_headless || s_host;
     const int fill = fixed || s_stretch;
-    const double fit = fmin(dw / sw, dh / sh);
-    const double vw = fill ? dw : floor(sw * fit + 0.5), vh = fill ? dh : floor(sh * fit + 0.5);
+    /* An explicit fullscreen drawable may have a different aspect from the
+     * screen. Fit in view pixels, then map back into the drawable. AppKit's
+     * compositor scales the drawable to the view after this pass. */
+    const u64 view_size = s_layer && !fixed
+        ? atomic_load_explicit(&s_win_px, memory_order_relaxed) : 0;
+    const u32 view_w = (u32)(view_size >> 32), view_h = (u32)view_size;
+    const double pw = view_w && view_h ? view_w : dw;
+    const double ph = view_w && view_h ? view_h : dh;
+    const double fit = fmin(pw / sw, ph / sh);
+    const double vw = fill ? dw : floor(sw * fit * dw / pw + 0.5);
+    const double vh = fill ? dh : floor(sh * fit * dh / ph + 0.5);
     [e setViewport:(MTLViewport){floor((dw - vw) * 0.5), floor((dh - vh) * 0.5), vw, vh, 0.0, 1.0}];
     [e setRenderPipelineState:s_eng_blit_pso];
     [e setFragmentTexture:src atIndex:0];
-    const int scaled = !fixed && (vw != sw || vh != sh);   /* a resized window filters; 1:1 and the fixed targets stay point-sampled */
+    const int scaled = (s_eng_post_scale != 100 || !fixed) &&
+                       (vw != (double)[src width] || vh != (double)[src height]);
     [e setFragmentSamplerState:(scaled ? s_default_sampler : s_eng_point_sampler) atIndex:0];
     /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
      * setting): out = in^gamma, as RPCS3's calibration pass applies it. The
@@ -4505,9 +4636,13 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 }
                 dst = s_host_tex[host_slot];
             } else {
-                /* The drawable is the window's size in device pixels, so the compositor does not
-                 * stretch it; eng_blit_to_display fits the game picture into it. */
-                const u32 ww = s_win_px_w, wh = s_win_px_h;
+                eng_post_options();
+                /* Fullscreen can request a fixed drawable while AppKit keeps the
+                 * monitor mode. Otherwise match the view's device-pixel extent. */
+                const u64 size = atomic_load_explicit(&s_win_px, memory_order_relaxed);
+                const int fullscreen = atomic_load_explicit(&s_window_fullscreen, memory_order_relaxed);
+                const u32 ww = fullscreen && s_fullscreen_w ? s_fullscreen_w : (u32)(size >> 32);
+                const u32 wh = fullscreen && s_fullscreen_h ? s_fullscreen_h : (u32)size;
                 const CGSize cur = s_layer.drawableSize;
                 if (ww && wh && ((u32)cur.width != ww || (u32)cur.height != wh)) {
                     s_layer.drawableSize = CGSizeMake((CGFloat)ww, (CGFloat)wh);
@@ -4934,8 +5069,10 @@ static int pump_messages_impl(void)
         if (s_window) {
             NSView* v = [s_window contentView];
             const NSSize px = [v convertSizeToBacking:[v bounds].size];
-            s_win_px_w = (u32)px.width;
-            s_win_px_h = (u32)px.height;
+            const int fullscreen = ([s_window styleMask] & NSWindowStyleMaskFullScreen) != 0;
+            atomic_store_explicit(&s_win_px, ((u64)(u32)px.width << 32) | (u32)px.height,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&s_window_fullscreen, fullscreen, memory_order_relaxed);
         }
     }
 #endif

@@ -96,6 +96,29 @@ int main(void)
         present(in, out, AA_OFF, 0.0f);
         assert(!memcmp(in, out, sizeof in));
 
+        /* The live setting changes the work surface and a return to native
+         * releases it. A flat input and its alpha survive both resamples. */
+        {
+            static px4 flat[W * H];
+            for (int i = 0; i < W * H; ++i) grey(flat[i], 90, 128);
+            rsx_metal_present_options pending = {
+                .aa = RSX_METAL_AA_OFF, .contrast = 1.0f, .post_scale_percent = 200,
+            };
+            rsx_metal_backend_set_present_options(&pending);
+            present(flat, out, AA_OFF, 0.0f);
+            assert(s_eng_post_source.width == W * 2 && s_eng_post_source.height == H * 2);
+            assert(!memcmp(flat, out, sizeof flat));
+            pending.post_scale_percent = 50;
+            rsx_metal_backend_set_present_options(&pending);
+            present(flat, out, AA_OFF, 0.0f);
+            assert(s_eng_post_source.width == W / 2 && s_eng_post_source.height == H / 2);
+            assert(!memcmp(flat, out, sizeof flat));
+            pending.post_scale_percent = 100;
+            rsx_metal_backend_set_present_options(&pending);
+            present(flat, out, AA_OFF, 0.0f);
+            assert(!s_eng_post_source && !memcmp(flat, out, sizeof flat));
+        }
+
         /* FXAA: pixels on the staircase take in-between values, pixels two or
          * more away from any edge do not change, and alpha is kept. */
         present(in, out, AA_FXAA, 0.0f);
