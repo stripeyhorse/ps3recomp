@@ -1428,8 +1428,9 @@ static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
       long i = n++;
       if (i < NW_MAX)
           fprintf(stderr, "[null-write] guest wrote%d 0x%X to 0x%08X (NULL+0x%X)"
-                          " by guest-fn=0x%08X -- DROPPED\n",
-                  width * 8, v, a, a, ppu_prof_resolve_host(ra));
+                          " by guest-fn=0x%08X r2=%08X -- DROPPED\n",
+                  width * 8, v, a, a, ppu_prof_resolve_host(ra),
+                  g_active_ctx ? (unsigned)g_active_ctx->gpr[2] : 0u);
       else if (i == NW_MAX)
           fprintf(stderr, "[null-write] further stores into the null page are"
                           " dropped without a word\n");
@@ -1659,8 +1660,9 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     static long s_n = 0;
     if (!PS3_LOG_FIRST(s_n, 16)) return;
     const uint32_t fn = ppu_prof_resolve_host(ra);
-    fprintf(stderr, "[null-read] guest read%d from 0x%08X (NULL+0x%X) by guest-fn=0x%08X%s" "\n",
-            width * 8, a, a, fn, s_n == 16 ? "  [further NULL reads not reported]" : "");
+    fprintf(stderr, "[null-read] guest read%d from 0x%08X (NULL+0x%X) by guest-fn=0x%08X%s r2=%08X\n",
+            width * 8, a, a, fn, s_n == 16 ? "  [further NULL reads not reported]" : "",
+            g_active_ctx ? (unsigned)g_active_ctx->gpr[2] : 0u);
     /* PS3_NULL_READ_STACK=1: guest-fn is the nearest host symbol, which can
      * name a neighbour; the guest call chain names the reader. Once for each
      * of the first four distinct guest-fn values. */
@@ -2653,14 +2655,13 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
       } }
     { static int bc=-2; if(bc==-2) bc=getenv("PS3_BREADCRUMB")?1:0;
       if(bc){ unsigned t=(unsigned)ctx->thread_id & 63; g_bc_last[t]=(uint32_t)ctx->ctr; g_bc_cnt[t]++; } }
-#ifdef _WIN32
+    /* PPU_TOCWATCH works on POSIX too: win32_backtrace.h shims RtlCaptureStackBackTrace and GetModuleHandleA. */
     { static int64_t tw=-2; if(tw==-2){const char*e=getenv("PPU_TOCWATCH"); tw=e?(int64_t)strtoul(e,0,16):-1;}
       if(tw>=0 && (uint32_t)ctx->gpr[2]==(uint32_t)tw){ static int _n=0; if(PS3_LOG_FIRST(_n, 4)){
         char* mb=(char*)GetModuleHandleA(0); void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
         char ln[800]; int p=snprintf(ln,sizeof ln,"[TOCWATCH] r2=0x%08X ctr=0x%08X bt:",(uint32_t)ctx->gpr[2],(uint32_t)ctx->ctr);
         for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
         fprintf(stderr,"%s\n",ln); } } }
-#endif
     uint32_t addr = (uint32_t)ctx->ctr;
     if (g_icall_target_set) { addr = g_icall_target; g_icall_target_set = 0; }
     /* PS3_CALLTRACE=N: log the first N indirect calls (target + r3/r4) --
@@ -2706,8 +2707,8 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
          * setScreenRenderTarget(this, NULL) exactly once and the caller is the
          * only way to find where that null config came from. */
         char _fromw[64]; ppu_guest_caller(_fromw, sizeof _fromw);
-        fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X r5=%lld lr=0x%08X from=%s tid=%llu\n",
-                addr,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],
+        fprintf(stderr,"[CALL] -> 0x%08X r2=0x%08X r3=0x%08X r4=0x%08X r5=%lld lr=0x%08X from=%s tid=%llu\n",
+                addr,(uint32_t)ctx->gpr[2],(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],
                 (long long)(int32_t)ctx->gpr[5], (uint32_t)ctx->lr, _fromw,
                 (unsigned long long)ctx->thread_id);
         /* r28-r31 usually hold the caller's object pointers; for a virtual
