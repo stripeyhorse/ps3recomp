@@ -1,14 +1,16 @@
 /*
- * ps3recomp - C11 timespec_get for MinGW-w64 on msvcrt
+ * ps3recomp - C11 timespec_get on older host C libraries
  *
  * The UCRT has timespec_get and TIME_UTC; msvcrt.dll does not, and a MinGW-w64
  * <time.h> targeting it declares neither, so SPU_INTERP_STATS (spu_interp.c) and
  * SPU_JOBPROF (spu_workload.c) did not compile. Both only subtract two
  * readings, so this returns QueryPerformanceCounter time (monotonic, not UTC).
+ * Older POSIX headers (including the FreeBSD 9 SDK for Prospero) also lack
+ * timespec_get. Their CLOCK_REALTIME provides the C11 TIME_UTC time base.
  * Include after <time.h> and, if the file uses it, after <windows.h>.
  */
-#ifndef PS3RECOMP_MINGW_TIMESPEC_GET_H
-#define PS3RECOMP_MINGW_TIMESPEC_GET_H
+#ifndef PS3RECOMP_TIMESPEC_GET_COMPAT_H
+#define PS3RECOMP_TIMESPEC_GET_COMPAT_H
 #include <time.h>
 #if defined(__MINGW32__) && !defined(_UCRT) && !defined(TIME_UTC)
 #define TIME_UTC 1
@@ -33,6 +35,13 @@ static inline int ps3_timespec_get(struct timespec* ts, int base)
     ts->tv_sec = (time_t)(c / f);
     ts->tv_nsec = (long)((c % f) * 1000000000LL / f);
     return base;
+}
+#define timespec_get ps3_timespec_get
+#elif !defined(_WIN32) && !defined(TIME_UTC)
+#define TIME_UTC 1
+static inline int ps3_timespec_get(struct timespec* ts, int base)
+{
+    return base == TIME_UTC && clock_gettime(CLOCK_REALTIME, ts) == 0 ? base : 0;
 }
 #define timespec_get ps3_timespec_get
 #endif

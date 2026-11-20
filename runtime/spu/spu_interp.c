@@ -6,7 +6,7 @@
  * bit-identical. Uncommon opcodes trap loudly (never silently wrong).
  */
 #include <time.h>
-#include "../platform/mingw_timespec_get.h"   /* timespec_get on msvcrt MinGW */
+#include "../platform/timespec_get_compat.h"   /* timespec_get on older host C libraries */
 #include "spu_interp.h"
 #include "spu_helpers.h"
 #include <stdio.h>
