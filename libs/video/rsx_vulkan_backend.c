@@ -2,7 +2,7 @@
  * ps3recomp - Vulkan RSX Backend. See rsx_vulkan_backend.h.
  *
  * The file, in order:
- *   loader and device      libvulkan by dlopen, Vulkan 1.0 entry points only;
+ *   loader and device      platform loader, Vulkan 1.0 entry points only;
  *                          device choice, BC textures when the device has them
  *   memory, images, submit helpers
  *   vtable fallback path   the null backend's fixed-function contract:
@@ -13,7 +13,7 @@
  *                          rsx_texture_decode(); depth test, no blend/stencil
  *   vtable guest programs  the same path running the decompilers' HLSL, with
  *                          whole mip chains and per-unit samplers
- *   optional window        SDL2 + swapchain; a present blits the frame into it
+ *   optional window        platform surface + swapchain; a present blits the frame into it
  *   draw engine backend    rsx_draw_backend: targets, clears, present and
  *                          readback (E1), pipelines and draws (E2), textures,
  *                          surface views and samplers (E3), depth snapshots
@@ -44,6 +44,7 @@
 #include <vulkan/vulkan.h>
 
 #include "rsx_vulkan_backend.h"
+#include "rsx_vulkan_platform.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
 #include "rsx_vp_decompiler.h"
@@ -53,12 +54,6 @@
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
-/* SDL2 is already required off Windows (cellPad, cellAudio); here it only
- * opens the optional window. Same include style as those two. */
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_vulkan.h>
-
-#include <dlfcn.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -147,7 +142,6 @@ typedef struct vk_image {
 #define VK_PIPELINE_SLOTS (2 * 2 * 8)   /* ztest x zwrite x compare op */
 
 typedef struct vk_state {
-    void*            lib;
     VkInstance       instance;
     VkPhysicalDevice phys;
     VkDevice         device;
@@ -220,9 +214,7 @@ typedef struct vk_state {
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
     int              stretch, no_vsync;
-    SDL_Window*      window;
-    const char*      inst_exts[16];
-    u32              inst_ext_count;
+    rsx_vk_output    output;
     VkSurfaceKHR     surface;
     VkSwapchainKHR   swapchain;
     VkExtent2D       sc_extent;
@@ -242,7 +234,7 @@ typedef struct vk_state {
 
 static vk_state s_vk;
 
-#define VK_LOG(...)  fprintf(stderr, "[RSX vulkan] " __VA_ARGS__)
+#define VK_LOG RSX_VK_LOG
 #define VK_CHECK(call, what)                                               \
     do { VkResult r_ = (call);                                             \
          if (r_ != VK_SUCCESS) {                                           \
@@ -252,18 +244,10 @@ static vk_state s_vk;
 /* ---------------------------------------------------------------------------
  * Loading
  * -------------------------------------------------------------------------*/
-static int vk_load_library(void)
+static int vk_load_global_functions(void)
 {
-    static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
-    for (size_t i = 0; i < sizeof names / sizeof names[0] && !s_vk.lib; i++)
-        s_vk.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
-    if (!s_vk.lib) {
-        VK_LOG("no Vulkan loader found (dlopen libvulkan.so.1: %s)\n", dlerror());
-        return -1;
-    }
-    pvkGetInstanceProcAddr =
-        (PFN_vkGetInstanceProcAddr)dlsym(s_vk.lib, "vkGetInstanceProcAddr");
-    if (!pvkGetInstanceProcAddr) { VK_LOG("libvulkan has no vkGetInstanceProcAddr\n"); return -1; }
+    pvkGetInstanceProcAddr = rsx_vk_platform_load();
+    if (!pvkGetInstanceProcAddr) return -1;
 #define LOAD_G(name) \
     if (!(p##name = (PFN_##name)pvkGetInstanceProcAddr(VK_NULL_HANDLE, #name))) \
         { VK_LOG("missing global function " #name "\n"); return -1; }
@@ -317,7 +301,7 @@ static int vk_device_rank(VkPhysicalDeviceType t)
     }
 }
 
-static int vk_find_graphics_queue(VkPhysicalDevice pd, u32* family)
+static int vk_find_graphics_queue(VkPhysicalDevice pd, VkSurfaceKHR surface, u32* family)
 {
     u32 n = 0;
     pvkGetPhysicalDeviceQueueFamilyProperties(pd, &n, NULL);
@@ -326,9 +310,9 @@ static int vk_find_graphics_queue(VkPhysicalDevice pd, u32* family)
     pvkGetPhysicalDeviceQueueFamilyProperties(pd, &n, props);
     for (u32 i = 0; i < n; i++) {
         if (!(props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-        if (s_vk.windowed) {           /* the same queue must also present */
+        if (surface) {                 /* the same queue must also present */
             VkBool32 ok = VK_FALSE;
-            if (pvkGetPhysicalDeviceSurfaceSupportKHR(pd, i, s_vk.surface, &ok) != VK_SUCCESS || !ok)
+            if (pvkGetPhysicalDeviceSurfaceSupportKHR(pd, i, surface, &ok) != VK_SUCCESS || !ok)
                 continue;
         }
         *family = i; return 0;
@@ -359,12 +343,24 @@ static int vk_pick_device(void)
     VK_CHECK(pvkEnumeratePhysicalDevices(s_vk.instance, &n, devs), "vkEnumeratePhysicalDevices");
 
     int best = -1, best_rank = -1;
+    const int per_device = s_vk.windowed && s_vk.output.surface_per_device;
+    VkSurfaceKHR best_surface = s_vk.surface;
     const char* forced = getenv("PS3RECOMP_VK_DEVICE");
     for (u32 i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         pvkGetPhysicalDeviceProperties(devs[i], &p);
+        VkSurfaceKHR surface = s_vk.surface;
+        if (per_device) {
+            char why[256];
+            if (rsx_vk_platform_create_surface(pvkGetInstanceProcAddr, s_vk.instance, devs[i],
+                                               &surface, why, sizeof why)) {
+                VK_LOG("device %u: %s -- cannot create display surface: %s\n",
+                       i, p.deviceName, why);
+                continue;
+            }
+        }
         u32 fam;
-        int usable = vk_find_graphics_queue(devs[i], &fam) == 0 &&
+        int usable = vk_find_graphics_queue(devs[i], surface, &fam) == 0 &&
                      (!s_vk.windowed ||
                       vk_has_device_extension(devs[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME));
         VK_LOG("device %u: %s (type %d, api %u.%u.%u)%s\n", i, p.deviceName,
@@ -372,13 +368,17 @@ static int vk_pick_device(void)
                VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion),
                usable ? "" : (s_vk.windowed ? " -- cannot present to the window"
                                             : " -- no graphics queue"));
-        if (!usable) continue;
-        if (forced) {
-            if ((u32)atoi(forced) == i) { best = (int)i; break; }
-            continue;
-        }
         int rank = vk_device_rank(p.deviceType);
-        if (rank > best_rank) { best = (int)i; best_rank = rank; }
+        if (usable && (forced ? (u32)atoi(forced) == i : rank > best_rank)) {
+            if (per_device && best_surface)
+                pvkDestroySurfaceKHR(s_vk.instance, best_surface, NULL);
+            best_surface = surface;
+            best = (int)i;
+            best_rank = rank;
+            if (forced) break;
+        } else if (per_device) {
+            pvkDestroySurfaceKHR(s_vk.instance, surface, NULL);
+        }
     }
     if (best < 0) {
         if (forced) VK_LOG("PS3RECOMP_VK_DEVICE=%s is not a usable device\n", forced);
@@ -386,7 +386,8 @@ static int vk_pick_device(void)
         return -1;
     }
     s_vk.phys = devs[best];
-    vk_find_graphics_queue(s_vk.phys, &s_vk.queue_family);
+    s_vk.surface = best_surface;
+    vk_find_graphics_queue(s_vk.phys, s_vk.surface, &s_vk.queue_family);
     pvkGetPhysicalDeviceMemoryProperties(s_vk.phys, &s_vk.memprops);
     VkPhysicalDeviceProperties p;
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
@@ -563,7 +564,7 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
 static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
 {
     pthread_mutex_lock(&s_vk.queue_mu);
-    const VkResult r = pvkQueuePresentKHR(s_vk.queue, pi);
+    const VkResult r = rsx_vk_platform_present(pvkQueuePresentKHR, s_vk.queue, pi);
     pthread_mutex_unlock(&s_vk.queue_mu);
     return r;
 }
@@ -1706,17 +1707,11 @@ static void vk_cb_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 /* ---------------------------------------------------------------------------
  * Optional window: PS3RECOMP_VK_WINDOW=1
  *
- * An SDL2 window with a Vulkan swapchain. Rendering still targets the
+ * An optional output with a Vulkan swapchain. Rendering still targets the
  * offscreen image, so readback and every test are unchanged; a present then
  * also blits that image into the next swapchain image. Any failure on this
  * path drops back to headless with a message instead of failing the run.
  * -------------------------------------------------------------------------*/
-static int vk_env_on(const char* name)
-{
-    const char* v = getenv(name);
-    return v && v[0] && v[0] != '0';
-}
-
 static void vk_window_drop(const char* why)
 {
     if (why) VK_LOG("window disabled, continuing headless: %s\n", why);
@@ -1733,11 +1728,7 @@ static void vk_window_drop(const char* why)
     }
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
-    if (s_vk.window) {
-        SDL_DestroyWindow(s_vk.window);
-        SDL_QuitSubSystem(SDL_INIT_VIDEO);
-    }
-    s_vk.window = NULL;
+    rsx_vk_platform_output_close();
     s_vk.surface = VK_NULL_HANDLE;
     s_vk.swapchain = VK_NULL_HANDLE;
     s_vk.sem_acquire = VK_NULL_HANDLE;
@@ -1745,80 +1736,16 @@ static void vk_window_drop(const char* why)
     s_vk.windowed = 0;
 }
 
-/* Auto follows the desktop. Explicit sizes request an exact fullscreen
- * display mode only when the window's current display advertises one. */
-static int vk_window_fullscreen(SDL_Window* window)
-{
-    const char* setting = getenv("PS3RECOMP_FULLSCREEN_SIZE");
-    unsigned w, h;
-    char extra;
-    if (setting && sscanf(setting, "%ux%u%c", &w, &h, &extra) == 2 &&
-        w >= 160 && h >= 90 && w <= 16384 && h <= 16384) {
-        const int display = SDL_GetWindowDisplayIndex(window);
-        SDL_DisplayMode requested = { .w = (int)w, .h = (int)h };
-        SDL_DisplayMode closest;
-        if (display >= 0 && SDL_GetClosestDisplayMode(display, &requested, &closest) &&
-            closest.w == requested.w && closest.h == requested.h &&
-            SDL_SetWindowDisplayMode(window, &closest) == 0 &&
-            SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN) == 0)
-            return 0;
-        SDL_SetWindowDisplayMode(window, NULL);
-        VK_LOG("fullscreen %ux%u unavailable; using desktop mode\n", w, h);
-    }
-    return SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
-}
-
 static void vk_window_open(const char* title)
 {
-    if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
+    if (rsx_vk_platform_output_open(title, s_vk.width, s_vk.height, &s_vk.output)) return;
+    s_vk.windowed = 1;
     const char* aspect = getenv("PS3RECOMP_ASPECT");
     s_vk.stretch = aspect && !strcmp(aspect, "stretch");
     const char* vsync = getenv("PS3RECOMP_VSYNC");
     s_vk.no_vsync = vsync && !strcmp(vsync, "0");
-    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
-        VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
-        return;
-    }
-    /* Resizable and maximizable; F11 or Alt+Enter switches to fullscreen and
-     * back. The frame is fitted to the swapchain extent by vk_window_fit. */
-    const char* size = getenv("PS3RECOMP_WINDOW_SIZE");
-    unsigned width = s_vk.width, height = s_vk.height;
-    unsigned w, h;
-    if (size && sscanf(size, "%ux%u", &w, &h) == 2 &&
-        w >= 160 && h >= 90 && w <= 16384 && h <= 16384) {
-        width = w;
-        height = h;
-    }
-    const Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
-    const int fullscreen = vk_env_on("PS3RECOMP_FULLSCREEN") || vk_env_on("PS3RECOMP_VK_FULLSCREEN");
-    s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
-                                   SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                   (int)width, (int)height, flags);
-    s_vk.windowed = 1;          /* so vk_window_drop also shuts SDL video down */
-    if (!s_vk.window) {
-        char why[256];
-        snprintf(why, sizeof why, "SDL_CreateWindow failed: %s", SDL_GetError());
-        vk_window_drop(why);
-        return;
-    }
-    SDL_SetWindowMinimumSize(s_vk.window, 320, 180);
-    if (fullscreen) {
-        if (vk_window_fullscreen(s_vk.window) == 0) SDL_ShowCursor(SDL_DISABLE);
-        else VK_LOG("fullscreen failed; keeping window: %s\n", SDL_GetError());
-    }
-    unsigned n = 0;
-    if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
-        !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {
-        char why[256];
-        snprintf(why, sizeof why, "no Vulkan surface extensions (%s)", SDL_GetError());
-        vk_window_drop(why);
-        return;
-    }
-    s_vk.inst_ext_count = n;
     const char* hold = getenv("PS3RECOMP_VK_HOLD");
     s_vk.hold_seconds = hold ? atof(hold) : 0.0;
-    VK_LOG("window: SDL video driver '%s', %u surface extension(s)\n",
-           SDL_GetCurrentVideoDriver(), n);
 }
 
 /* 0 on success, 1 when the window has no drawable area right now (the old swapchain is kept), -1 on failure. */
@@ -1858,9 +1785,7 @@ static int vk_create_swapchain(void)
 
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == 0xFFFFFFFFu) {
-        int w = 0, hh = 0;
-        SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &hh);
-        ext.width = (u32)w; ext.height = (u32)hh;
+        ext = rsx_vk_platform_drawable_extent(s_vk.phys);
         if (ext.width  < caps.minImageExtent.width)  ext.width  = caps.minImageExtent.width;
         if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
         if (ext.width  > caps.maxImageExtent.width)  ext.width  = caps.maxImageExtent.width;
@@ -1938,18 +1863,9 @@ static int vk_create_swapchain(void)
  * Also set while the window is minimized, when there is no drawable area to make one for. */
 static int s_vk_resized;
 
-/* Minimized, or no drawable area: nothing can be presented, and a swapchain cannot be created for it. */
-static int vk_window_hidden(void)
-{
-    int w = 0, h = 0;
-    if (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_MINIMIZED) return 1;
-    SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &h);
-    return w <= 0 || h <= 0;
-}
-
 static void vk_swapchain_lost(void)
 {
-    if (vk_window_hidden()) { s_vk_resized = 1; return; }   /* recreated once it is shown again */
+    if (rsx_vk_platform_output_hidden()) { s_vk_resized = 1; return; }   /* recreated once it is shown again */
     vk_device_idle();
     const int r = vk_create_swapchain();
     s_vk_resized = r > 0;     /* the surface is 0x0 before SDL reports the window minimized */
@@ -1979,7 +1895,7 @@ static vk_rect vk_window_fit(void)
 static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
-    if (vk_window_hidden()) return;
+    if (rsx_vk_platform_output_hidden()) return;
     if (s_vk_resized) {
         vk_swapchain_lost();
         if (!s_vk.windowed || s_vk_resized) return;
@@ -4007,7 +3923,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
       s_vk.dump_every = (e && atoi(e) > 0) ? (u32)atoi(e) : 1; }
 
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
-    if (vk_load_library()) return -1;
+    if (vk_load_global_functions()) return -1;
 
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                               .pApplicationName = "ps3recomp", .pEngineName = "ps3recomp RSX",
@@ -4015,8 +3931,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                                 .pApplicationInfo = &app };
     if (s_vk.windowed) {
-        ci.enabledExtensionCount   = s_vk.inst_ext_count;
-        ci.ppEnabledExtensionNames = s_vk.inst_exts;
+        ci.enabledExtensionCount   = s_vk.output.extension_count;
+        ci.ppEnabledExtensionNames = s_vk.output.extensions;
     }
     VkResult ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
     if (ir != VK_SUCCESS && s_vk.windowed) {
@@ -4030,10 +3946,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed) {
         if (vk_load_wsi_instance_functions()) {
             vk_window_drop("the driver has no surface functions");
-        } else if (!SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, &s_vk.surface)) {
+        } else if (!s_vk.output.surface_per_device) {
             char why[256];
-            snprintf(why, sizeof why, "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
-            vk_window_drop(why);
+            if (rsx_vk_platform_create_surface(pvkGetInstanceProcAddr, s_vk.instance, VK_NULL_HANDLE,
+                                               &s_vk.surface, why, sizeof why))
+                vk_window_drop(why);
         }
     }
     if (vk_pick_device()) {
@@ -4176,13 +4093,13 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed && s_vk.swapchain && s_vk.presented && s_vk.hold_seconds > 0.0) {
         VK_LOG("holding the last frame on screen for %.1f s "
                "(Esc or closing the window ends it early)\n", s_vk.hold_seconds);
-        const Uint32 end = SDL_GetTicks() + (Uint32)(s_vk.hold_seconds * 1000.0);
-        while (s_vk.windowed && !SDL_TICKS_PASSED(SDL_GetTicks(), end)) {
+        const u32 end = rsx_vk_platform_ticks() + (u32)(s_vk.hold_seconds * 1000.0);
+        while (s_vk.windowed && (int32_t)(end - rsx_vk_platform_ticks()) > 0) {
             if (rsx_vulkan_backend_pump_messages() != 0) break;
             vk_present_window();         /* FIFO: paced by the display */
         }
     }
-    if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
+    if (s_vk.windowed) vk_window_drop(NULL);
     if (s_vk.device) {
         vk_device_idle();
         vk_guest_shutdown();
@@ -4212,7 +4129,7 @@ void rsx_vulkan_backend_shutdown(void)
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
-    if (s_vk.lib) dlclose(s_vk.lib);
+    rsx_vk_platform_unload();
     free(s_vk.cpu_verts);
     pthread_mutex_destroy(&s_vk.queue_mu);
     pthread_mutex_destroy(&s_vk.present_mu);
@@ -4222,25 +4139,7 @@ void rsx_vulkan_backend_shutdown(void)
 int rsx_vulkan_backend_pump_messages(void)
 {
     if (!s_vk.windowed) return 0;
-    int quit = 0;
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_QUIT) quit = 1;
-        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
-        else if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
-                 (e.key.keysym.sym == SDLK_F11 ||
-                  (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
-            const int full = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_FULLSCREEN) != 0;
-            if ((full ? SDL_SetWindowFullscreen(s_vk.window, 0) : vk_window_fullscreen(s_vk.window)) == 0)
-                SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
-            s_vk_resized = 1;
-        } else if (e.type == SDL_WINDOWEVENT &&
-                   (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESTORED ||
-                    e.window.event == SDL_WINDOWEVENT_MAXIMIZED)) {
-            s_vk_resized = 1;
-        }
-    }
-    return quit ? -1 : 0;
+    return rsx_vk_platform_pump_messages(&s_vk_resized);
 }
 
 void rsx_vulkan_backend_present(void)

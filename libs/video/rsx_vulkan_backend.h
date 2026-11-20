@@ -21,7 +21,8 @@
  * Rendering is offscreen; a present reads the frame back (the host's pixel
  * checks), optionally dumps it, and optionally shows it in a window.
  *
- * Vulkan is loaded at run time (dlopen of libvulkan.so.1), not linked, so:
+ * The Linux platform adapter loads Vulkan at run time (dlopen of
+ * libvulkan.so.1), so:
  *   - building needs only the Vulkan headers, not a target-arch libvulkan
  *     (which is what makes cross-compiling for aarch64 straightforward);
  *   - a machine with no Vulkan loader fails init() cleanly instead of failing
@@ -61,11 +62,11 @@ extern "C" {
 #endif
 
 /* Load Vulkan, create the device and the offscreen target, and register as
- * the RSX backend. `title` is only logged (no window at V0).
+ * the RSX backend. `title` is also the SDL window title when enabled.
  * Returns 0 on success, -1 on any failure (reason printed to stderr). */
 int  rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
 
-/* Unregister and destroy every Vulkan object, then unload the library. */
+/* Unregister and destroy every Vulkan object, then release the loader. */
 void rsx_vulkan_backend_shutdown(void);
 
 /* Headless: always 0. Windowed: drains SDL's event queue; -1 once the

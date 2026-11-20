@@ -48,7 +48,7 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
 option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
-list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_(backend|platform_sdl)\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
     if(WIN32 OR APPLE)
         message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
@@ -59,7 +59,9 @@ if(PS3RECOMP_RSX_VULKAN)
             "libvulkan-dev, Fedora: vulkan-headers -- or pass "
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
     endif()
-    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+    list(APPEND HLE_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_platform_sdl.c")
     # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
 endif()
