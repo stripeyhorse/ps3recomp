@@ -585,6 +585,15 @@ static void spurs_api_unlock(struct SpursInst* si)
     ReleaseSRWLockExclusive(&si->lock);
 }
 
+/* Workload APIs return policy-module errors, whose low byte agrees with
+ * the core errors used by the shared instance lock. */
+static s32 workload_error(s32 core_error)
+{
+    return core_error ? (s32)((u32)core_error + 0x100u) : CELL_OK;
+}
+
+enum { WKL_RUNNABLE = 2, WKL_SHUTTING_DOWN = 3, WKL_REMOVABLE = 4 };
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
 static int spurs_guest_range_valid(u32 ea, u32 bytes);
 
@@ -1601,14 +1610,14 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
                          u32 maxContention)
 {
     if (!spurs || !wid)
-        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+        return workload_error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
     maxContention = spurs_clamp_contention(maxContention);
     /* spurs/wid/priority are guest EAs; pm stays a guest EA (it's the SPU
      * program address consumed later by the workload dispatch). */
     uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
     struct SpursInst* si;
     s32 lock_rc = spurs_api_lock(spurs_ea, &si);
-    if (lock_rc) return lock_rc;
+    if (lock_rc) return workload_error(lock_rc);
     const u8* priority_h = GUEST_PTR(priority, const u8*);
 
 
@@ -1665,7 +1674,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
     }
 
     spurs_api_unlock(si);
-    return CELL_SPURS_CORE_ERROR_NOMEM;
+    return workload_error(CELL_SPURS_CORE_ERROR_NOMEM);
 }
 
 /* Real (BE) CellSpursWorkloadAttribute offsets (libspurs layout; the game's
@@ -1864,20 +1873,20 @@ s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea, u64 nameIns
 
 s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
 {
-    if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= SPURS_MAX_WID) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (!spurs) return workload_error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (wid >= SPURS_MAX_WID) return workload_error(CELL_SPURS_CORE_ERROR_INVAL);
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
-    if (rc) return rc;
+    if (rc) return workload_error(rc);
     if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
+        spurs_api_unlock(si); return workload_error(CELL_SPURS_CORE_ERROR_SRCH);
     }
 
     if (si->active[wid] || spurs_policy_release_workload(si->ea, wid)) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_BUSY;
+        spurs_api_unlock(si); return workload_error(CELL_SPURS_CORE_ERROR_BUSY);
     }
     s_workloads[wid].in_use = 0;
-    vm_write8(si->ea + wkl_state_off(wid), 3);
+    vm_write8(si->ea + wkl_state_off(wid), 0);
     vm_write32(si->ea + SPURS_WKL_ENABLED,
                vm_read32(si->ea + SPURS_WKL_ENABLED) & ~(0x80000000u >> wid));
     spurs_scheduler_forget(wid);
@@ -2005,6 +2014,9 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         AcquireSRWLockExclusive(&si->lock);
         u32 wid = slot->wid;
         if (si->active[wid]) si->active[wid]--;
+        u32 state_ea = slot->ea + wkl_state_off(wid);
+        if (!si->active[wid] && vm_read8(state_ea) == WKL_SHUTTING_DOWN)
+            vm_write8(state_ea, WKL_REMOVABLE);
         spu_lockline_lock();
         wkl_count_set(slot->ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
         ef_line_end(slot->ea);
@@ -3486,16 +3498,43 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
 
 s32 cellSpursShutdownWorkload(u64 spurs_ea, u32 wid)
 {
-    static int _n = 0;
-    if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] ShutdownWorkload(wid=%u)\n", wid);
+    if (!spurs_ea) return workload_error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (wid >= SPURS_MAX_WID) return workload_error(CELL_SPURS_CORE_ERROR_INVAL);
+    struct SpursInst* si;
+    s32 rc = spurs_api_lock((u32)spurs_ea, &si);
+    if (rc) return workload_error(rc);
+    const u32 state_ea = si->ea + wkl_state_off(wid);
+    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
+        spurs_api_unlock(si);
+        return workload_error(CELL_SPURS_CORE_ERROR_SRCH);
+    }
+    if (vm_read8(state_ea) == WKL_RUNNABLE)
+        vm_write8(state_ea, si->active[wid] ? WKL_SHUTTING_DOWN : WKL_REMOVABLE);
+    spurs_api_unlock(si);
     return CELL_OK;
 }
 
 s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid)
 {
-    static int _n = 0;
-    if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] WaitForWorkloadShutdown(wid=%u)\n", wid);
-    return CELL_OK;
+    if (!spurs_ea) return workload_error(CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    if (wid >= SPURS_MAX_WID) return workload_error(CELL_SPURS_CORE_ERROR_INVAL);
+    struct SpursInst* si;
+    s32 rc = spurs_api_lock((u32)spurs_ea, &si);
+    if (rc) return workload_error(rc);
+    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
+        spurs_api_unlock(si);
+        return workload_error(CELL_SPURS_CORE_ERROR_SRCH);
+    }
+    // Worker completion needs the instance lock, and the coordinator probes
+    // under both locks. Drop the registry lock before waiting.
+    ReleaseSRWLockExclusive(&s_workload_registry_lock);
+    const u32 state_ea = (u32)spurs_ea + wkl_state_off(wid);
+    while (si->ea == (u32)spurs_ea && si->kernel_live && !si->stopping &&
+           vm_read8(state_ea) == WKL_SHUTTING_DOWN)
+        SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+    const int stopped = si->ea == (u32)spurs_ea && vm_read8(state_ea) == WKL_REMOVABLE;
+    ReleaseSRWLockExclusive(&si->lock);
+    return stopped ? CELL_OK : workload_error(CELL_SPURS_CORE_ERROR_STAT);
 }
 
 /* =========================================================================

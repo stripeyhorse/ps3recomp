@@ -171,12 +171,19 @@ int main(void)
     }
     for(unsigned i=0;i<3;i++)wait_for(&held[i],1,"configured capacity");
     Sleep(20);assert(atomic_load(&peak_count)==3 && atomic_load(&lane_mask)==7);
-    assert((u32)cellSpursRemoveWorkload((CellSpurs*)0x1000,0)==CELL_SPURS_CORE_ERROR_BUSY);
+    assert((u32)cellSpursRemoveWorkload((CellSpurs*)0x1000,0)==0x8041080A);
+    assert(cellSpursShutdownWorkload(0x1000,0)==0);
+    assert(vm_read8(0x1000+SPURS_WKL_STATE1)==WKL_SHUTTING_DOWN);
     assert(cellSpursSetMaxContention((CellSpurs*)0x1000,0,0)==0);
     assert(vm_read8(0x1000+SPURS_WKL_MAXCONT)==0);
     assert(!atomic_load(&held[3]));
     for(unsigned i=0;i<3;i++)assert(atomic_load(&held[i])==1);
     atomic_store(&gate,1);
+    assert(cellSpursWaitForWorkloadShutdown(0x1000,0)==0);
+    assert(vm_read8(0x1000+SPURS_WKL_STATE1)==WKL_REMOVABLE);
+    assert(cellSpursRemoveWorkload((CellSpurs*)0x1000,0)==0);
+    assert(vm_read8(0x1000+SPURS_WKL_STATE1)==0);
+    assert((u32)cellSpursWaitForWorkloadShutdown(0x1000,0)==0x80410805);
     for(unsigned i=0;i<4;i++)wait_for(&done[i],1,"release and next admission");
     finalize(0x1000);puts("SPURS configured capacity / maxContention / stable physical slots / reinit PASS");
 
@@ -199,7 +206,7 @@ int main(void)
         wait_for(&incarnation_runs,incarnation+1,"same policy/data workload incarnation");
         for(unsigned i=0;;i++) {
             s32 rc=cellSpursRemoveWorkload((CellSpurs*)0x1000,0);
-            if(!rc)break;assert((u32)rc==CELL_SPURS_CORE_ERROR_BUSY && i<3000);Sleep(1);
+            if(!rc)break;assert((u32)rc==0x8041080A && i<3000);Sleep(1);
         }
     }
     finalize(0x1000);puts("SPURS removal retires resident LS even with unchanged policy/data PASS");
