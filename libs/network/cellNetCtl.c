@@ -25,6 +25,7 @@
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <ifaddrs.h>
