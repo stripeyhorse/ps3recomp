@@ -13,13 +13,15 @@ void ppu_resv_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
 
-enum { BODY_WRITE_THEN_BLOCK = 1, BODY_WRITE_THEN_RETURN, BODY_SPIN_UNTIL_RELEASED };
+enum { BODY_WRITE_THEN_BLOCK = 1, BODY_WRITE_THEN_RETURN, BODY_SPIN_UNTIL_RELEASED, BODY_CLEAR_PENDING };
 
 /* Long enough that a creator which does not wait reads the word before it is written, even on a loaded runner. */
 #define PUBLISH_DELAY_MS 50
 
 static int g_published;   /* what a thread writes before it blocks (stands in for the event queue key) */
 static int g_release;     /* lets a BODY_SPIN_UNTIL_RELEASED thread end */
+static int g_pending;     /* PAIN's GameContent/SysCacheCreate word: the creator stores 1 after create, the worker 0 */
+static long long g_child_entered_ms;
 
 static void sleep_ms(long ms) { struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
 static long long now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000; }
@@ -39,6 +41,10 @@ static void guest_entry(ppu_context* ctx)
         break;
     case BODY_SPIN_UNTIL_RELEASED: /* never reaches a wait the runtime sees */
         while (!__atomic_load_n(&g_release, __ATOMIC_ACQUIRE)) sleep_ms(1);
+        break;
+    case BODY_CLEAR_PENDING:       /* a worker with nothing to load: reports done at once */
+        __atomic_store_n(&g_child_entered_ms, now_ms(), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_pending, 0, __ATOMIC_RELEASE);
         break;
     }
     ctx->gpr[3] = 0;
@@ -88,9 +94,25 @@ static void finish_case(void)
     __atomic_store_n(&g_published, 0, __ATOMIC_RELAXED);
 }
 
+/* The creator side of PAIN's boot handshake: create, publish "pending" (after the host has had time to run the child
+ * to completion), then poll with a wait syscall. Returns the word once the child has had its turn. */
+static int creator_publishes_after_create(int32_t priority)
+{
+    __atomic_store_n(&g_pending, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_child_entered_ms, 0, __ATOMIC_RELAXED);
+    create(priority, BODY_CLEAR_PENDING);
+    sleep_ms(20);                                   /* a free host core runs the child here */
+    __atomic_store_n(&g_pending, 1, __ATOMIC_RELEASE);
+    ppu_thread_note_block(1);                       /* sys_timer_usleep in the poll loop */
+    for (int i = 0; i < 1000 && __atomic_load_n(&g_pending, __ATOMIC_ACQUIRE); i++) sleep_ms(1);
+    finish_case();
+    return __atomic_load_n(&g_pending, __ATOMIC_ACQUIRE);
+}
+
 int main(void)
 {
     const int on = getenv("PS3_PRIO_START") != NULL;
+    const int cf = getenv("PS3_CREATOR_FIRST") != NULL;
     vm_base = calloc(1, 0x10000); assert(vm_base);
     g_vm_stack_alloc.next_addr = 0x10000000u;   /* the guest stack region the threads bump-allocate from */
     g_vm_stack_alloc.region_end = 0xA0000000u;
@@ -144,9 +166,38 @@ int main(void)
     EXPECT(__atomic_load_n(&g_published, __ATOMIC_RELAXED) == on);
     finish_case();
 
+    /* 6. PS3_CREATOR_FIRST: an equal or lower priority child enters guest code only after the creator's next block,
+     *    so the creator's "pending" lands before the child's "done". Without it the child's 0 is overwritten. */
+    set_main_priority(1001);
+    EXPECT(creator_publishes_after_create(1001) == (cf ? 0 : 1));
+    EXPECT(creator_publishes_after_create(1500) == (cf ? 0 : 1));
+    /* A higher-priority child is not held back for the creator. */
+    __atomic_store_n(&g_child_entered_ms, 0, __ATOMIC_RELAXED);
+    {
+        const long long t0 = now_ms();
+        create(400, BODY_CLEAR_PENDING);
+        for (int i = 0; i < 1000 && !__atomic_load_n(&g_child_entered_ms, __ATOMIC_RELAXED); i++) sleep_ms(1);
+        EXPECT(__atomic_load_n(&g_child_entered_ms, __ATOMIC_RELAXED) - t0 < 100);
+        finish_case();
+    }
+    /* 7. A creator that never blocks holds its child back for the cap only. */
+    {
+        __atomic_store_n(&g_child_entered_ms, 0, __ATOMIC_RELAXED);
+        const long long t0 = now_ms();
+        create(1001, BODY_CLEAR_PENDING);
+        for (int i = 0; i < 2000 && !__atomic_load_n(&g_child_entered_ms, __ATOMIC_RELAXED); i++) sleep_ms(1);
+        const long long ms = __atomic_load_n(&g_child_entered_ms, __ATOMIC_RELAXED) - t0;
+        if (cf) EXPECT(ms >= CREATOR_FIRST_TIMEOUT_MS - 5 && ms < CREATOR_FIRST_TIMEOUT_MS + 300);
+        else    EXPECT(ms < 100);
+        finish_case();
+    }
+
     free(vm_base);
-    if (g_fails) { fprintf(stderr, "%d check(s) failed (PS3_PRIO_START %s)\n", g_fails, on ? "on" : "off"); return 1; }
+    if (g_fails) { fprintf(stderr, "%d check(s) failed (PS3_PRIO_START %s, PS3_CREATOR_FIRST %s)\n", g_fails,
+                           on ? "on" : "off", cf ? "on" : "off"); return 1; }
     printf("PASS: PS3_PRIO_START %s\n", on ? "on: a higher-priority thread runs until it blocks"
                                           : "off: sys_ppu_thread_create never waits");
+    printf("PASS: PS3_CREATOR_FIRST %s\n", cf ? "on: an equal/lower-priority child starts after its creator blocks"
+                                             : "off: a child starts at once (the lost-pending interleave reproduces)");
     return 0;
 }

@@ -54,6 +54,9 @@ typedef struct ppu_thread_info {
     uint64_t     tls_addr;
     uint32_t     prof_pc;      /* last syscall/HLE callsite (sampling profiler) */
     int          blocked;      /* reached a blocking call (ppu_thread_note_block); atomic access only */
+    uint64_t     block_seq;    /* blocking calls reached so far (ppu_thread_note_block); atomic access only */
+    uint64_t     gate_creator; /* PS3_CREATOR_FIRST: tid whose next block releases this thread's guest entry (0: none) */
+    uint64_t     gate_seq;     /* the creator's block_seq when it created this thread */
 
 #ifdef _WIN32
     HANDLE       host_thread;
@@ -102,6 +105,11 @@ uint64_t ppu_thread_register_main(void);
  * With PS3_PRIO_START=1, sys_ppu_thread_create waits for it on a thread it has just made at a higher priority than
  * the creator's, as lv2's scheduler would run that thread first. */
 void ppu_thread_note_block(uint64_t tid);
+/* Creator-first start (PS3_CREATOR_FIRST=1, or this call; off by default). A thread created at the same or a lower
+ * priority than its creator does not enter guest code until the creator reaches its next blocking call, or ends, or
+ * CREATOR_FIRST_TIMEOUT_MS passes. lv2 returns from sys_ppu_thread_create to the creator; host threads let the child
+ * finish first, and a creator that publishes "pending" after the create then overwrites the child's "done". */
+void ppu_thread_set_creator_first(int on);
 /* Set the executable's validated PROC_PARAM priority before main dispatch. */
 uint64_t ppu_thread_register_main_priority(int32_t priority);
 int64_t sys_ppu_thread_exit(ppu_context* ctx);

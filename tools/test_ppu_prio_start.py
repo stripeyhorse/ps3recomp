@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PS3_PRIO_START through the real sys_ppu_thread.c: run once with the option and once without."""
+"""PS3_PRIO_START and PS3_CREATOR_FIRST through the real sys_ppu_thread.c, in all four combinations."""
 import os
 from pathlib import Path
 import subprocess
@@ -17,9 +17,10 @@ with tempfile.TemporaryDirectory(prefix='ppu-prio-start-') as tmp:
         '-I'+str(root/'include'),'-I'+str(root/'runtime'),'-I'+str(root/'runtime/syscalls'),
         str(root/'tests/test_ppu_prio_start.c'),*linker,'-o',str(binary)],check=True)
     quiet=subprocess.PIPE if os.environ.get('CI') else None
-    for on in (False, True):
-        env={k:v for k,v in os.environ.items() if k!='PS3_PRIO_START'}
+    for on, cf in ((False, False), (True, False), (False, True), (True, True)):
+        env={k:v for k,v in os.environ.items() if k not in ('PS3_PRIO_START','PS3_CREATOR_FIRST')}
         if on: env['PS3_PRIO_START']='1'
+        if cf: env['PS3_CREATOR_FIRST']='1'
         result=subprocess.run([str(binary)],timeout=60,env=env,stderr=quiet,text=True)
         if result.returncode and result.stderr:
             sys.stderr.write(result.stderr)

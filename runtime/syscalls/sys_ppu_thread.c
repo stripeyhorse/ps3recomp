@@ -135,10 +135,42 @@ static int prio_start_enabled(void)
 void ppu_thread_note_block(uint64_t tid)
 {
     if (tid == 0 || tid > PPU_THREAD_MAX) return;
-    int* blocked = &g_ppu_threads[tid - 1].blocked;
+    ppu_thread_info* t = &g_ppu_threads[tid - 1];
+    /* Release: what the thread wrote before this wait is visible to a creator-first child released by it. */
+    __atomic_add_fetch(&t->block_seq, 1, __ATOMIC_RELEASE);
+    int* blocked = &t->blocked;
     /* Load first: the wait syscalls call this on every wait, and most threads blocked long ago. */
     if (!__atomic_load_n(blocked, __ATOMIC_RELAXED))
         __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
+}
+
+/* ---------------------------------------------------------------------------
+ * Creator-first start (PS3_CREATOR_FIRST=1 or ppu_thread_set_creator_first; off by default)
+ *
+ * sys_ppu_thread_create returns to its creator. A child at the same or a lower priority cannot take the creator's
+ * place, and real guest workers spend milliseconds on disc I/O before they report back, so a creator that writes
+ * "pending" after the create returns always gets there first on hardware. PAIN (BCES00548) does exactly that twice
+ * during boot: GameContent stores 2 and SysCacheCreate stores 1 right after creating the worker that stores 0 when it
+ * is done, then both poll with sys_timer_usleep. A host worker that finishes first has its 0 overwritten and the boot
+ * polls forever. With this option such a child waits at its guest entry until the creator reaches its next blocking
+ * call (any ppu_thread_note_block), ends, or CREATOR_FIRST_TIMEOUT_MS passes -- the cap keeps a creator that spins
+ * without a syscall waiting on its child from deadlocking. Higher-priority children keep PS3_PRIO_START's behaviour.
+ * -----------------------------------------------------------------------*/
+#define CREATOR_FIRST_TIMEOUT_MS 200
+
+static int s_creator_first = -1;
+
+void ppu_thread_set_creator_first(int on) { __atomic_store_n(&s_creator_first, on ? 1 : 0, __ATOMIC_RELAXED); }
+
+static int creator_first_enabled(void)
+{
+    int on = __atomic_load_n(&s_creator_first, __ATOMIC_RELAXED);
+    if (on < 0) {
+        const char* v = getenv("PS3_CREATOR_FIRST");
+        on = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+        __atomic_store_n(&s_creator_first, on, __ATOMIC_RELAXED);
+    }
+    return on;
 }
 
 /* Priority the creator runs at. Must be called under the table lock. Main
@@ -168,6 +200,27 @@ static void wait_first_block(const ppu_thread_info* t, uint64_t tid)
     }
     fprintf(stderr, "[SYS] PS3_PRIO_START: tid=%llu \"%s\" (prio %d) did not block within %d ms; its creator goes on\n",
             (unsigned long long)tid, t->name, t->priority, PRIO_START_TIMEOUT_MS);
+}
+
+/* Runs on the child's host thread before its guest entry. The acquire load pairs with the creator's release in
+ * ppu_thread_note_block, so the creator's stores before that block (its "pending" word) happen before the child's. */
+static void wait_creator_block(const ppu_thread_info* t)
+{
+    const uint64_t creator = t->gate_creator;
+    if (creator == 0 || creator > PPU_THREAD_MAX) return;
+    const ppu_thread_info* c = &g_ppu_threads[creator - 1];
+    const ULONGLONG start = GetTickCount64();
+    for (;;) {
+        if (__atomic_load_n(&c->block_seq, __ATOMIC_ACQUIRE) != t->gate_seq) return;
+        const int state = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
+        if (state == PPU_THREAD_STATE_FINISHED || state == PPU_THREAD_STATE_FREE) return;
+        const ULONGLONG waited = GetTickCount64() - start;
+        if (waited >= CREATOR_FIRST_TIMEOUT_MS) break;
+        if (waited < PRIO_START_SPIN_MS) SwitchToThread();
+        else                             Sleep(1);
+    }
+    fprintf(stderr, "[SYS] PS3_CREATOR_FIRST: tid=%llu \"%s\": creator tid=%llu did not block within %d ms; starting\n",
+            (unsigned long long)t->ctx.thread_id, t->name, (unsigned long long)creator, CREATOR_FIRST_TIMEOUT_MS);
 }
 
 /* ---------------------------------------------------------------------------
@@ -201,6 +254,8 @@ static void* ppu_host_thread_proc(void* param)
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
             (unsigned long long)info->entry_addr, (unsigned long)GetCurrentThreadId());
+
+    wait_creator_block(info);   /* PS3_CREATOR_FIRST */
 
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
@@ -528,6 +583,15 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     t->stack_addr = stack_addr;
     t->stack_size = stack_size;
     t->entry_addr = entry;
+    /* PS3_CREATOR_FIRST: an equal/lower-priority child enters guest code after the creator's next block. Recorded
+     * before the host thread exists, so the child reads it without the table lock. */
+    if (creator_first_enabled() && ctx->thread_id != thread_id) {
+        const ppu_thread_info* c = find_thread(ctx->thread_id);
+        if (c && priority >= c->priority) {
+            t->gate_creator = ctx->thread_id;
+            t->gate_seq = __atomic_load_n(&c->block_seq, __ATOMIC_ACQUIRE);
+        }
+    }
 
     /* Copy thread name if provided */
     if (name_addr != 0) {
