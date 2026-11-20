@@ -111,6 +111,11 @@ uint8_t* prx_image_load_file(const char* path, uint32_t* out_size);
  */
 uint32_t prx_resolve_export(uint32_t nid);
 
+/* Clear exports still owned by this module. A port serializes registry
+ * writers and keeps the image alive until in-flight guest calls have ended.
+ * Readers may resolve exports concurrently with publication or removal. */
+void prx_unpublish_exports(uint32_t base, const prx_export* exports, uint32_t export_count);
+
 /* Number of exports currently registered (diagnostics/tests). */
 uint32_t prx_export_registry_count(void);
 

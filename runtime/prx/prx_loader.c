@@ -7,6 +7,7 @@
 #include "prx_loader.h"
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,36 +20,62 @@ extern uint8_t* vm_base;
  * Flat NID -> guest-address table, filled as modules load. A handful of system
  * PRXs export a few hundred symbols total, so a linear array with linear lookup
  * is plenty (lookups happen once per import resolution, not per call). */
-typedef struct { uint32_t nid; uint32_t guest_addr; } prx_export_reg_entry;
+typedef struct { uint32_t nid; _Atomic uint32_t guest_addr; } prx_export_reg_entry;
 #define PRX_EXPORT_REG_CAP 2048
 static prx_export_reg_entry s_export_reg[PRX_EXPORT_REG_CAP];
-static uint32_t             s_export_reg_n = 0;
+static _Atomic uint32_t     s_export_reg_n = 0;
 
 static void prx_export_register(uint32_t nid, uint32_t guest_addr)
 {
     /* Last writer wins if two modules export the same NID (matches the PS3
      * loader's link order). Overwrite an existing entry rather than duplicate. */
-    for (uint32_t i = 0; i < s_export_reg_n; i++) {
+    uint32_t count = atomic_load_explicit(&s_export_reg_n, memory_order_relaxed);
+    for (uint32_t i = 0; i < count; i++) {
         if (s_export_reg[i].nid == nid) {
-            s_export_reg[i].guest_addr = guest_addr;
+            atomic_store_explicit(&s_export_reg[i].guest_addr, guest_addr, memory_order_release);
             return;
         }
     }
-    if (s_export_reg_n < PRX_EXPORT_REG_CAP)
-        s_export_reg[s_export_reg_n++] = (prx_export_reg_entry){ nid, guest_addr };
-    else
+    if (count < PRX_EXPORT_REG_CAP) {
+        s_export_reg[count].nid = nid;
+        atomic_store_explicit(&s_export_reg[count].guest_addr, guest_addr, memory_order_relaxed);
+        atomic_store_explicit(&s_export_reg_n, count + 1, memory_order_release);
+    } else
         fprintf(stderr, "[prx] export registry full, dropping NID 0x%08X\n", nid);
 }
 
 uint32_t prx_resolve_export(uint32_t nid)
 {
-    for (uint32_t i = 0; i < s_export_reg_n; i++)
+    uint32_t count = atomic_load_explicit(&s_export_reg_n, memory_order_acquire);
+    for (uint32_t i = 0; i < count; i++)
         if (s_export_reg[i].nid == nid)
-            return s_export_reg[i].guest_addr;
+            return atomic_load_explicit(&s_export_reg[i].guest_addr, memory_order_acquire);
     return 0;
 }
 
-uint32_t prx_export_registry_count(void) { return s_export_reg_n; }
+uint32_t prx_export_registry_count(void)
+{
+    uint32_t active = 0;
+    uint32_t count = atomic_load_explicit(&s_export_reg_n, memory_order_acquire);
+    for (uint32_t i = 0; i < count; i++)
+        active += atomic_load_explicit(&s_export_reg[i].guest_addr, memory_order_acquire) != 0;
+    return active;
+}
+
+void prx_unpublish_exports(uint32_t base, const prx_export* exports, uint32_t export_count)
+{
+    uint32_t count = atomic_load_explicit(&s_export_reg_n, memory_order_relaxed);
+    for (uint32_t j = 0; j < export_count; j++) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (s_export_reg[i].nid != exports[j].nid)
+                continue;
+            uint32_t addr = base + exports[j].vaddr;
+            atomic_compare_exchange_strong_explicit(&s_export_reg[i].guest_addr,
+                &addr, 0, memory_order_release, memory_order_relaxed);
+            break;
+        }
+    }
+}
 
 prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
 {
