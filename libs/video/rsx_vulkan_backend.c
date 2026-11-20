@@ -45,6 +45,8 @@
 
 #include "rsx_vulkan_backend.h"
 #include "rsx_vulkan_platform.h"
+#define VK_DUMP_LOG RSX_VK_LOG
+#include "rsx_vk_dump.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
 #include "rsx_vp_decompiler.h"
@@ -231,6 +233,7 @@ typedef struct vk_state {
     u32              presented;
     const char*      dump_path;
     u32              dump_every;       /* write every nth presented frame */
+    vk_dump_q        dump_q;           /* bounded queue + writer thread */
 } vk_state;
 
 static vk_state s_vk;
@@ -1984,12 +1987,7 @@ static void vk_present_window(void)
 
 static void vk_dump_ppm(const unsigned char* rgba)
 {
-    FILE* f = fopen(s_vk.dump_path, "wb");
-    if (!f) { VK_LOG("cannot open %s for the frame dump\n", s_vk.dump_path); return; }
-    fprintf(f, "P6\n%u %u\n255\n", s_vk.width, s_vk.height);
-    for (size_t i = 0; i < (size_t)s_vk.width * s_vk.height; i++)
-        fwrite(rgba + i * 4, 1, 3, f);
-    fclose(f);
+    vk_dump_enqueue(&s_vk.dump_q, s_vk.dump_path, s_vk.width, s_vk.height, rgba);
 }
 
 /* ---------------------------------------------------------------------------
@@ -4142,6 +4140,7 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
     rsx_vk_platform_unload();
     free(s_vk.cpu_verts);
+    vk_dump_shutdown(&s_vk.dump_q);
     pthread_mutex_destroy(&s_vk.queue_mu);
     pthread_mutex_destroy(&s_vk.present_mu);
     memset(&s_vk, 0, sizeof s_vk);
