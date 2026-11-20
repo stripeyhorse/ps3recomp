@@ -21,6 +21,17 @@ typedef void (*spu_dispatch_fn)(spu_context*);
 spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
 void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
 
+/* musttail is a clang attribute; GCC errors on it. Same guard the lifter's
+ * generated spu_recomp.h uses (SPU_TAILCALL). On non-clang the plain
+ * call+return relies on the compiler's sibling-call optimization, which GCC
+ * applies to this exact shape (single call, immediate return, void, shared
+ * signature). */
+#if defined(__clang__)
+#  define SPU_MT_TAILCALL(call) __attribute__((musttail)) return call
+#else
+#  define SPU_MT_TAILCALL(call) do { call; return; } while (0)
+#endif
+
 void spu_indirect_branch_mt(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK;
@@ -62,9 +73,9 @@ void spu_indirect_branch_mt(spu_context* ctx)
         if (!fn) fn = spu_lookup(pc, ctx->image_id);
         if (fn) {
             ctx->pc = pc;
-            __attribute__((musttail)) return fn(ctx);
+            SPU_MT_TAILCALL(fn(ctx));
         }
     }
     /* slow / special path: full resolver (diagnostics, intercepts, miss log) */
-    __attribute__((musttail)) return spu_indirect_branch(ctx);
+    SPU_MT_TAILCALL(spu_indirect_branch(ctx));
 }
