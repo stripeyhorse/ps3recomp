@@ -4699,9 +4699,25 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                             b = [x.strip() for x in w2.operands.split(',')]
                             if not b or b[0] != _src[0] or w2.mnemonic.startswith(('st', 'lf')):
                                 continue
-                            if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
-                                disp = mem_disp(b[1]); r_base = cand
-                                base_is_ld = (w2.mnemonic == 'ld')
+                            if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(' in b[1]:
+                                src_disp = mem_disp(b[1])
+                                src_base = b[1].split('(')[1].rstrip(')').strip()
+                                if src_base == 'r2':
+                                    disp = src_disp; r_base = cand
+                                    base_is_ld = w2.mnemonic == 'ld'
+                                else:
+                                    # The spilled address can itself come from a
+                                    # TOC-indirect load (e.g. a table field in an
+                                    # animation decoder's globals).
+                                    for parent in reversed([x for x in win_cand if x.addr < w2.addr]):
+                                        c = [x.strip() for x in parent.operands.split(',')]
+                                        if not c or c[0] != src_base or parent.mnemonic.startswith(('st', 'lf')):
+                                            continue
+                                        if parent.mnemonic in ('lwz', 'ld') and len(c) == 2 and '(r2)' in c[1]:
+                                            disp = mem_disp(c[1]); r_base = cand
+                                            base_is_ld = parent.mnemonic == 'ld'
+                                            disp2 = src_disp; disp2_is_ld = w2.mnemonic == 'ld'
+                                        break
                             break               # nearest definition wins, TOC load or not
                 elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(' in a[1]:
                     # TWO-LEVEL base: `lwz r30, d1(r2); lwz r11, d2(r30)`. The

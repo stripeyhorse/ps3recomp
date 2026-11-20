@@ -371,6 +371,7 @@ def main() -> int:
     test_multi_toc_prefers_targets_near_the_dispatcher()
     test_bound_compare_beyond_window()
     test_spilled_base_reused_as_target()
+    test_spilled_toc_indirect_base()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
         return 1
@@ -426,6 +427,19 @@ def test_spilled_base_reused_as_target():
     # A store to a different slot is not the spill: no base, no table.
     words[1] = w_std(10, 1, 0x2D8)
     check("reload of a slot nothing stored is not a base", discover(words, mem), None)
+
+
+def test_spilled_toc_indirect_base():
+    """A table pointer loaded through a TOC global, then spilled to r1."""
+    table, global_ea = 0x11000, 0x81000
+    mem = {TOC + 16: global_ea, global_ea - 8: table,
+           table: 0x100, table + 4: 0x200, table + 8: 0x300}
+    words = [w_lwz(30, 2, 16), w_lwz(7, 30, -8), w_std(7, 1, 0xD0),
+             w_cmplwi(7, 0, 2), w_ld(8, 1, 0xD0), w_slwi(9, 0, 2),
+             w_lwzx(0, 9, 8), w_add(8, 0, 8), w_mtctr(8), w_bctr()]
+    check("spilled TOC-indirect base", discover(words, mem), [0x11100, 0x11200, 0x11300])
+    words[1] = w_lwz(7, 29, -8)
+    check("uninitialized parent cannot produce a table", discover(words, mem), None)
 
 
 if __name__ == "__main__":
