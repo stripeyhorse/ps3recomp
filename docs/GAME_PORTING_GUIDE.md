@@ -532,6 +532,40 @@ Determine how the game uses SPUs:
    - Check for `cellSpursInitialize`, `cellSpursCreateTask` calls
    - The SPURS HLE handles management; actual SPU tasks need attention
 
+   **Raw SPURS policy modules.** A title's first `cellSpursAddWorkload`
+   may pass a *raw* policy-module image (not an ELF, so
+   `extract_spu_images.py` never sees it): the runtime logs
+   `[cellSpurs] wid=N PM NOT LIFTED (fp=...) -- workload will not run`
+   and the workload retries forever. The image lives in the PPU ELF's
+   data at the guest address the log names as `pm=`. The recipe, proven
+   on a retail title:
+
+   ```bash
+   # 1. carve the raw bytes out of the PPU ELF at the logged guest address
+   #    (translate guest va -> file offset with your PT_LOAD manifest)
+   # 2. wrap as a loadable SPU ELF at the PM load base -- the runtime
+   #    loads PMs at LS 0xA00:
+   python tools/wrap_spu_elf.py pm.bin --base 0xA00 --entry 0xA00 \
+          --out pm.elf
+   # 3. find functions and lift
+   python tools/find_spu_functions.py pm.elf --out pm.functions.json
+   python tools/spu_lifter.py pm.elf --auto-functions pm.elf \
+          --output <port>/spu/pm
+   # 4. register by the FNV of the RAW image bytes (the value the
+   #    PM NOT LIFTED line prints as fp=), with the entry at 0xA00 --
+   #    raw PMs begin with executable no-op marker words and are
+   #    entered at the image start:
+   #      spu_begin_image(<id>); <lifted>_recomp_register();
+   #      spu_workload_register_img(<fp>, spu_func_00000A00, <id>, "pm");
+   ```
+
+   The raw image's first words decode as odd `ila` sequences: those are
+   executable no-op magic markers, not data. Do not trim them -- the PM
+   is entered at its load base, and the real prologue follows the
+   markers. A raw PM is *not* a job-module: the overlay-signature
+   registration (`lift_jobmods.py`) does not make `spurs_resolve_pm`
+   find it; the fingerprint registry above is what `cellSpurs` consults.
+
 2. **Raw SPU** — some games create SPU threads directly
    - Check for `sys_spu_thread_group_create` syscalls
    - Each SPU program needs separate analysis
@@ -617,6 +651,42 @@ then prints, once per that many seconds, its step rate and the six busiest
 ---
 
 ## Phase 12: Testing and Polish
+
+### Mandatory First-Boot Installs (a special boot gate)
+
+Many disc titles gate their first boot behind a mandatory game-data install
+("installing game data to the HDD", a progress dialog the title draws itself).
+Fought head-on, this drags the port through the title's SPURS install pipeline
+before anything else works. The fast route, proven on a retail title:
+
+1. **Fix the title identity first.** The boot must initialise `cellGame` from
+   the disc's `PARAM.SFO` (the project template's `main.cpp` now does this
+   automatically). With the placeholder title ID, SKU selection, game-data
+   paths and install gating all take wrong branches -- symptoms include an
+   install prompt that never existed on that copy, and installs aimed at the
+   disc mount.
+2. **Find the gate, not the pipeline.** Disassemble around the install dialog
+   strings: the gate is usually one existence probe (a `cellFsStat` of a
+   completion marker such as `<USRDIR>/CacheFlags/CacheDone.flg`) whose result
+   selects "install" vs "already cached". The marker names a *directory tree*,
+   and that tree is the actual product of the install.
+3. **Pre-seed the tree offline if the format is tractable.** Disc titles that
+   ship a pak + a flat descriptor (records of {big-endian u32 size,
+   NUL-terminated path} with contiguous uncompressed payload slices) can be
+   extracted with a small script: validate the descriptor's header words
+   (count, total == pak size), extract every slice under
+   `PS3_HDD0_ROOT/game/<TITLEID>/USRDIR/`, then write the marker only after
+   the byte accounting balances. A pre-seeded tree is deterministic, fast and
+   reproducible on every machine; the alternative is one reference install
+   under RPCS3 and copying the resulting `dev_hdd0` subtree.
+4. **Do not just bypass the branch.** The runtime file loader typically has
+   no archive fallback: with only a marker (or a NOP'd gate) the title skips
+   the installer, then fails on the first missing loose asset. Bypass only as
+   a diagnostic, to see how far the title gets.
+5. **Prove it with a cold boot:** the gate's stat must succeed against the
+   seeded tree, the title's own "cache is complete" path must print, and the
+   first menu/UI assets must open from `/dev_hdd0` (`FS_CALLER=1` names the
+   opener). Judge completion by asset opens, not by the progress bar.
 
 ### Testing Checklist
 
