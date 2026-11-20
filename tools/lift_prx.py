@@ -106,8 +106,9 @@ class Prx:
             elif rtype == 6:      # ADDR16_HA
                 img[target:target + 2] = struct.pack(
                     ">H", ((value + 0x8000) >> 16) & 0xFFFF)
-            elif rtype == 44:     # REL64 (rare)
-                img[target:target + 8] = struct.pack(">Q", value & (2**64 - 1))
+            elif rtype == 44:     # REL64: S + A - P
+                displacement = value - (base + target)
+                img[target:target + 8] = struct.pack(">Q", displacement & (2**64 - 1))
             else:
                 raise SystemExit(f"unhandled relocation type {rtype} "
                                  f"(entry {i}) — extend lift_prx.py")
