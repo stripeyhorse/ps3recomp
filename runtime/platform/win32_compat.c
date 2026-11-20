@@ -60,7 +60,7 @@
 /* The signal that parks a thread for SuspendThread on Linux. SIGRTMIN and the
  * two above it belong to the C library's own threading, and SIGRTMIN is not a
  * compile-time constant there, so this is only ever evaluated at run time. */
-#if defined(__linux__)
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
 #  define PS3_SUSPEND_SIGNAL (SIGRTMIN + 4)
 #endif
 
@@ -104,7 +104,7 @@ typedef struct ps3_obj {
     unsigned long long created_ft, exited_ft;   /* FILETIME units */
 #if defined(__APPLE__)
     mach_port_t    port;               /* the thread's Mach port, once it runs */
-#else
+#elif defined(PS3_SUSPEND_SIGNAL)
     sem_t          park_ack, park_go;  /* the suspend handshake, both ways */
     CONTEXT        park_ctx;           /* saved by the parking handler */
     int            park_ctx_dirty;     /* SetThreadContext wants it put back */
@@ -154,7 +154,7 @@ static void obj_release_locked(ps3_obj* o)
     if (o->kind == OBJ_THREAD) {
         for (ps3_obj** p = &s_threads; *p; p = &(*p)->thr_next)
             if (*p == o) { *p = o->thr_next; break; }
-#if !defined(__APPLE__)
+#if defined(PS3_SUSPEND_SIGNAL)
         if (o->park_ready) { sem_destroy(&o->park_ack); sem_destroy(&o->park_go); }
 #endif
     }
@@ -514,7 +514,7 @@ static void* thread_trampoline(void* p)
  * without s_lock; it takes it. Returns 0 if the semaphores could not be made. */
 static int thread_arm(ps3_obj* t)
 {
-#if !defined(__APPLE__)
+#if defined(PS3_SUSPEND_SIGNAL)
     if (sem_init(&t->park_ack, 0, 0) != 0) return 0;
     if (sem_init(&t->park_go, 0, 0) != 0) { sem_destroy(&t->park_ack); return 0; }
     t->park_ready = 1;
@@ -804,7 +804,7 @@ static void ctx_to_uc(ucontext_t* uc, const CONTEXT* c, int all)
  * SuspendThread is holding s_lock for, and a thread whose routine has already
  * returned has cleared its own thread-local while still being alive enough to
  * take the signal. */
-#if !defined(__APPLE__)
+#if defined(PS3_SUSPEND_SIGNAL)
 static ps3_obj* s_park_target;               /* set under s_lock */
 static int      s_park_installed;
 
@@ -856,7 +856,7 @@ static int park_thread_locked(ps3_obj* t)
 }
 
 static void unpark_thread_locked(ps3_obj* t) { sem_post(&t->park_go); }
-#endif /* !__APPLE__ */
+#endif /* PS3_SUSPEND_SIGNAL */
 
 /* Can this record be stopped by the host right now? A thread that has not run
  * its trampoline yet is held on the CREATE_SUSPENDED gate instead, and a
@@ -885,7 +885,7 @@ DWORD ResumeThread(HANDLE h)
         } else if (!t->done) {
 #if defined(__APPLE__)
             thread_resume(t->port);
-#else
+#elif defined(PS3_SUSPEND_SIGNAL)
             unpark_thread_locked(t);
 #endif
         }
@@ -916,14 +916,22 @@ DWORD SuspendThread(HANDLE h)
         if (t->suspend_count == 0) {
 #if defined(__APPLE__)
             ok = (thread_suspend(t->port) == KERN_SUCCESS);
-#else
+#elif defined(PS3_SUSPEND_SIGNAL)
             ok = park_thread_locked(t);
+#else
+            ok = 0;
 #endif
         }
         if (ok) { r = (DWORD)t->suspend_count; t->suspend_count++; }
     }
     pthread_mutex_unlock(&s_lock);
-    if (r == (DWORD)-1) SetLastError(ERROR_INVALID_PARAMETER);
+    if (r == (DWORD)-1) {
+#if defined(__APPLE__) || defined(PS3_SUSPEND_SIGNAL)
+        SetLastError(ERROR_INVALID_PARAMETER);
+#else
+        SetLastError(ERROR_NOT_SUPPORTED);
+#endif
+    }
     return r;
 }
 
@@ -1051,7 +1059,7 @@ BOOL GetThreadContext(HANDLE h, CONTEXT* ctx)
     ctx->ContextFlags = CONTEXT_FULL;
     ctx_from_native(ctx, &st);
     return TRUE;
-#else
+#elif defined(PS3_SUSPEND_SIGNAL)
     /* Only the parking handler has a frame to answer from. */
     pthread_mutex_lock(&s_lock);
     BOOL ok = FALSE;
@@ -1059,6 +1067,9 @@ BOOL GetThreadContext(HANDLE h, CONTEXT* ctx)
     pthread_mutex_unlock(&s_lock);
     if (!ok) SetLastError(ERROR_INVALID_PARAMETER);
     return ok;
+#else
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
 #endif
 }
 
@@ -1086,7 +1097,7 @@ BOOL SetThreadContext(HANDLE h, const CONTEXT* ctx)
         return FALSE;
     }
     return TRUE;
-#else
+#elif defined(PS3_SUSPEND_SIGNAL)
     /* Handed to the parking handler, which puts it back into the signal frame
      * as it returns. */
     pthread_mutex_lock(&s_lock);
@@ -1099,6 +1110,9 @@ BOOL SetThreadContext(HANDLE h, const CONTEXT* ctx)
     pthread_mutex_unlock(&s_lock);
     if (!ok) SetLastError(ERROR_INVALID_PARAMETER);
     return ok;
+#else
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
 #endif
 }
 

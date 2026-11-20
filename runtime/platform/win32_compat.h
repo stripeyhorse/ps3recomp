@@ -188,6 +188,7 @@ typedef struct {
 #define ERROR_INVALID_HANDLE   6u
 #define ERROR_NOT_ENOUGH_MEMORY 8u
 #define ERROR_GEN_FAILURE      31u
+#define ERROR_NOT_SUPPORTED           50u
 #define ERROR_INVALID_PARAMETER 87u
 #define ERROR_ALREADY_EXISTS   183u
 #define ERROR_TIMEOUT          1460u
@@ -897,6 +898,10 @@ typedef CONTEXT* LPCONTEXT;
  *   park legal inside a handler; nothing in it takes the shim's lock. A thread
  *   that blocks SIGRTMIN+4 cannot be stopped this way, and SuspendThread waits
  *   for it: do not mask it in a thread anything might want to freeze.
+ *
+ *   Other POSIX hosts support the CREATE_SUSPENDED gate. Suspending an
+ *   already-running thread or accessing its registers fails with
+ *   ERROR_NOT_SUPPORTED until the host has a thread and context backend.
  *
  * The Win32 hazards apply unchanged and are inherent, not artefacts of the
  * mapping: a thread stopped inside malloc still holds malloc's lock, so the
