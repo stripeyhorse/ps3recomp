@@ -68,6 +68,7 @@ extern "C" {
 uint32_t ppu_load_elf(const char* path);      /* ELF -> guest RAM, returns entry OPD */
 void     ppu_recomp_register(void);           /* generated: lifted table -> address map */
 void     ppu_hle_init(void);                  /* firmware import NID -> HLE handler */
+extern "C" void cellGame_init_from_paramsfo(const char* sfo_path); /* libs/system/cellGame.c */
 void     ppu_sysprx_register(void);           /* boot-critical CRT (sys_initialize_tls, ...) */
 void     ppu_fs_register(void);               /* cellFs over the real game directory */
 void     lv2_init_syscalls(void);             /* the lv2 syscall table */
@@ -433,6 +434,28 @@ int main(int argc, char** argv)
 
     derive_vfs_root(argv[1]);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
+
+    /* Initialise cellGame's title metadata from the disc's PARAM.SFO.
+     * Without this, cellGame answers BootCheck / GetParamString with a
+     * placeholder title ID, and a title whose SKU selection, game-data
+     * paths or install gate depend on its real identity takes the wrong
+     * path from the very first query. Tolerates all the usual layouts:
+     * a disc root (PS3_GAME/), a PSN game dir, or a USRDIR-derived root. */
+    { static const char* const kSfoLayouts[] = {
+          "%s/PS3_GAME/PARAM.SFO",   /* vfs root = disc root      */
+          "%s/../PARAM.SFO",         /* vfs root = .../USRDIR    */
+          "%s/PARAM.SFO",            /* vfs root = the game dir  */
+      };
+      char sfo[1100];
+      int found = 0;
+      for (size_t i = 0; i < sizeof kSfoLayouts / sizeof kSfoLayouts[0]; i++) {
+          snprintf(sfo, sizeof sfo, kSfoLayouts[i], ppu_vfs_root);
+          FILE* f = fopen(sfo, "rb");
+          if (f) { fclose(f); found = 1; break; }
+      }
+      if (!found)
+          snprintf(sfo, sizeof sfo, "%s/PS3_GAME/PARAM.SFO", ppu_vfs_root);
+      cellGame_init_from_paramsfo(sfo); }
 
     ppu_recomp_register();   /* lifted function table -> address map */
     ps3_load_prx_modules();  /* this game's lifted system PRX, if it has any */
