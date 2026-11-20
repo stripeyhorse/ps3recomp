@@ -17,6 +17,7 @@
 
 #include "spu_context.h"
 #include "../../include/ps3emu/log_first.h"
+#include "../../include/ps3emu/runtime_hooks.h"
 #include "spu_coherency.h"
 #include <stdint.h>
 #include <string.h>
@@ -597,6 +598,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        if (g_spu_dma_get_hook)
+            g_spu_dma_get_hook(spu, (uint32_t)ea, size, ls_ptr);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;

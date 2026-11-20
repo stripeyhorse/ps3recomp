@@ -177,6 +177,8 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
  * installed, so a title with no SPU-built FIFO pays nothing. */
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 
+void (*g_spu_dma_get_hook)(const spu_context*, uint32_t, uint32_t, uint8_t*);
+
 void spu_halt(spu_context* ctx)
 {
     /* Register/context dump at halt-asserts: the WWS job's parameter guard

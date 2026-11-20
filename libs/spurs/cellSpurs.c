@@ -21,6 +21,9 @@
 #include <string.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/runtime_hooks.h"
+
+void (*g_spurs_ready_count_store_hook)(uint32_t, uint32_t, uint32_t, uint64_t);
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
@@ -2198,6 +2201,9 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
     s_workloads[wid].readyCount = value;
     /* The real store: the instance byte the kernel (poll thread) watches. */
     vm_write8(si->ea + wkl_ready_off(wid), (u8)value);
+    if (g_spurs_ready_count_store_hook)
+        g_spurs_ready_count_store_hook(si->ea, wid, value,
+                                       vm_read64(si->ea + wkl_info_off(wid) + 8));
     {   static int _n = 0;
         if (_n < 32)
             printf("[cellSpurs] ReadyCountStore(wid=%u, value=%u)\n", wid, value);
