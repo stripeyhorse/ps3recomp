@@ -92,6 +92,7 @@ static id<MTLTexture>      s_offscreen;  /* headless only   */
 static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
 static NSWindow*           s_window;
 static int                 s_headless;
+static int                 s_stretch;     /* present into the whole window */
 static atomic_int          s_closed;
 #if !TARGET_OS_IPHONE
 static id                  s_window_close_observer;
@@ -869,11 +870,13 @@ static int create_window_impl(const char* title)
         [NSApp setMainMenu:bar];
     }
 
-    /* PS3RECOMP_METAL_WINDOW=<w>x<h>: initial content size in points (default: the game's size). */
+    /* PS3RECOMP_WINDOW_SIZE=<w>x<h>: initial content size in points.
+     * PS3RECOMP_METAL_WINDOW is the older name. */
     NSRect frame = NSMakeRect(0, 0, (CGFloat)s_width, (CGFloat)s_height);
     {
         unsigned ww = 0, wh = 0;
-        const char* ws = getenv("PS3RECOMP_METAL_WINDOW");
+        const char* ws = getenv("PS3RECOMP_WINDOW_SIZE");
+        if (!ws) ws = getenv("PS3RECOMP_METAL_WINDOW");
         if (ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 160 && wh >= 90 && ww <= 16384 && wh <= 16384)
             frame.size = NSMakeSize((CGFloat)ww, (CGFloat)wh);
     }
@@ -903,6 +906,13 @@ static int create_window_impl(const char* title)
     s_layer.device          = s_dev;
     s_layer.pixelFormat     = MTLPixelFormatBGRA8Unorm;
     s_layer.framebufferOnly = YES;
+    const char* vsync = getenv("PS3RECOMP_VSYNC");
+    const char* aspect = getenv("PS3RECOMP_ASPECT");
+    s_layer.displaySyncEnabled = !(vsync && !strcmp(vsync, "0"));
+    s_stretch = aspect && !strcmp(aspect, "stretch");
+    fprintf(stderr, "[RSX metal] window %.0fx%.0f points, vsync %s, aspect %s\n",
+            frame.size.width, frame.size.height, s_layer.displaySyncEnabled ? "on" : "off",
+            s_stretch ? "stretch" : "fit");
     s_layer.drawableSize    = CGSizeMake((CGFloat)s_width, (CGFloat)s_height);
 
     NSView* view = [s_window contentView];
@@ -4435,17 +4445,18 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e) return;
-    /* In the window the picture keeps its aspect ratio: fitted into the drawable and centred, black around it. The
-     * headless and host-surface targets are the size the title asked for and are filled as before. */
+    /* The default window fit preserves aspect with black bars. Stretch
+     * covers the drawable, as do the fixed-size headless and host targets. */
     const double dw = (double)[dst width], dh = (double)[dst height];
     const double sw = (double)[src width], sh = (double)[src height];
-    const int fill = s_headless || s_host;
+    const int fixed = s_headless || s_host;
+    const int fill = fixed || s_stretch;
     const double fit = fmin(dw / sw, dh / sh);
     const double vw = fill ? dw : floor(sw * fit + 0.5), vh = fill ? dh : floor(sh * fit + 0.5);
     [e setViewport:(MTLViewport){floor((dw - vw) * 0.5), floor((dh - vh) * 0.5), vw, vh, 0.0, 1.0}];
     [e setRenderPipelineState:s_eng_blit_pso];
     [e setFragmentTexture:src atIndex:0];
-    const int scaled = !fill && (vw != sw || vh != sh);   /* a resized window filters; 1:1 and the fixed targets stay point-sampled */
+    const int scaled = !fixed && (vw != sw || vh != sh);   /* a resized window filters; 1:1 and the fixed targets stay point-sampled */
     [e setFragmentSamplerState:(scaled ? s_default_sampler : s_eng_point_sampler) atIndex:0];
     /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
      * setting): out = in^gamma, as RPCS3's calibration pass applies it. The
