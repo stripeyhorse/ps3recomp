@@ -12,6 +12,7 @@
  *         -o /tmp/test_spu_fi_cflts_neon runtime/spu/tests/test_spu_fi_cflts_neon.c
  */
 #include "spu_helpers.h"
+#include "../../../tests/spu_ls_watch_fixture.h"
 #include <stdio.h>
 #include <stdlib.h>
 

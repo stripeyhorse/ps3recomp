@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <time.h>
 #include "../spu_coherency.c"
+#include "../../../tests/spu_ls_watch_fixture.h"
 
 void spu_ch_wake(spu_context* ctx) { (void)ctx; }
 

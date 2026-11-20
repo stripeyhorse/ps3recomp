@@ -81,6 +81,10 @@ set_tests_properties(sys_fs PROPERTIES
 # sys_ppu_thread_join / detach through the real sys_ppu_thread.c with host
 # threads: the slot a join frees stays free (Windows), self-join, second joiner.
 add_executable(test_ppu_thread_join test_ppu_thread_join.c)
+if(NOT WIN32)
+    target_sources(test_ppu_thread_join PRIVATE
+        "${PS3RECOMP_ROOT}/runtime/platform/win32_compat.c")
+endif()
 target_include_directories(test_ppu_thread_join PRIVATE
     "${PS3RECOMP_ROOT}/runtime/syscalls"
     "${PS3RECOMP_ROOT}/runtime"
