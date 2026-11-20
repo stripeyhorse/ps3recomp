@@ -211,6 +211,7 @@ typedef struct vk_state {
     int              depth_bounds_ok; /* depthBounds enabled                */
     int              depth_clamp_ok;  /* depthClamp enabled                 */
     int              indep_blend_ok;  /* independentBlend: per-target MRT state */
+    float            sampler_aniso;   /* PS3_ANISO, bounded by the device limit */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
     int              stretch, no_vsync;
@@ -394,6 +395,12 @@ static int vk_pick_device(void)
     /* Vulkan guarantees 4096; the engine's targets and textures may use what
      * the device really has (a title's 4608-wide target on RADV). */
     s_vk.max_dim = p.limits.maxImageDimension2D >= 4096u ? p.limits.maxImageDimension2D : 4096u;
+    const char* aniso_env = getenv("PS3_ANISO");
+    int aniso = aniso_env ? atoi(aniso_env) : 0;
+    if (aniso > 16) aniso = 16;
+    s_vk.sampler_aniso = aniso > 1 ? (float)aniso : 1.0f;
+    if (s_vk.sampler_aniso > p.limits.maxSamplerAnisotropy)
+        s_vk.sampler_aniso = p.limits.maxSamplerAnisotropy;
     VK_LOG("using device %d: %s\n", best, p.deviceName);
     return 0;
 }
@@ -3483,6 +3490,8 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
         .addressModeU = vk_gcm_wrap(d->wrap_s), .addressModeV = vk_gcm_wrap(d->wrap_t),
         .addressModeW = vk_gcm_wrap(d->wrap_r),
         .minLod = min_lod, .maxLod = max_lod,
+        .anisotropyEnable = d->min_linear && d->mip_present && s_vk.sampler_aniso > 1.0f,
+        .maxAnisotropy = s_vk.sampler_aniso,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK };
     VkSampler smp;
     if (pvkCreateSampler(s_vk.device, &sci, NULL, &smp) != VK_SUCCESS) return s_vk.sampler;
@@ -3969,6 +3978,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkPhysicalDeviceFeatures have, want;
     memset(&want, 0, sizeof want);
     pvkGetPhysicalDeviceFeatures(s_vk.phys, &have);
+    if (!have.samplerAnisotropy) s_vk.sampler_aniso = 1.0f;
+    want.samplerAnisotropy = s_vk.sampler_aniso > 1.0f;
     want.textureCompressionBC = have.textureCompressionBC;
     /* User clip planes (rsx_vp_apply_user_clip) write ClipDistance. */
     want.shaderClipDistance = have.shaderClipDistance;
