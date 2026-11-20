@@ -39,7 +39,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <string.h>
-#include <sys/mman.h>
+#include "posix_mmap.h"
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <sys/stat.h>   /* GetFileAttributesA */
@@ -1447,7 +1447,7 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protect)
     int prot = (type & MEM_COMMIT) ? prot_of(protect) : PROT_NONE;
 
     if (type & MEM_RESERVE) {
-        int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+        int flags = PS3_MAP_PRIVATE_ANON;
 #if defined(MAP_FIXED_NOREPLACE)
         if (address) flags |= MAP_FIXED_NOREPLACE;
 #endif

@@ -44,7 +44,7 @@
 #include <string.h>
 
 #ifndef _WIN32
-#include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
+#include "posix_mmap.h"   /* mmap: the guest arena, see alloc_guest_vm */
 #endif
 
 #if defined(__APPLE__)
@@ -337,7 +337,7 @@ static bool alloc_guest_vm(void)
      * start, so every commit failed with EINVAL and sys_memory_allocate
      * answered ENOMEM to every call. mmap's base is page-aligned and zeroed. */
     void* p = mmap(NULL, VM_SIZE, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+                   PS3_MAP_PRIVATE_ANON, -1, 0);
     vm_base = (p == MAP_FAILED) ? nullptr : (uint8_t*)p;
     ppu_vm_size = 0;              /* the whole space is backed; no OOB guard needed */
 #endif

@@ -26,7 +26,7 @@
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
 #else
-  #include <sys/mman.h>
+  #include "../platform/posix_mmap.h"
   #include <signal.h>
   #include <unistd.h>
 #endif
@@ -233,7 +233,7 @@ static inline int32_t vm_init(void)
     {
         size_t want = (size_t)VM_TOTAL_SIZE;
         uint8_t* raw = (uint8_t*)mmap(NULL, want * 2, PROT_NONE,
-                                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                      PS3_MAP_PRIVATE_ANON,
                                       -1, 0);
         if (raw == MAP_FAILED) {
             vm_base = NULL;

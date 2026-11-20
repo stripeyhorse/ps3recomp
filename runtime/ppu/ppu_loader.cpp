@@ -43,7 +43,7 @@
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "../platform/ps3_stdio.h"        /* ps3_stdio_init -- buffered stdout/stderr, timed flush */
 #ifndef _WIN32
-#include <sys/mman.h>   /* the guest-pointer trap reserves the low 4 GB */
+#include "../platform/posix_mmap.h"   /* the guest-pointer trap reserves the low 4 GB */
 #include <signal.h>
 #include <unistd.h>
 #endif
@@ -211,7 +211,7 @@ extern "C" void ps3_install_guest_ptr_trap(void)
         if (a == 0x10000u) len -= 0x10000u;
         if (brk_now >= a && brk_now < a + len) continue;
 
-        int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+        int flags = PS3_MAP_PRIVATE_ANON;
 #ifdef MAP_FIXED_NOREPLACE
         flags |= MAP_FIXED_NOREPLACE;   /* fail rather than evict a live mapping */
 #endif
