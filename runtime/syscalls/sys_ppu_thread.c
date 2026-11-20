@@ -281,7 +281,34 @@ static void* ppu_host_thread_proc(void* param)
 #endif
 }
 
-/* ---------------------------------------------------------------------------
+#ifndef _WIN32
+/* Diagnostic replay of a debugger hold at worker entry. The guest creator
+ * can keep running after create returns. This is a bounded timing probe,
+ * independent of the priority model and the SPURS scheduler. */
+static int ppu_start_delay_selected(const char* thread_name)
+{
+    const char* names = getenv("PS3_PPU_START_DELAY");
+    if (!names || !thread_name[0]) return 0;
+    const size_t name_len = strlen(thread_name);
+    while (*names) {
+        const size_t len = strcspn(names, ",");
+        if (len == name_len && memcmp(names, thread_name, len) == 0) return 1;
+        names += len;
+        if (*names == ',') names++;
+    }
+    return 0;
+}
+
+static void* ppu_host_thread_proc_delayed(void* param)
+{
+    const ppu_thread_info* info = (const ppu_thread_info*)param;
+    fprintf(stderr, "[THREAD %llu] PS3_PPU_START_DELAY: holding \"%s\" for 10 ms\n",
+            (unsigned long long)info->ctx.thread_id, info->name);
+    Sleep(10);
+    return ppu_host_thread_proc(param);
+}
+#endif
+
 /* PPU_THREADGATE: PS3 priority scheduling — a newly created same/lower-priority
  * thread does NOT run until the creating thread blocks. Our HLE spawns host threads
  * immediately, so a worker (GThread entry=0x5353C0) can read its job object's
@@ -600,12 +627,14 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      * where a recompiled call chain that spills a whole ppu_context per frame
      * overflows in a few hundred frames. Like the Win32 branch it is a
      * reservation, not a commitment -- the pages are mapped lazily. */
+    void* (*start)(void*) = ppu_start_delay_selected(t->name)
+        ? ppu_host_thread_proc_delayed : ppu_host_thread_proc;
     int rc;
     {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         if (pthread_attr_setstacksize(&attr, PPU_HOST_STACK_BYTES) == 0) {
-            rc = pthread_create(&t->host_thread, &attr, ppu_host_thread_proc, t);
+            rc = pthread_create(&t->host_thread, &attr, start, t);
         } else {
             rc = EINVAL;
         }
@@ -619,7 +648,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
                             "falling back to the default\n",
                     (unsigned long long)thread_id,
                     (size_t)(PPU_HOST_STACK_BYTES / (1024 * 1024)), rc);
-            rc = pthread_create(&t->host_thread, NULL, ppu_host_thread_proc, t);
+            rc = pthread_create(&t->host_thread, NULL, start, t);
         }
     }
     if (rc != 0) {
