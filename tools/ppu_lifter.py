@@ -2130,10 +2130,17 @@ class PPULifter:
                     return f"/* bl -> non-code 0x{tgt:08X} */;"
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
-                # PPC `bl` sets LR = return address (next instr). Emit it so mflr
-                # reads the correct value AND stack-saved LRs are real return
-                # addresses -> reliable back-chain unwinding for diagnostics.
-                return f"ctx->lr = 0x{insn.addr + 4:08X}; {self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
+                # PPC64 glink/PLT semantics: on real hardware a cross-module call
+                # goes through a glink stub that saves the caller's TOC into the
+                # ABI-reserved slot at sp+0x28 before swapping r2. The caller
+                # restores it afterwards with `ld r2, 40(r1)`. Some toolchains
+                # (this title's) emit that restore after EVERY bl. The lifted
+                # direct call bypasses the glink stub, so without this spill the
+                # caller's reload reads stale stack garbage and r2 dies (seen as
+                # r2=0 null-page cascades deep in static-init). Emit the save
+                # the stub would have made; the slot is reserved for exactly this.
+                return (f"vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); "
+                        f"ctx->lr = 0x{insn.addr + 4:08X}; {self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);")
             except ValueError:
                 return f"/* bl {target} */;"
 
