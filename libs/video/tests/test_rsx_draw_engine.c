@@ -93,7 +93,7 @@ typedef struct {
     float draw_first_vertex[4];   /* ATTR0 of the first vertex handed over */
     rsx_topology draw_topology;
     u32 scissor[4];
-    u32 stencil_ref;
+    u32 stencil_ref, back_stencil_ref;
     float depth_bounds[2];
     int n_depth_bounds;
     u32 last_created_texture, last_created_color;
@@ -229,6 +229,11 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
 }
 
 static void stub_stencil_ref(void* u, u32 r) { (void)u; stub.stencil_ref = r; }
+static void stub_stencil_refs(void* u, u32 front, u32 back)
+{
+    stub_stencil_ref(u, front);
+    stub.back_stencil_ref = back;
+}
 static void stub_depth_bounds(void* u, float lo, float hi)
 {
     (void)u;
@@ -1038,6 +1043,48 @@ static void test_pipeline_key(void)
 }
 
 /* ---- 5. restart cuts and topology expansion ------------------------------ */
+
+static void test_two_sided_stencil(void)
+{
+    engine_up();
+    rsx_draw_backend backend = g_stub_backend;
+    backend.set_stencil_refs = stub_stencil_refs;
+    rsx_draw_engine_set_backend(&backend);
+
+    m(0x0328, 1);       /* STENCIL_TEST_ENABLE */
+    m(0x0348, 1);       /* TWO_SIDED_STENCIL_TEST_ENABLE */
+    draw_triangle();
+    CHECK(stub.pipeline_rs.s_write_mask == 0xff && stub.pipeline_rs.bs_write_mask == 0xff &&
+          stub.pipeline_rs.bs_func_mask == 0xff && stub.pipeline_rs.bs_zpass == 0x1e00,
+          "front and back stencil registers start with the NV40 reset values");
+
+    m(0x032C, 0x0F);    /* STENCIL_MASK */
+    m(0x0338, 0xF0);    /* STENCIL_FUNC_MASK */
+    m(0x034C, 0xF0);    /* BACK_STENCIL_MASK */
+    m(0x0358, 0x0F);    /* BACK_STENCIL_FUNC_MASK */
+    m(0x0334, 0x14);    /* STENCIL_FUNC_REF */
+    m(0x0354, 0x41);    /* BACK_STENCIL_FUNC_REF */
+    draw_triangle();
+    CHECK(stub.pipeline_rs.s_write_mask == 0x0f && stub.pipeline_rs.bs_write_mask == 0xf0 &&
+          stub.pipeline_rs.s_func_mask == 0xf0 && stub.pipeline_rs.bs_func_mask == 0x0f,
+          "each face uses its own compare and write masks");
+    CHECK(stub.stencil_ref == 0x14 && stub.back_stencil_ref == 0x41,
+          "each face uses its own reference");
+    const int pipelines = stub.n_pipeline_create;
+    m(0x0354, 0x62);
+    draw_triangle();
+    CHECK(stub.back_stencil_ref == 0x62 && stub.n_pipeline_create == pipelines,
+          "changing only the back reference does not recompile the pipeline");
+    m(0x0358, 0x3F);
+    draw_triangle();
+    CHECK(stub.pipeline_rs.bs_func_mask == 0x3f && stub.n_pipeline_create == pipelines + 1,
+          "changing only the back compare mask selects a new pipeline");
+    m(0x0348, 0);
+    draw_triangle();
+    CHECK(stub.back_stencil_ref == stub.stencil_ref,
+          "one-sided stencil applies the front reference to both faces");
+    engine_down();
+}
 
 static void test_restart_expansion(void)
 {
@@ -2731,6 +2778,7 @@ int main(void)
     test_texture_sparse_rehash();
     test_compressed_volume();
     test_pipeline_key();
+    test_two_sided_stencil();
     test_restart_expansion();
     test_indexed_runs();
     test_indexed_draws();

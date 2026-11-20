@@ -3008,7 +3008,7 @@ static struct {
     float        vp[4];
     u32          sc[4];
     int          have_vp, have_sc;
-    u32          stencil_ref;
+    u32          stencil_ref, back_stencil_ref;
     float        depth_bounds[2];     /* min, max for the next draw */
     vk_buffer    indices;
     u32          warned;
@@ -3302,7 +3302,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
                                                  rs->s_func_mask, rs->s_write_mask);
     VkStencilOpState back = rs->stencil_two_sided
         ? vk_gcm_stencil_face(rs->bs_func, rs->bs_fail, rs->bs_zfail, rs->bs_zpass,
-                              rs->s_func_mask, rs->s_write_mask)
+                              rs->bs_func_mask, rs->bs_write_mask)
         : front;
     VkPipelineDepthStencilStateCreateInfo ds = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
@@ -3470,7 +3470,12 @@ static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
     (void)user;
     s_e2.sc[0] = x; s_e2.sc[1] = y; s_e2.sc[2] = w; s_e2.sc[3] = h; s_e2.have_sc = 1;
 }
-static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_e2.stencil_ref = ref; }
+static void vk_eng_set_stencil_refs(void* user, u32 front, u32 back)
+{
+    (void)user;
+    s_e2.stencil_ref = front;
+    s_e2.back_stencil_ref = back;
+}
 
 /* Vulkan wants the bounds inside [0, 1] without VK_EXT_depth_range_unrestricted;
  * a NaN clamps to the open end so a garbage register cannot reject a draw. */
@@ -3910,7 +3915,12 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     }
     pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
     pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
-    pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
+    if (s_e2.stencil_ref == s_e2.back_stencil_ref) {
+        pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref);
+    } else {
+        pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_BIT, s_e2.stencil_ref);
+        pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_BACK_BIT, s_e2.back_stencil_ref);
+    }
     if (s_vk.depth_bounds_ok)
         pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
     pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -3954,7 +3964,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .bind_vertex_textures = vk_eng_bind_vertex_textures,
     .set_viewport         = vk_eng_set_viewport,
     .set_scissor          = vk_eng_set_scissor,
-    .set_stencil_ref      = vk_eng_set_stencil_ref,
+    .set_stencil_refs     = vk_eng_set_stencil_refs,
     .set_depth_bounds     = vk_eng_set_depth_bounds,
     .draw                 = vk_eng_draw,
     .clear_color          = vk_eng_clear_color,

@@ -78,7 +78,10 @@ extern u32 ppu_vm_size;
 #define M_STENCIL_OP_ZFAIL    0x0340
 #define M_STENCIL_OP_ZPASS    0x0344
 #define M_TWO_SIDED_STENCIL   0x0348
+#define M_BACK_STENCIL_MASK   0x034C
 #define M_BACK_STENCIL_FUNC   0x0350
+#define M_BACK_STENCIL_REF    0x0354
+#define M_BACK_STENCIL_FUNC_MASK 0x0358
 #define M_BACK_STENCIL_OP_FAIL  0x035C
 #define M_BACK_STENCIL_OP_ZFAIL 0x0360
 #define M_BACK_STENCIL_OP_ZPASS 0x0364
@@ -460,6 +463,8 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->s_zfail      = rsx_dsp_reg(rsx, M_STENCIL_OP_ZFAIL);
     rs->s_zpass      = rsx_dsp_reg(rsx, M_STENCIL_OP_ZPASS);
     rs->bs_func      = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC);
+    rs->bs_func_mask = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC_MASK) & 0xFF;
+    rs->bs_write_mask = rsx_dsp_reg(rsx, M_BACK_STENCIL_MASK) & 0xFF;
     rs->bs_fail      = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_FAIL);
     rs->bs_zfail     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
     rs->bs_zpass     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
@@ -513,6 +518,10 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
     ENG_HASH_FIELD(s_zfail);
     ENG_HASH_FIELD(s_zpass);
     ENG_HASH_FIELD(bs_func);
+    if (rs->stencil_two_sided) {
+        ENG_HASH_FIELD(bs_func_mask);
+        ENG_HASH_FIELD(bs_write_mask);
+    }
     ENG_HASH_FIELD(bs_fail);
     ENG_HASH_FIELD(bs_zfail);
     ENG_HASH_FIELD(bs_zpass);
@@ -3453,8 +3462,14 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.be->set_scissor(g.be->user, sc[0], sc[1], sc[2], sc[3]);
     }
     /* Dynamic, and deliberately outside the pipeline key. */
-    g.be->set_stencil_ref(g.be->user,
-                          rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
+    const u32 front_ref = rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu;
+    if (g.be->set_stencil_refs) {
+        const u32 back_ref = rs.stencil_two_sided
+            ? rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_REF) & 0xFFu : front_ref;
+        g.be->set_stencil_refs(g.be->user, front_ref, back_ref);
+    } else if (g.be->set_stencil_ref) {
+        g.be->set_stencil_ref(g.be->user, front_ref);
+    }
     /* The bounds too: a deferred renderer moves them between its light and
      * sky passes without changing anything else. Raw floats, as written. */
     if (g.be->set_depth_bounds) {

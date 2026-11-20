@@ -99,7 +99,7 @@ typedef struct rsx_be_render_state {
      * off). A backend without depth clamping draws it clipped. */
     u32 depth_clamp;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
-    u32 bs_func, bs_fail, bs_zfail, bs_zpass;
+    u32 bs_func, bs_func_mask, bs_write_mask, bs_fail, bs_zfail, bs_zpass;
 } rsx_be_render_state;
 
 /* submit_and_wait reasons, for a backend that wants to log or count them. */
@@ -300,6 +300,9 @@ typedef struct rsx_draw_backend {
                                      float depth_value, u8 stencil,
                                      u32 x, u32 y, u32 w, u32 h);
 
+    /* Optional independent references for backends with two-sided stencil.
+     * With two-sided stencil off both arguments carry the front reference. */
+    void (*set_stencil_refs)(void* user, u32 front, u32 back);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

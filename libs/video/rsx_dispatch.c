@@ -178,6 +178,19 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * a title that turned clipping off. */
     rsx->regs[0x1D78 >> 2] = 0x00000001u;
 
+    /* NV40 stencil reset state for each face: allow writing/comparing all
+     * bits, pass the comparison and keep the stored value on each outcome.
+     * The reference is already zero. Some draws enable stencil and program
+     * only the operations that differ from these defaults. */
+    for (u32 face = 0; face <= 0x20; face += 0x20) {
+        rsx->regs[(0x032Cu + face) >> 2] = 0xFFu;
+        rsx->regs[(0x0330u + face) >> 2] = 0x0207u;
+        rsx->regs[(0x0338u + face) >> 2] = 0xFFu;
+        rsx->regs[(0x033Cu + face) >> 2] = 0x1E00u;
+        rsx->regs[(0x0340u + face) >> 2] = 0x1E00u;
+        rsx->regs[(0x0344u + face) >> 2] = 0x1E00u;
+    }
+
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
