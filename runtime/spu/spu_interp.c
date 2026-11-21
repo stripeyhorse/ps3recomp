@@ -428,7 +428,42 @@ static void interp_stats_step(const spu_context* ctx)
     s_is_tot = 0; s_is_t0 = now;
 }
 
+/* SPU_INTERP_ENTRIES=<file>: every distinct place the interpreter was entered
+ * inside the job code buffer (LS 0x4000 up), keyed by the first eight bytes of
+ * the module that was in the buffer at the time, with a call count. All job
+ * modules load at the same address, so a bare LS address does not say whose
+ * code it is; the header does. The file is rewritten as the run goes, one
+ * "<sig16hex> <pc hex> <count>" per line, and is what
+ * tools/lift_jobmods.py --extra-entries reads to seed the function starts a
+ * static scan cannot find (targets reached only through function pointers). */
+enum { IEN_N = 8192 };
+static struct { uint64_t sig; uint32_t pc; volatile uint32_t n; } s_ien[IEN_N];
+static const char* s_ien_path;
+static volatile unsigned long long s_ien_total;
+static void interp_entries_note(const spu_context* ctx, uint32_t pc)
+{
+    static int on = -1;
+    if (on < 0) { s_ien_path = getenv("SPU_INTERP_ENTRIES"); on = s_ien_path && *s_ien_path; }
+    if (!on || pc < 0x4000u) return;
+    uint64_t sig = 0;
+    for (int i = 0; i < 8; i++) sig = (sig << 8) | ctx->ls[0x4000 + i];
+    uint32_t h = (uint32_t)((sig ^ (sig >> 29)) * 0x9E3779B1u ^ pc * 0x85EBCA6Bu) & (IEN_N - 1);
+    for (unsigned probe = 0; probe < 64; probe++, h = (h + 1) & (IEN_N - 1)) {
+        if (s_ien[h].n && s_ien[h].sig == sig && s_ien[h].pc == pc) { s_ien[h].n++; break; }
+        if (!s_ien[h].n) { s_ien[h].sig = sig; s_ien[h].pc = pc; s_ien[h].n = 1; break; }
+    }
+    /* Unlocked on purpose: a lost count cannot change which entries exist. */
+    if ((++s_ien_total & 0x3FFFF) != 1) return;
+    FILE* f = fopen(s_ien_path, "w");
+    if (!f) return;
+    for (unsigned i = 0; i < IEN_N; i++)
+        if (s_ien[i].n)
+            fprintf(f, "%016llx %05x %u\n", (unsigned long long)s_ien[i].sig, s_ien[i].pc, s_ien[i].n);
+    fclose(f);
+}
+
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    interp_entries_note(ctx, start_lsa & 0x3FFFC);
     if (interp_stats_on()) {
         /* Credit an entry inside a resident code region to the image that
          * owns it, so the list names the lift that's missing the entry. */

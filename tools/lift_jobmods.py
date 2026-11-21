@@ -77,6 +77,31 @@ CODE_END = {
 EXTRA_FUNCS = [a.strip() for a in
                os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", "").split(",") if a.strip()]
 
+# Extra function entries per module (--extra-entries FILE): the places a run
+# entered the SPU interpreter inside the job code buffer, as the runtime's
+# SPU_INTERP_ENTRIES writes them ("<first 8 header bytes, hex> <pc hex>
+# <count>"). Unlike EXTRA_FUNCS these name their module, so each address is
+# offered only to the image it was executed in. They are function starts
+# reached only through pointers the module builds at run time: no static scan
+# finds them, and code_end stops short of whatever lies beyond them.
+MODULE_ENTRIES = {}
+
+
+def load_module_entries(path):
+    for line in open(path):
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        MODULE_ENTRIES.setdefault(parts[0].lower(), set()).add(int(parts[1], 16) & ~3)
+
+
+def module_entries(raw, base=BASE, hi=None):
+    """This module's recorded interpreter entries that fall on an instruction
+    inside its image, past the 0x30-byte header."""
+    top = hi if hi is not None else base + len(raw)
+    return sorted(a for a in MODULE_ENTRIES.get(raw[:8].hex(), ())
+                  if base + 0x30 <= a < top and a + 4 <= base + len(raw))
+
 
 def manual_link_targets(raw, base=BASE):
     """Return targets built into the link register by hand:
@@ -211,6 +236,7 @@ def module_code_end(raw, name, base=BASE):
     hi = min(base + len(raw), CODE_END.get(name, base + len(raw)))
     seeds = {base + struct.unpack_from(">I", raw, 0x10)[0], base + 0x30}
     seeds |= {int(a, 0) for a in EXTRA_FUNCS}
+    seeds |= set(module_entries(raw, base, hi))
     derived = manual_link_sites(raw, base) + switch_table_sites(raw, base)
     while True:
         seen = reachable(raw, seeds, hi, base)
@@ -238,6 +264,7 @@ def module_seeds(raw, base=BASE):
     # ef33c6c99dc7). Seeding it is exact, not a heuristic: every module's
     # first instruction is at +0x30.
     inside.append(hex(base + 0x30))
+    inside += [hex(a) for a in module_entries(raw, base)]
     inside += [hex(a) for a in manual_link_targets(raw, base)]
     inside += [hex(a) for a in switch_table_targets(raw, base)]
     return inside
@@ -345,6 +372,9 @@ def main():
     ap.add_argument("--symbol-prefix", default="port", metavar="NAME",
                     help="C symbol prefix for the registration functions, so two "
                          "ports linked in one tree cannot collide (default: port).")
+    ap.add_argument("--extra-entries", metavar="FILE", action="append", default=[],
+                    help="Per-module function entries recorded at run time by "
+                         "SPU_INTERP_ENTRIES=<file> (repeatable; files are merged).")
     ap.add_argument("--merge-chunks", action="store_true",
                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks "
                          "between call targets becomes one C function with gotos "
@@ -353,6 +383,11 @@ def main():
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 
+    for path in args.extra_entries:
+        load_module_entries(path)
+    if MODULE_ENTRIES:
+        print(f"  recorded entries: {sum(len(v) for v in MODULE_ENTRIES.values())} "
+              f"in {len(MODULE_ENTRIES)} module(s)")
     if EXTRA_FUNCS:
         print(f"  extra function entries: {', '.join(EXTRA_FUNCS)}")
     if args.engine_elf:

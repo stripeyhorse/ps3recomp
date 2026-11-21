@@ -2692,8 +2692,13 @@ void spu_indirect_branch(spu_context* ctx)
      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
      * Without this, any indirect branch through such a value fails the lookup
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
-     * masking is a no-op for already-valid targets. */
-    ctx->pc &= SPU_LS_MASK;
+     * masking is a no-op for already-valid targets.
+     * It ignores the low two bits as well: instructions are word-aligned and
+     * titles branch through tagged pointers. PAIN's animation job calls
+     * 0x123F1 for the function at 0x123F0 seven million times a flight; the
+     * lookup missed on the tagged address and every call detoured through
+     * the interpreter. */
+    ctx->pc &= SPU_LS_MASK & ~3u;
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first
