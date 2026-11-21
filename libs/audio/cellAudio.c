@@ -175,6 +175,14 @@ static SDL_AudioDeviceID s_sdl_audio_dev = 0;
 /* Leave headroom for CoreAudio's periodic pulls and host scheduling jitter.
  * Prime only the device queue: the guest ring must start at normal cadence. */
 enum { SDL_AUDIO_PREBUFFER_BLOCKS = 10, SDL_AUDIO_MAX_BLOCKS = 20 };
+
+static void audio_backend_prime(void)
+{
+    const float silence[CELL_AUDIO_BLOCK_SAMPLES * 2] = {0};
+    for (int block = 0; block < SDL_AUDIO_PREBUFFER_BLOCKS; ++block) {
+        if (SDL_QueueAudio(s_sdl_audio_dev, silence, sizeof silence) < 0) break;
+    }
+}
 #endif
 
 static int audio_backend_init(void)
@@ -201,10 +209,7 @@ static int audio_backend_init(void)
     }
 
 #ifndef _WIN32
-    const float silence[CELL_AUDIO_BLOCK_SAMPLES * 2] = {0};
-    for (int block = 0; block < SDL_AUDIO_PREBUFFER_BLOCKS; ++block) {
-        if (SDL_QueueAudio(s_sdl_audio_dev, silence, sizeof silence) < 0) break;
-    }
+    audio_backend_prime();
 #endif
     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
     return 0;
@@ -736,7 +741,12 @@ static void* audio_mix_thread_func(void* arg)
         audio_dump_mix();
 
         const u32 queued = audio_backend_queued_samples();
-        if (s_sdl_audio_dev && queued == 0) ++dry;
+        if (s_sdl_audio_dev && queued == 0) {
+            ++dry;
+            /* The guest and host run at the same nominal rate, so an empty
+             * device queue has no way to rebuild its scheduling headroom. */
+            audio_backend_prime();
+        }
         if (queued < CELL_AUDIO_BLOCK_SAMPLES * SDL_AUDIO_MAX_BLOCKS) {
             audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         } else {
