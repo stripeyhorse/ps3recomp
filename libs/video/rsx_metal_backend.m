@@ -5020,7 +5020,27 @@ static void eng_dump_frame(id<MTLTexture> src)
     const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
     if (!path || !*path) return;
     static unsigned frame;
-    if ((++frame % 120) != 0) return;
+    /* PS3RECOMP_METAL_FRAME_DUMP_SEQ=<count>[:<step>]: instead of every 120th
+     * frame to the one path, write <count> frames, every <step>th, as
+     * <path>.<frame>.ppm, starting when the file <path>.go appears. A defect
+     * that lasts one frame (a flickering actor) never lands on a 120-frame
+     * grid, and frame numbers differ too much between runs to aim with. */
+    static int seq = -1; static unsigned seq_first, seq_count, seq_step = 1;
+    if (seq < 0) { const char* e = getenv("PS3RECOMP_METAL_FRAME_DUMP_SEQ");
+        seq = e && sscanf(e, "%u:%u", &seq_count, &seq_step) >= 1;
+        if (!seq_step) seq_step = 1; }
+    ++frame;
+    char seq_path[1200];
+    if (seq) {
+        if (!seq_first) {
+            snprintf(seq_path, sizeof seq_path, "%s.go", path);
+            if (access(seq_path, F_OK) != 0) return;
+            seq_first = frame;
+        }
+        if (frame >= seq_first + seq_count * seq_step || (frame - seq_first) % seq_step) return;
+        snprintf(seq_path, sizeof seq_path, "%s.%06u.ppm", path, frame);
+        path = seq_path;
+    } else if ((frame % 120) != 0) return;
     if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
         [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
     size_t w = [src width], h = [src height];
