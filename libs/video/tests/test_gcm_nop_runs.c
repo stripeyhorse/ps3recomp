@@ -164,14 +164,17 @@ int main(void)
 
     if (draw_engine) {
         /* NI packet on subchannel 1 keeps its method and subchannel in the
-         * mirror. Place the header after a boundary-crossing packet. */
+         * mirror. Put it after a packet that crosses into a separately
+         * mapped IO page. */
         const u32 tail2 = PAGE2 - 8;
+        const u32 second_ea = 0x00300000u;
+        populate_offset_table(second_ea, PAGE2, 0x100000u);
         gw32(IO_ADDR + tail2, (2u << 18) | PROBE_METHOD);
         gw32(IO_ADDR + tail2 + 4, 6);
-        gw32(IO_ADDR + PAGE2, 7);
-        gw32(IO_ADDR + PAGE2 + 4, 0x40000000u | (2u << 18) | (1u << 13) | PROBE_METHOD);
-        gw32(IO_ADDR + PAGE2 + 8, 8);
-        gw32(IO_ADDR + PAGE2 + 12, 9);
+        gw32(second_ea, 7);
+        gw32(second_ea + 4, 0x40000000u | (2u << 18) | (1u << 13) | PROBE_METHOD);
+        gw32(second_ea + 8, 8);
+        gw32(second_ea + 12, 9);
         s_fifo_getoff = tail2;
         vm_write32(ctrl + 4, tail2);
         vm_write32(ctrl + 0, PAGE2 + 16);
