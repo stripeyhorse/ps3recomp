@@ -178,6 +178,58 @@ void rsx_metal_backend_note_guest_frame(void)
     pthread_mutex_unlock(&session->lock);
 }
 
+/* With the FPS option on, once a second: the eight busiest threads by name
+ * and the share of one core each used since the last line. A frame rate that
+ * does not follow CPU speed is a question about which threads are saturated on
+ * that machine, and this answers it from a player's log without a profiler.
+ * Read-only Mach queries on the title's own task. */
+#include <mach/mach.h>
+static void fps_log_threads(void)
+{
+    enum { MAXT = 96, TOP = 8 };
+    static struct { uint64_t id; uint64_t ns; } prev[MAXT];
+    static unsigned n_prev;
+    static CFTimeInterval last;
+    const CFTimeInterval now = CACurrentMediaTime();
+    const double span = last > 0 ? now - last : 0;
+    last = now;
+    thread_act_array_t threads = NULL; mach_msg_type_number_t count = 0;
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
+    struct { char name[24]; double pct; } top[TOP]; unsigned n_top = 0;
+    static struct { uint64_t id; uint64_t ns; } cur[MAXT]; unsigned n_cur = 0;
+    double total = 0;
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        thread_identifier_info_data_t idi; mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
+        thread_extended_info_data_t ext; mach_msg_type_number_t m = THREAD_EXTENDED_INFO_COUNT;
+        if (thread_info(threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&idi, &n) == KERN_SUCCESS &&
+            thread_info(threads[i], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &m) == KERN_SUCCESS) {
+            const uint64_t ns = ext.pth_user_time + ext.pth_system_time;
+            uint64_t before = ns;
+            for (unsigned k = 0; k < n_prev; k++) if (prev[k].id == idi.thread_id) { before = prev[k].ns; break; }
+            if (n_cur < MAXT) { cur[n_cur].id = idi.thread_id; cur[n_cur].ns = ns; n_cur++; }
+            const double pct = span > 0 ? (double)(ns - before) / (span * 1e9) * 100.0 : 0;
+            total += pct;
+            unsigned at = n_top < TOP ? n_top : TOP;
+            for (unsigned k = 0; k < n_top; k++) if (pct > top[k].pct) { at = k; break; }
+            if (at < TOP) {
+                const unsigned end = n_top < TOP ? n_top : TOP - 1;
+                for (unsigned k = end; k > at; k--) top[k] = top[k - 1];
+                snprintf(top[at].name, sizeof top[at].name, "%s", ext.pth_name[0] ? ext.pth_name : "unnamed");
+                top[at].pct = pct;
+                if (n_top < TOP) n_top++;
+            }
+        }
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
+    memcpy(prev, cur, sizeof(prev[0]) * n_cur); n_prev = n_cur;
+    if (span <= 0) return;
+    char line[512]; int o = snprintf(line, sizeof line, "[threads] total=%.0f%%", total);
+    for (unsigned k = 0; k < n_top && o < (int)sizeof line - 40; k++)
+        o += snprintf(line + o, sizeof line - (size_t)o, " %s=%.0f%%", top[k].name, top[k].pct);
+    fprintf(stderr, "%s\n", line);
+}
+
 /* Main queue timer continues to report zero FPS even when frame submission
  * blocks. It changes only the title, with no extra GPU work or image readback. */
 static void fps_stop(void)
@@ -209,6 +261,7 @@ static void fps_start(void)
             title,r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds];
         fprintf(stderr,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f\n",
             r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds);
+        fps_log_threads();
     });
     dispatch_resume(s_fps_timer);
 }

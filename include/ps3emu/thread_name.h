@@ -40,7 +40,24 @@ static inline void ps3_thread_name(const char* fmt, ...)
     set_desc(GetCurrentThread(), w);
 }
 #else
+#if defined(__APPLE__)
+/* macOS: the name shows in `sample`, in crash reports and in the runtime's own
+ * per-thread CPU line (PS3RECOMP_METAL_FPS). pthread names are 63 bytes. */
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
+static inline void ps3_thread_name(const char* fmt, ...)
+{
+    char s[64];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s, sizeof s, fmt, ap);
+    va_end(ap);
+    pthread_setname_np(s);
+}
+#else
 static inline void ps3_thread_name(const char* fmt, ...) { (void)fmt; }
+#endif
 #endif
 
 #endif /* PS3EMU_THREAD_NAME_H */
