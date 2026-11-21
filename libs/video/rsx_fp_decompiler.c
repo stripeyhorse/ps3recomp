@@ -359,6 +359,13 @@ static void decode_src(u32 w, int abs_bit, Src* s)
     s->swz[4] = '\0';
 }
 
+/* PS3_RES_SCALE: the engine's render targets are this many times the guest's
+ * size, so SV_POSITION counts scaled pixels and WPOS is divided back to the
+ * guest's window coordinates. 1 (the default) emits exactly the old text. */
+static float s_fp_wpos_scale = 1.0f;
+void  rsx_fp_set_wpos_scale(float scale) { s_fp_wpos_scale = scale > 0.0f ? scale : 1.0f; }
+float rsx_fp_wpos_scale(void) { return s_fp_wpos_scale; }
+
 /* HLSL expression for the interpolated input selected by OPDEST.INPUT_SRC.
  * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..7; WPOS maps
  * to SV_POSITION (screen-space — an approximation of the RSX window coord). */
@@ -533,6 +540,14 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
             "    float2 size = float2(width, height);\n", tex);
         out_puts(p, text);
     }
+    /* PS3_RES_SCALE: a comparison map is a depth target the engine made the
+     * guest's size times the scale, while unnormalised coordinates count the
+     * guest's texels: scale them to the map's own texels first. */
+    if (d->unnormalized && s_fp_wpos_scale != 1.0f) {
+        snprintf(text, sizeof text, "    float2 uv = coordinate.xy * %.9g / size;\n",
+                 (double)s_fp_wpos_scale);
+        out_puts(p, text);
+    } else
     out_puts(p, d->unnormalized ? "    float2 uv = coordinate.xy / size;\n" :
                                      "    float2 uv = coordinate.xy;\n");
     if (!d->linear) {
@@ -1327,6 +1342,16 @@ static int rsx_fp_decompile_internal(
      * The draw engine passes the window height in fp_alpha.y when the origin is
      * BOTTOM (0 otherwise) and a pixel-center bias in fp_alpha.z (-0.5 for INTEGER
      * centers, 0 for HALF). A backend that leaves both 0 gets the host position. */
+    if (strstr(o.p, "_rsx_wpos(") && s_fp_wpos_scale != 1.0f) {
+        /* PS3_RES_SCALE: scaled pixels back to the guest's, before the origin flip. */
+        char macro[320];
+        snprintf(macro, sizeof macro, buffered
+            ? "#define _rsx_wpos(p) float4((p).x / %.9g + fp_alpha.z, "
+              "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y / %.9g : (p).y / %.9g) + fp_alpha.z, (p).z, (p).w)\n"
+            : "#define _rsx_wpos(p) float4((p).xy / %.9g, (p).zw)\n",
+            (double)s_fp_wpos_scale, (double)s_fp_wpos_scale, (double)s_fp_wpos_scale);
+        out_puts(&p, macro);
+    } else
     if (strstr(o.p, "_rsx_wpos("))
         out_puts(&p, buffered
             ? "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
@@ -1862,8 +1887,14 @@ int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy)
     }
     if (!body) return -1;
     char line[128];
-    const int n = snprintf(line, sizeof line,
-        "    input.position.xy = floor(input.position.xy / float2(%u, %u)) + 0.5;\n", sx, sy);
+    /* PS3_RES_SCALE: the grid counts guest pixels; _rsx_wpos divides by the scale after. */
+    const double k = (double)s_fp_wpos_scale;
+    const int n = s_fp_wpos_scale == 1.0f
+        ? snprintf(line, sizeof line,
+            "    input.position.xy = floor(input.position.xy / float2(%u, %u)) + 0.5;\n", sx, sy)
+        : snprintf(line, sizeof line,
+            "    input.position.xy = (floor(input.position.xy / float2(%.9g, %.9g)) + 0.5) * %.9g;\n",
+            (double)sx * k, (double)sy * k, k);
     if (n < 0 || (size_t)n >= sizeof line || len + (size_t)n + 1 > capacity) return -1;
     memmove(body + n, body, len - (size_t)(body - hlsl) + 1);
     memcpy(body, line, (size_t)n);

@@ -178,6 +178,8 @@ if(APPLE)
         "-framework Foundation"
         "-framework AppKit"
         "-framework ApplicationServices"
+        # PS3_UPSCALE=metalfx (macOS 13+); weak, so older systems still start.
+        "-weak_framework MetalFX"
     )
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"

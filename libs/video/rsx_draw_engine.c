@@ -1215,8 +1215,12 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
     const int z16 = z->zfmt == 1u;      /* SURFACE_FORMAT Z16 */
     const int bytes = base_fmt == RSX_TEX_FMT_A8R8G8B8 && !z16 && !rsx_texture_argb_is_rgba();
     const int d16 = base_fmt == RSX_TEX_FMT_DEPTH16 && z16;
+    /* A Z24S8 zeta read as Y16_X16: the depth as two 16-bit halves. PAIN
+     * reads its 2560x720 scene depth this way every frame; through guest
+     * memory that was 7 MB read back, decoded and uploaded again each time. */
+    const int y16x16 = base_fmt == 0x95u && !z16;
     if (s_depth_via_guest || !g.be->depth_as_color || !g.be->surface_view ||
-        !z->handle || !(bytes || d16) || !(t->format & RSX_TEX_FMT_LINEAR) ||
+        !z->handle || !(bytes || d16 || y16x16) || !(t->format & RSX_TEX_FMT_LINEAR) ||
         t->cubemap || t->dimension == 3 || t->mipmaps > 1)
         return 0;
     const u32 used_w = z->used_w < z->w ? z->used_w : z->w;
@@ -1480,6 +1484,38 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     return handle;
 }
 
+/* PS3RECOMP_ENG_TEXSTATS=1: once every 120 presented frames, how many texture
+ * decodes-and-uploads the FIFO thread did and why (new key, evicted key,
+ * guest bytes changed, bytes the engine itself stored), with their bytes.
+ * A scene that re-uploads every frame shows here as a steady non-zero row. */
+enum { TS_NEW, TS_EVICT, TS_CHANGED, TS_REWRITTEN, TS_N };
+static u32 s_ts_n[TS_N]; static u64 s_ts_bytes[TS_N]; static u32 s_ts_frame;
+static int eng_texstats_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_TEXSTATS"); on = e && *e && *e != '0'; }
+    return on;
+}
+static void eng_texstats(int why, u32 span, u32 w, u32 h, u32 fmt, u32 offset)
+{
+    if (!eng_texstats_on()) return;
+    s_ts_n[why]++; s_ts_bytes[why] += span;
+    if (why != TS_NEW) { static int n; if (PS3_LOG_FIRST(n, 40))
+        fprintf(stderr, "[texstats] %s %ux%u fmt=0x%02X off=0x%08X span=%u frame=%u\n",
+                why == TS_EVICT ? "evict" : why == TS_CHANGED ? "changed" : "rewritten",
+                w, h, fmt, offset, span, g.frames); }
+    if ((u32)(g.frames - s_ts_frame) < 120u) return;
+    fprintf(stderr, "[texstats] %u frames: new %u (%llu KB) evict %u (%llu KB) changed %u (%llu KB) "
+            "rewritten %u (%llu KB) cache %u/%u\n", g.frames - s_ts_frame,
+            s_ts_n[TS_NEW], (unsigned long long)(s_ts_bytes[TS_NEW] >> 10),
+            s_ts_n[TS_EVICT], (unsigned long long)(s_ts_bytes[TS_EVICT] >> 10),
+            s_ts_n[TS_CHANGED], (unsigned long long)(s_ts_bytes[TS_CHANGED] >> 10),
+            s_ts_n[TS_REWRITTEN], (unsigned long long)(s_ts_bytes[TS_REWRITTEN] >> 10),
+            g.n_textures, (u32)ENG_MAX_TEXTURES);
+    memset(s_ts_n, 0, sizeof s_ts_n); memset(s_ts_bytes, 0, sizeof s_ts_bytes);
+    s_ts_frame = g.frames;
+}
+
 /* The cache slot for a texture unit's bytes, keyed on where they are and what
  * the registers say they are. An already-cached entry is re-hashed at most
  * once per presented frame and re-decoded when the guest changed it, which is
@@ -1536,9 +1572,11 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              * bytes: they are new, so upload without hashing them all. The
              * stored hash becomes unknown and the next ordinary check
              * re-uploads once rather than miss a change. */
+            int ts_why = TS_CHANGED;
             if (e->rewritten && readable) {
                 hash = ~e->content_hash;
                 e->rewritten = 0;
+                ts_why = TS_REWRITTEN;
             } else if (readable && (sparse != e->sparse_hash ||
                              eng_texture_full_rehash(span, e->last_full_frame))) {
                 hash = eng_texture_content_hash(location, offset, span, &readable);
@@ -1547,6 +1585,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             if (readable) e->sparse_hash = sparse;
             e->last_hash_frame = g.frames;
             if (readable && hash != e->content_hash) {
+                eng_texstats(ts_why, span, w, h, fmt, offset);
                 /* In place when the backend orders the upload after the draws
                  * that sampled the old bytes; a volume keeps create-and-swap,
                  * and so does a different mip count (the key does not hold it,
@@ -1590,6 +1629,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
       e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
+    eng_texstats(evicted ? TS_EVICT : TS_NEW, span, w, h, fmt, offset);
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap, depth, 0u);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);

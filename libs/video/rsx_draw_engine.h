@@ -279,6 +279,9 @@ typedef struct rsx_draw_backend {
      *    G = bits 7..0, B = 0 (the stencil byte), A = bits 23..16, with
      *    round(depth * 0xFFFFFF) taken exactly;
      *  - DEPTH16 (0x92) of a Z16 zeta: R16 unorm of round(depth * 0xFFFF).
+     *  - Y16_X16 (0x95) of a Z24S8 zeta: R16G16 unorm, R the top 16 bits of
+     *    round(depth * 0xFFFFFF) and G its low 8 bits in the high byte, as
+     *    the decode reads the stored big-endian word.
      * Any other format: 0. Made in command order, like
      * depth_snapshot, so no wait, and from the depth the draws so far left,
      * which may be the target the current pass still attaches; the engine
