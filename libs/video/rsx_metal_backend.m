@@ -211,6 +211,25 @@ static void fps_track_drawable(id<CAMetalDrawable> drawable) { (void)drawable; }
 void rsx_metal_backend_note_guest_frame(void) {}
 #endif
 
+/* A slow drawable acquisition stalls the same thread that drains RSX.
+ * Include it in the opt-in FPS log so a compositor wait can be distinguished
+ * from a guest fence the FIFO never reached. */
+static id<CAMetalDrawable> acquire_drawable(CAMetalLayer *layer)
+{
+#if !TARGET_OS_IPHONE
+    if (fps_session()) {
+        const CFTimeInterval start=CACurrentMediaTime();
+        id<CAMetalDrawable> drawable=[layer nextDrawable];
+        const double elapsed_ms=(CACurrentMediaTime()-start)*1000.0;
+        if (elapsed_ms >= 50.0 || !drawable)
+            fprintf(stderr, "[RSX FPS] drawable_wait_ms=%.2f available=%d\n",
+                    elapsed_ms, drawable != nil);
+        return drawable;
+    }
+#endif
+    return [layer nextDrawable];
+}
+
 /* ---- vertex layout ----------------------------------------------------------
  * Every draw carries all 16 RSX vertex attributes as float4, fetched on the
  * CPU by rsx_fetch_attrib: 256 bytes per vertex, attribute i at offset i*16.
@@ -4652,7 +4671,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                     s_layer.drawableSize = CGSizeMake((CGFloat)ww, (CGFloat)wh);
                     fprintf(stderr, "[RSX metal] drawable %ux%u (window)\n", ww, wh);
                 }
-                drawable = [s_layer nextDrawable];
+                drawable = acquire_drawable(s_layer);
                 if (!drawable) {           /* compositor is busy; skip */
                     dispatch_semaphore_signal(s_inflight);
                     return;
@@ -5132,7 +5151,7 @@ void rsx_metal_backend_present(void)
             }
             target = s_host_tex[host_slot];
         } else {
-            drawable = [s_layer nextDrawable];
+            drawable = acquire_drawable(s_layer);
             if (!drawable) {            /* compositor is busy; skip this frame */
                 dispatch_semaphore_signal(s_inflight);
                 return;

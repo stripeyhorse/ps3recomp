@@ -100,6 +100,9 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #include <pthread.h>
   #include <unistd.h>
   #include <time.h>
+  #if defined(__APPLE__)
+    #include <pthread/qos.h>
+  #endif
   typedef pthread_t thread_t;
   typedef pthread_mutex_t mutex_t;
   #define mutex_init(m)    pthread_mutex_init(m, NULL)
@@ -144,8 +147,8 @@ static AudioNotifySlot s_notify_queues[CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES];
 static u64            s_audio_start_us = 0;
 
 /* Mixing thread */
-static unsigned long long g_audio_dropped;   /* frames the device had no room for */
 #ifdef _WIN32
+static unsigned long long g_audio_dropped;   /* frames the device had no room for */
 static unsigned g_audio_holes[CELL_AUDIO_PORT_MAX];   /* AUDIO_RATE: empty blocks right after a block with sound */
 #endif
 static volatile int  s_mix_thread_running = 0;
@@ -168,6 +171,11 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 #if AUDIO_BACKEND_SDL2
 
 static SDL_AudioDeviceID s_sdl_audio_dev = 0;
+#ifndef _WIN32
+/* Leave headroom for CoreAudio's periodic pulls and host scheduling jitter.
+ * Prime only the device queue: the guest ring must start at normal cadence. */
+enum { SDL_AUDIO_PREBUFFER_BLOCKS = 10, SDL_AUDIO_MAX_BLOCKS = 20 };
+#endif
 
 static int audio_backend_init(void)
 {
@@ -192,6 +200,12 @@ static int audio_backend_init(void)
         return -1;
     }
 
+#ifndef _WIN32
+    const float silence[CELL_AUDIO_BLOCK_SAMPLES * 2] = {0};
+    for (int block = 0; block < SDL_AUDIO_PREBUFFER_BLOCKS; ++block) {
+        if (SDL_QueueAudio(s_sdl_audio_dev, silence, sizeof silence) < 0) break;
+    }
+#endif
     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
     return 0;
 }
@@ -212,6 +226,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     }
 }
 
+#ifdef _WIN32
 /* SDL queues without bound: keep about four blocks ahead of the device. */
 static int audio_backend_room(void)
 {
@@ -221,7 +236,7 @@ static int audio_backend_room(void)
 }
 
 static void audio_backend_wait(void) { SDL_Delay(1); }
-
+#else
 static u32 audio_backend_queued_samples(void)
 {
     if (s_sdl_audio_dev) {
@@ -230,6 +245,7 @@ static u32 audio_backend_queued_samples(void)
     return 0;
 }
 
+#endif
 #endif /* AUDIO_BACKEND_SDL2 */
 
 #if AUDIO_BACKEND_WASAPI
@@ -678,30 +694,71 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+static uint64_t audio_clock_ns(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000000ull + now.tv_nsec;
+}
+
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
+    ps3_thread_name("audio mix");
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     printf("[cellAudio] Mixing thread started\n");
 
-    unsigned long blocks = 0; float peak = 0.0f;
+    const uint64_t block_ns = 1000000000ull * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE;
+    const int measure = getenv("AUDIO_RATE") != NULL;
+    const int report_peak = getenv("AUDIO_PEAK") != NULL;
+    uint64_t due = audio_clock_ns();
+    uint64_t interval = due;
+    unsigned mixed = 0, silent = 0, dry = 0, dropped = 0, late = 0;
+    float peak = 0.0f;
+
     while (s_mix_thread_running) {
+        const uint64_t now = audio_clock_ns();
+        if (now < due) {
+            const struct timespec wait = { 0, (long)(due - now) };
+            nanosleep(&wait, NULL);
+            continue;
+        }
+        /* A long scheduler pause must not drain several guest blocks before
+         * the producer can react to its first wakeup. Restart the cadence. */
+        if (now - due >= block_ns) {
+            due = now;
+            ++late;
+        }
+        due += block_ns;
         audio_mix_one_block();
         audio_dump_mix();
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
-        audio_notify_event_queues();
-        /* AUDIO_PEAK=1: the loudest sample of every second of mixed output (187.5 blocks of 256). */
-        { static int pk_on = -1; if (pk_on < 0) pk_on = getenv("AUDIO_PEAK") ? 1 : 0;
-          if (pk_on) {
-              const float pk = audio_mix_peak(); if (pk > peak) peak = pk;
-              if (++blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
-          } }
 
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
+        const u32 queued = audio_backend_queued_samples();
+        if (s_sdl_audio_dev && queued == 0) ++dry;
+        if (queued < CELL_AUDIO_BLOCK_SAMPLES * SDL_AUDIO_MAX_BLOCKS) {
+            audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         } else {
-            usleep(2000);
+            ++dropped;
         }
+        audio_notify_event_queues();
+
+        if (!measure && !report_peak) continue;
+        const float block_peak = audio_mix_peak();
+        if (block_peak > peak) peak = block_peak;
+        ++mixed;
+        if (block_peak == 0.0f) ++silent;
+        if (now - interval < 5000000000ull) continue;
+        if (measure) {
+            fprintf(stderr, "[audio-rate] %.1f blocks/s silent %.1f%% dry %u dropped %u late %u queue %u device %s\n",
+                    mixed * 1e9 / (now - interval), 100.0 * silent / mixed,
+                    dry, dropped, late, queued, s_sdl_audio_dev ? "open" : "none");
+        }
+        if (report_peak) fprintf(stderr, "[audio-peak] peak %.4f\n", peak);
+        mixed = silent = dry = dropped = late = 0;
+        peak = 0.0f;
+        interval = now;
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
