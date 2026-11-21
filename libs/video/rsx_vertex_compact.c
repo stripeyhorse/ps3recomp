@@ -432,6 +432,50 @@ int rsx_vertex_remap_build(
         remap->occurrence_capacity = count;
     }
 
+    /* Dense fast path. A mesh's indices nearly always cover a compact range
+     * with one base index, and then a table indexed by (vertex - lowest) does
+     * what the hash below does, in the same first-occurrence order, without a
+     * hash and a probe per index. This function was a tenth of the RSX thread
+     * in a scene of a few hundred indexed meshes. RSX_REMAP_DENSE=0 turns it
+     * off. */
+    {
+        static int dense = -1;
+        if (dense < 0) { const char* e = getenv("RSX_REMAP_DENSE"); dense = !(e && *e == '0'); }
+        u32 lo = refs[0].vertex_id, hi = lo;
+        const u32 base_index = refs[0].base_index;
+        int one_base = 1;
+        for (u32 i = 1; i < count; i++) {
+            const u32 v = refs[i].vertex_id;
+            lo = v < lo ? v : lo;
+            hi = v > hi ? v : hi;
+            one_base &= refs[i].base_index == base_index;
+        }
+        const u64 range = (u64)hi - lo + 1u;
+        if (dense && one_base && range <= (u64)count * 4u + 1024u) {
+            if (range > remap->direct_capacity) {
+                u32* table = (u32*)realloc(remap->direct, (size_t)range * sizeof(u32));
+                if (!table)
+                    return 0;
+                remap->direct = table;
+                remap->direct_capacity = (u32)range;
+            }
+            memset(remap->direct, 0xFF, (size_t)range * sizeof(u32));
+            u32 n = 0;
+            for (u32 occurrence = 0; occurrence < count; occurrence++) {
+                const rsx_vertex_ref ref = refs[occurrence];
+                u32* at = &remap->direct[ref.vertex_id - lo];
+                if (*at == 0xFFFFFFFFu) {
+                    *at = n;
+                    refs[n] = ref;      /* n <= occurrence: already read */
+                    n++;
+                }
+                remap->occurrence_to_unique[occurrence] = *at;
+            }
+            *unique_count = n;
+            return 1;
+        }
+    }
+
     if (count > UINT_MAX / 2u)
         return 0;
     u32 slot_capacity = 16u;
@@ -497,6 +541,7 @@ u32 rsx_vertex_remap_index(
 
 void rsx_vertex_remap_destroy(rsx_vertex_remap* remap)
 {
+    if (remap) { free(remap->direct); remap->direct = NULL; remap->direct_capacity = 0; }
     if (!remap)
         return;
     free(remap->occurrence_to_unique);

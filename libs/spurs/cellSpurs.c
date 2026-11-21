@@ -17,7 +17,11 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
 #include <stdio.h>
-#include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+#include <stdlib.h>
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
@@ -2002,6 +2006,15 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
     ps3_thread_name("spurs pm");
+#if defined(__APPLE__)
+    /* PS3_THREAD_QOS=1: run SPURS lanes at user-interactive QoS. A lane is a
+     * guest SPU, and when it has work the frame is waiting on it; at the
+     * default class macOS may place it on an efficiency core. Off unless
+     * asked: on a 4P+4E machine it measured no different, and whether it
+     * matters depends on the core mix. */
+    { const char* e = getenv("PS3_THREAD_QOS");
+      if (e && *e == '1') pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); }
+#endif
     struct SpursInst* si = slot->instance;
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }

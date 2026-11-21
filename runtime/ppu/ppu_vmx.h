@@ -270,8 +270,8 @@ VMX_INL float vmx_minf(float x, float y) {
     if (x == 0 && y == 0) return signbit(x) ? x : y;      /* min(-0,+0) = -0 */
     return x < y ? x : y;
 }
-VMX_FBIN(vmx_vaddfp, vmx_f(x) + vmx_f(y), 1)
-VMX_FBIN(vmx_vsubfp, vmx_f(x) - vmx_f(y), 1)
+VMX_FBIN(vmx_vaddfp_ref, vmx_f(x) + vmx_f(y), 1)
+VMX_FBIN(vmx_vsubfp_ref, vmx_f(x) - vmx_f(y), 1)
 VMX_FBIN(vmx_vmaxfp, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
 VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
 
@@ -285,8 +285,8 @@ VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
  * ASSUMPTION: the host rounding mode is round-to-nearest (nothing in the
  * runtime changes MXCSR). */
 VMX_INL float vmx_fmaf(float x, float z, float y) {
-#if defined(__FMA__)
-    return fmaf(x, z, y);   /* one instruction with -mfma */
+#if defined(__FMA__) || defined(__aarch64__)
+    return fmaf(x, z, y);   /* one instruction with -mfma, and always on arm64 */
 #else
     const double s = (double)x * (double)z + (double)y;
     uint64_t u; memcpy(&u, &s, sizeof u);
@@ -296,16 +296,70 @@ VMX_INL float vmx_fmaf(float x, float z, float y) {
     return fmaf(x, z, y);
 #endif
 }
-VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+VMX_INL void vmx_vmaddfp_ref(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
         vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(vmx_fmaf(x, z, y))), vscr)); } VMX_OUT; }
-VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+VMX_INL void vmx_vnmsubfp_ref(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
         vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-vmx_fmaf(x, z, -y))), vscr)); } VMX_OUT; }
+
+/* vaddfp, vsubfp, vmaddfp and vnmsubfp are most of a physics- and
+ * animation-heavy title's vector float work (a fifth of PAIN's main thread in
+ * its city view), and the element loops above do them a byte at a time. On
+ * arm64 they are a byte reverse, the NJ flush, one NEON operation and the NaN
+ * rule, bit for bit what the loops give (tests/test_vmx_neon.c compares them).
+ * The loops stay as the reference and as every other host's implementation. */
+#if defined(__aarch64__)
+#include <arm_neon.h>
+VMX_INL uint32x4_t vmxn_ld(const void* p) { return vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8((const uint8_t*)p))); }
+VMX_INL void vmxn_st(void* d, uint32x4_t v) { vst1q_u8((uint8_t*)d, vrev32q_u8(vreinterpretq_u8_u32(v))); }
+VMX_INL uint32x4_t vmxn_flush(uint32x4_t x, uint32_t vscr) {
+    if (!(vscr & VMX_NJ)) return x;
+    const uint32x4_t tiny = vceqzq_u32(vandq_u32(x, vdupq_n_u32(0x7F800000u)));
+    return vbslq_u32(tiny, vandq_u32(x, vdupq_n_u32(0x80000000u)), x);
+}
+VMX_INL uint32x4_t vmxn_isnan(uint32x4_t x) {
+    return vcgtq_u32(vandq_u32(x, vdupq_n_u32(0x7FFFFFFFu)), vdupq_n_u32(0x7F800000u));
+}
+VMX_INL uint32x4_t vmxn_fix(uint32x4_t r) { return vbslq_u32(vmxn_isnan(r), vdupq_n_u32(0x7FC00000u), r); }
+/* NaN precedence: A, B (quieted), else the fixed result */
+VMX_INL uint32x4_t vmxn_nan2(uint32x4_t r, uint32x4_t a, uint32x4_t b) {
+    const uint32x4_t q = vdupq_n_u32(0x7FC00000u);
+    r = vbslq_u32(vmxn_isnan(b), vorrq_u32(b, q), vmxn_fix(r));
+    return vbslq_u32(vmxn_isnan(a), vorrq_u32(a, q), r);
+}
+VMX_INL void vmx_vaddfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const uint32x4_t x = vmxn_flush(vmxn_ld(a_), vscr), y = vmxn_flush(vmxn_ld(b_), vscr);
+    const uint32x4_t z = vreinterpretq_u32_f32(vaddq_f32(vreinterpretq_f32_u32(x), vreinterpretq_f32_u32(y)));
+    vmxn_st(d_, vmxn_flush(vmxn_nan2(z, x, y), vscr));
+}
+VMX_INL void vmx_vsubfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const uint32x4_t x = vmxn_flush(vmxn_ld(a_), vscr), y = vmxn_flush(vmxn_ld(b_), vscr);
+    const uint32x4_t z = vreinterpretq_u32_f32(vsubq_f32(vreinterpretq_f32_u32(x), vreinterpretq_f32_u32(y)));
+    vmxn_st(d_, vmxn_flush(vmxn_nan2(z, x, y), vscr));
+}
+VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
+    const float32x4_t x = vreinterpretq_f32_u32(vmxn_flush(vmxn_ld(a_), vscr)),
+                      y = vreinterpretq_f32_u32(vmxn_flush(vmxn_ld(b_), vscr)),
+                      z = vreinterpretq_f32_u32(vmxn_flush(vmxn_ld(c_), vscr));
+    vmxn_st(d_, vmxn_flush(vmxn_fix(vreinterpretq_u32_f32(vfmaq_f32(y, x, z))), vscr));
+}
+VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
+    const float32x4_t x = vreinterpretq_f32_u32(vmxn_flush(vmxn_ld(a_), vscr)),
+                      y = vreinterpretq_f32_u32(vmxn_flush(vmxn_ld(b_), vscr)),
+                      z = vreinterpretq_f32_u32(vmxn_flush(vmxn_ld(c_), vscr));
+    vmxn_st(d_, vmxn_flush(vmxn_fix(vreinterpretq_u32_f32(vnegq_f32(vfmaq_f32(vnegq_f32(y), x, z)))), vscr));
+}
+#else
+VMX_INL void vmx_vaddfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vaddfp_ref(d_, a_, b_, vscr); }
+VMX_INL void vmx_vsubfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vsubfp_ref(d_, a_, b_, vscr); }
+VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vmaddfp_ref(d_, a_, b_, c_, vscr); }
+VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vnmsubfp_ref(d_, a_, b_, c_, vscr); }
+#endif
 
 #define VMX_FUN(name, expr, flush_in, nanmode) \
 VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16]; \

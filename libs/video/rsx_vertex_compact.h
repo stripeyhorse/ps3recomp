@@ -44,6 +44,8 @@ typedef struct rsx_vertex_remap {
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    u32* direct;            /* dense-range table (rsx_vertex_remap_build) */
+    u32 direct_capacity;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {
