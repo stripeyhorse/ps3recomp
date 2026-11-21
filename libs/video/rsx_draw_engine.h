@@ -324,6 +324,8 @@ void rsx_draw_engine_set_default(int on);
 void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user);
 
 int  rsx_draw_engine_init(u32 width, u32 height);
+/* True on the render owner while prebuilding the optional shader recipe map. */
+int  rsx_draw_engine_preparing_shaders(void);
 void rsx_draw_engine_shutdown(void);
 
 /* One FIFO method, with its subchannel bits still on: the engine masks them

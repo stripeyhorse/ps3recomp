@@ -19,6 +19,7 @@
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -159,6 +160,7 @@ typedef struct {
     u64 key;
     u32 handle;
     u8 fixed;
+    u8 prepared;           /* 1 until the first draw uses a prebuilt pipeline */
     u16 tex_used;           /* units the pixel program samples */
     u64 fp_hash;            /* eng_fp_debug_hash of the guest fragment program */
 } eng_pipeline;
@@ -2157,6 +2159,233 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
     s_dbz.mn = mn; s_dbz.mx = mx;
 }
 
+/* Local capture format for the shader preparation tool. Only the recipe
+ * metadata is distributable. The capture's program bytes are used to locate
+ * matching inputs in the player's disc and are kept out of the resulting map.
+ * Version the map whenever a field or shader/pipeline identity changes. */
+typedef struct {
+    u64 key, vs_hash, ps_hash, fp_hash;
+    u32 vp_bytes, fp_bytes, rt_fmt, rt_count;
+    u32 fp_ctrl, cube_mask, vol_mask, vtex_mask, vp_branch_bits;
+    u32 ucp, dbz, shadow_mask, expand_units, unnorm_mask, srgb_output;
+    u32 wpos_grid[2];
+    u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][3];
+    rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES];
+    u8 gamma_masks[RSX_DSP_NUM_TEXTURES];
+    u8 expand_masks[RSX_DSP_NUM_TEXTURES];
+    rsx_vertex_layout_plan layout;
+    rsx_be_render_state state;
+} eng_shader_recipe;
+
+static u64 eng_shader_text_hash(const char* source)
+{
+    return eng_fnv1a(source, (u32)strlen(source), 1469598103934665603ull);
+}
+
+static int s_preparing_shaders;
+static int s_log_prepared_shaders;
+
+int rsx_draw_engine_preparing_shaders(void)
+{
+    return s_preparing_shaders;
+}
+
+static void eng_shader_capture(const char* dir, const eng_shader_recipe* recipe,
+                               const u8* vs, const u8* fs)
+{
+    char name[1024];
+    const int len = snprintf(name, sizeof name, "%s/%016llx.capture", dir,
+                             (unsigned long long)recipe->key);
+    if (len < 0 || (size_t)len >= sizeof name) return;
+    FILE* file = fopen(name, "wb");
+    if (!file) return;
+    if (fwrite(recipe, sizeof *recipe, 1, file) == 1 &&
+        fwrite(vs, recipe->vp_bytes, 1, file) == 1)
+        fwrite(fs, recipe->fp_bytes, 1, file);
+    fclose(file);
+}
+
+static void eng_translate_shader(const eng_shader_recipe* recipe, const u8* vs, const u8* fs,
+                                 u32 constant_count, int* vi, int* fi, u32* nconst, u32* dbz_bit)
+{
+    rsx_vp_set_branch_bits(recipe->vp_branch_bits);
+    *vi = rsx_vp_decompile_compact_ex(vs, recipe->vp_bytes, recipe->vtex_mask,
+                                      recipe->layout.mask, s_vs_hlsl, sizeof s_vs_hlsl);
+    if (*vi > 0 && recipe->ucp &&
+        rsx_vp_apply_user_clip(s_vs_hlsl, sizeof s_vs_hlsl, recipe->ucp) < 0) {
+        *vi = -1;
+        static u32 said;
+        if (PS3_LOG_FIRST(said, 8))
+            fprintf(stderr, "[rsx engine] vertex program could not apply user clip planes\n");
+    }
+    *fi = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(
+        fs, recipe->fp_bytes, recipe->fp_ctrl, recipe->cube_mask, recipe->vol_mask,
+        recipe->shadow_mask ? recipe->shadow : NULL, recipe->gamma_masks,
+        recipe->expand_units ? recipe->expand_masks : NULL, s_ps_hlsl, sizeof s_ps_hlsl, nconst);
+    if (*fi > 0 && *nconst != constant_count) *fi = -1;
+    if (*fi > 0 && (recipe->wpos_grid[0] > 1u || recipe->wpos_grid[1] > 1u) &&
+        rsx_fp_apply_wpos_grid(s_ps_hlsl, sizeof s_ps_hlsl,
+                              recipe->wpos_grid[0], recipe->wpos_grid[1]) < 0)
+        *fi = -1;
+    if (*fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl,
+            recipe->unnorm_mask, recipe->unnorm_dim, recipe->cube_mask, recipe->vol_mask) < 0)
+        *fi = -1;
+    if (*fi > 0 && recipe->srgb_output &&
+        rsx_fp_apply_srgb_output(s_ps_hlsl, sizeof s_ps_hlsl) < 0)
+        *fi = -1;
+    if (*fi > 0 && recipe->state.alpha_test_enable &&
+        rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl, recipe->state.alpha_func) < 0)
+        *fi = -1;
+    if (*fi > 0 && recipe->dbz) {
+        if (rsx_fp_apply_depth_bounds(s_ps_hlsl, sizeof s_ps_hlsl, recipe->dbz - 1u) > 0)
+            *dbz_bit = 1u << (recipe->dbz - 1u); /* read with Load, no sampler */
+        else {
+            static u32 said;
+            if (PS3_LOG_FIRST(said, 8))
+                fprintf(stderr, "[rsx engine] depth bounds not applied to a fragment program"
+                                " (unexpected text)\n");
+        }
+    }
+}
+
+#define ENG_SHADER_MAP_LIMIT 2048u
+#define ENG_SHADER_PROGRAM_LIMIT (64u * 1024)
+#define ENG_SHADER_PATH_LIMIT 480u
+
+/* Only paths relative to the validated game-data root are accepted. */
+static int eng_read_shader_path(FILE* map, char* path, u32 size)
+{
+    if (!size || size >= ENG_SHADER_PATH_LIMIT || fread(path, 1, size, map) != size)
+        return 0;
+    path[size] = '\0';
+    if (strlen(path) != size || path[0] == '/' || strchr(path, '\\') ||
+        strchr(path, ':')) return 0;
+    for (const char* part = path; *part;) {
+        size_t n = strcspn(part, "/");
+        if (!n || (n == 1 && part[0] == '.') ||
+            (n == 2 && part[0] == '.' && part[1] == '.')) return 0;
+        part += n;
+        if (*part) ++part;
+    }
+    return 1;
+}
+
+static int eng_read_shader_bytes(const char* root, const char* name, u64 offset,
+                                 u8* bytes, u32 size)
+{
+    char path[2048];
+    const int len = snprintf(path, sizeof path, "%s/%s", root, name);
+    if (len < 0 || (size_t)len >= sizeof path || offset > LONG_MAX) return 0;
+    FILE* file = fopen(path, "rb");
+    if (!file) return 0;
+    const int ok = fseek(file, (long)offset, SEEK_SET) == 0 &&
+                   fread(bytes, 1, size, file) == size;
+    fclose(file);
+    return ok;
+}
+
+static int eng_build_recipe(const eng_shader_recipe* recipe, u8* vs, u8* fs)
+{
+    u32 slot = eng_pipeline_slot(recipe->key);
+    for (; g.pipeline_index[slot]; slot = (slot + 1u) & (ENG_PIPELINE_INDEX - 1u))
+        if (g.pipelines[g.pipeline_index[slot] - 1u].key == recipe->key) return 0;
+
+    /* The VP decompiler consumes little-endian words. On-disc VP words are
+     * big-endian, while FP input is in the RSX's raw byte order. */
+    for (u32 i = 0; i < recipe->vp_bytes; i += 4) {
+        const u8 a = vs[i], b = vs[i + 1];
+        vs[i] = vs[i + 3];
+        vs[i + 1] = vs[i + 2];
+        vs[i + 2] = b;
+        vs[i + 3] = a;
+    }
+    const int constants = rsx_fp_collect_constants(fs, recipe->fp_bytes, &g.fp_constants);
+    if (constants < 0) return 0;
+    int vi, fi;
+    u32 nconst = 0, dbz_bit = 0;
+    eng_translate_shader(recipe, vs, fs, (u32)constants, &vi, &fi, &nconst, &dbz_bit);
+    if (vi <= 0 || fi <= 0 ||
+        eng_shader_text_hash(s_vs_hlsl) != recipe->vs_hash ||
+        eng_shader_text_hash(s_ps_hlsl) != recipe->ps_hash)
+        return 0;
+
+    const u32 handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl,
+        &recipe->state, &recipe->layout, recipe->layout.stride,
+        (rsx_be_format)recipe->rt_fmt, recipe->rt_count);
+    if (!handle) return 0;
+    eng_pipeline* pipeline = &g.pipelines[g.n_pipelines++];
+    *pipeline = (eng_pipeline){
+        .key = recipe->key, .handle = handle, .prepared = 1,
+        .tex_used = (u16)(eng_sampled_units(s_ps_hlsl) | dbz_bit), .fp_hash = recipe->fp_hash,
+    };
+    g.pipeline_index[slot] = (u16)g.n_pipelines;
+    return 1;
+}
+
+static void eng_prepare_shaders(void)
+{
+    const char* path = getenv("PS3RECOMP_SHADER_RECIPES");
+    const char* root = getenv("PS3RECOMP_SHADER_GAME_DIR");
+    if (!path || !*path || !root || !*root) return;
+
+    FILE* map = fopen(path, "rb");
+    if (!map) {
+        fprintf(stderr, "[shader-prep] Could not read shader recipes\n");
+        return;
+    }
+    char magic[8];
+    u32 header[2];
+    if (fread(magic, sizeof magic, 1, map) != 1 || memcmp(magic, "PRSMAP1", 8) != 0 ||
+        fread(header, sizeof header, 1, map) != 1 || header[0] != sizeof(eng_shader_recipe) ||
+        !header[1] || header[1] > ENG_SHADER_MAP_LIMIT) {
+        fprintf(stderr, "[shader-prep] Incompatible shader recipe format\n");
+        fclose(map);
+        return;
+    }
+
+    u8* buffers = malloc(2 * ENG_SHADER_PROGRAM_LIMIT);
+    if (!buffers) {
+        fclose(map);
+        return;
+    }
+    u8* vs = buffers;
+    u8* fs = buffers + ENG_SHADER_PROGRAM_LIMIT;
+    const u32 total = header[1];
+    u32 built = 0;
+    const char* fps = getenv("PS3RECOMP_METAL_FPS");
+    s_log_prepared_shaders = fps && *fps && *fps != '0';
+    s_preparing_shaders = 1;
+    for (u32 i = 0; i < total; i++) {
+        eng_shader_recipe recipe;
+        u64 offsets[2];
+        u32 lengths[2];
+        char vp_path[ENG_SHADER_PATH_LIMIT], fp_path[ENG_SHADER_PATH_LIMIT];
+        if (fread(&recipe, sizeof recipe, 1, map) != 1 ||
+            fread(offsets, sizeof offsets, 1, map) != 1 ||
+            fread(lengths, sizeof lengths, 1, map) != 1 ||
+            !eng_read_shader_path(map, vp_path, lengths[0]) ||
+            !eng_read_shader_path(map, fp_path, lengths[1])) break;
+        if (recipe.key && recipe.vp_bytes && recipe.fp_bytes &&
+            recipe.vp_bytes <= ENG_SHADER_PROGRAM_LIMIT &&
+            recipe.fp_bytes <= ENG_SHADER_PROGRAM_LIMIT &&
+            !(recipe.vp_bytes % 16) && !(recipe.fp_bytes % 16) &&
+            recipe.dbz <= RSX_DSP_NUM_TEXTURES &&
+            recipe.layout.count && recipe.layout.count <= RSX_DSP_NUM_VERTEX_ATTR &&
+            recipe.layout.stride == recipe.layout.count * 16u &&
+            recipe.rt_count && recipe.rt_count <= RSX_BE_MAX_COLOR_TARGETS &&
+            recipe.rt_fmt <= RSX_BE_FMT_R32G32B32A32F &&
+            eng_read_shader_bytes(root, vp_path, offsets[0], vs, recipe.vp_bytes) &&
+            eng_read_shader_bytes(root, fp_path, offsets[1], fs, recipe.fp_bytes))
+            built += eng_build_recipe(&recipe, vs, fs);
+        if (((i + 1u) % 16u) == 0 && i + 1u < total)
+            fprintf(stderr, "[shader-prep] Preparing shaders (%u of %u)\n", i + 1u, total);
+    }
+    s_preparing_shaders = 0;
+    free(buffers);
+    fclose(map);
+    fprintf(stderr, "[shader-prep] Prepared %u of %u Metal pipelines before Play\n", built, total);
+}
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
@@ -2278,8 +2507,13 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
     u32 slot = eng_pipeline_slot(key);
     for (; g.pipeline_index[slot]; slot = (slot + 1u) & (ENG_PIPELINE_INDEX - 1u)) {
-        const eng_pipeline* p = &g.pipelines[g.pipeline_index[slot] - 1u];
+        eng_pipeline* p = &g.pipelines[g.pipeline_index[slot] - 1u];
         if (p->key == key) {
+            if (p->prepared) {
+                if (s_log_prepared_shaders)
+                    fprintf(stderr, "[shader-prep] Used pipeline %016llx\n", (unsigned long long)key);
+                p->prepared = 0;
+            }
             *out_fixed = p->fixed;
             *out_tex_used = p->tex_used;
             *out_fp_hash = p->fp_hash;
@@ -2287,6 +2521,24 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         }
     }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
+
+    eng_shader_recipe recipe = {0};
+    recipe.key = key;
+    recipe.vp_bytes = vp_instrs * 16u; recipe.fp_bytes = fp_size;
+    recipe.rt_fmt = rt_fmt; recipe.rt_count = rt_count;
+    recipe.fp_ctrl = fp_ctrl; recipe.cube_mask = cube_mask;
+    recipe.vol_mask = vol_mask; recipe.vtex_mask = vtex_mask;
+    recipe.vp_branch_bits = vp_branch_bits;
+    recipe.ucp = ucp; recipe.dbz = dbz; recipe.shadow_mask = shadow_mask;
+    recipe.expand_units = expand_units; recipe.unnorm_mask = unnorm_mask;
+    recipe.srgb_output = srgb_output;
+    memcpy(recipe.wpos_grid, wpos_grid, sizeof recipe.wpos_grid);
+    memcpy(recipe.unnorm_dim, unnorm_dim, sizeof recipe.unnorm_dim);
+    memcpy(recipe.shadow, shadow, sizeof recipe.shadow);
+    memcpy(recipe.gamma_masks, gamma_masks, sizeof recipe.gamma_masks);
+    memcpy(recipe.expand_masks, expand_masks, sizeof recipe.expand_masks);
+    recipe.layout = *layout;
+    recipe.state = *rs;
 
     u32 handle = 0;
     int vi = 1, fi = 1;
@@ -2296,50 +2548,20 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
     } else {
-        rsx_vp_set_branch_bits(vp_branch_bits);
-        vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
-                                         layout->mask, s_vs_hlsl,
-                                         sizeof s_vs_hlsl);
-        if (vi > 0 && ucp && rsx_vp_apply_user_clip(s_vs_hlsl, sizeof s_vs_hlsl, ucp) < 0) {
-            vi = -1;
-            static u32 said;
-            if (PS3_LOG_FIRST(said, 8))
-                fprintf(stderr, "[rsx engine] user clip planes 0x%06X: vertex program text not in the"
-                                " decompiler's form, draw skipped\n", rsx_dsp_reg(&g.rsx, 0x1478u));
-        }
-        fi = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp_uc, fp_size, fp_ctrl, cube_mask, vol_mask,
-                shadow_mask ? shadow : NULL, gamma_masks, expand_units ? expand_masks : NULL,
-                s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
-        if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
-        if (fi > 0 && wpos_scaled &&
-            rsx_fp_apply_wpos_grid(s_ps_hlsl, sizeof s_ps_hlsl, wpos_grid[0], wpos_grid[1]) < 0)
-            fi = -1;
-        if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
-                                                (const u32 (*)[3])unnorm_dim, cube_mask,
-                                                vol_mask) < 0)
-            fi = -1;
-        if (fi > 0 && srgb_output &&
-            rsx_fp_apply_srgb_output(s_ps_hlsl, sizeof s_ps_hlsl) < 0)
-            fi = -1;
-        if (fi > 0 && rs->alpha_test_enable &&
-            rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
-                                             rs->alpha_func) < 0)
-            fi = -1;
-        if (fi > 0 && dbz) {
-            if (rsx_fp_apply_depth_bounds(s_ps_hlsl, sizeof s_ps_hlsl, dbz - 1u) > 0) {
-                dbz_bit = 1u << (dbz - 1u);   /* read with Load: no rsx_samp[] names it */
-            } else {
-                static u32 said;   /* drawn unbounded rather than dropped */
-                if (PS3_LOG_FIRST(said, 8))
-                    fprintf(stderr, "[rsx engine] depth bounds not applied to a fragment program"
-                                    " (unexpected text)\n");
-            }
-        }
+        eng_translate_shader(&recipe, vp_uc, fp_uc, g.fp_constants.count,
+                             &vi, &fi, &nconst, &dbz_bit);
     }
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
     const u64 fp_hash = fixed ? 0 : eng_fp_debug_hash(fp_uc, fp_size);
+    const char* capture = getenv("PS3RECOMP_SHADER_CAPTURE");
+    if (capture && *capture && handle && !fixed) {
+        recipe.vs_hash = eng_shader_text_hash(s_vs_hlsl);
+        recipe.ps_hash = eng_shader_text_hash(s_ps_hlsl);
+        recipe.fp_hash = fp_hash;
+        eng_shader_capture(capture, &recipe, vp_uc, fp_uc);
+    }
     /* RSX_ENGINE_SHADER_DUMP=<existing dir>: each new pipeline's two programs
      * as <dir>/pipe<handle>.vs.hlsl and .ps.hlsl, the handle being the one
      * RSX_ENGINE_PASS_DUMP's index names, and a guest fragment program's own
@@ -2382,6 +2604,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipelines[g.n_pipelines].fp_hash = fp_hash;
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
+    g.pipelines[g.n_pipelines].prepared = 0;
     g.pipelines[g.n_pipelines].tex_used =
         (u16)(fixed ? 0xFFFFu : (eng_sampled_units(s_ps_hlsl) | dbz_bit));
     *out_tex_used = g.pipelines[g.n_pipelines].tex_used;
@@ -3713,6 +3936,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
         free(g.vp_cb); g.vp_cb = NULL;
         return -1;
     }
+    eng_prepare_shaders();
     rsx_dispatch_sink sink;
     memset(&sink, 0, sizeof sink);
     sink.clear            = sink_clear;

@@ -3514,6 +3514,8 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
         snprintf(name, sizeof name, "%s %016llx", what, (unsigned long long)hash);
         fn = compile_guest_function(s_msl, name);
     }
+    /* A preparation failure must not prevent a retry at the first draw. */
+    if (!fn && rsx_draw_engine_preparing_shaders()) return nil;
     s_eng_func[s_eng_func_count].hash = hash;
     s_eng_func[s_eng_func_count].fn   = fn;
     s_eng_func_count++;
@@ -4940,7 +4942,9 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
                 host_detach();
             }
         }
-        rc = s_headless ? create_offscreen() : s_host ? 0 : create_window(title);
+        const char* recipes = getenv("PS3RECOMP_SHADER_RECIPES");
+        const int defer_window = !s_headless && !s_host && recipes && *recipes;
+        rc = s_headless ? create_offscreen() : (s_host || defer_window) ? 0 : create_window(title);
 #endif
         if (rc != 0) {
             fprintf(stderr, "[RSX metal] surface creation failed\n");
@@ -4997,6 +5001,19 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         } else {
             rsx_set_backend(&s_backend_vtable);
         }
+#if !TARGET_OS_IPHONE
+        if (recipes && *recipes) {
+            RsxMslCacheStats stats;
+            rsx_hlsl_to_msl_cache_stats(&stats);
+            fprintf(stderr, "[shader-prep] MSL translations=%u disk hits=%u\n",
+                    stats.translations, stats.disk_hits);
+        }
+        if (defer_window && create_window(title) != 0) {
+            rsx_metal_backend_shutdown();
+            fprintf(stderr, "[RSX metal] window creation failed\n");
+            return -1;
+        }
+#endif
         fprintf(stderr, "[RSX metal] %s on %s (%ux%u), guest shaders %s, %s path\n",
                 s_headless ? "headless" : s_host ? "host-surface" : "windowed",
                 [[s_dev name] UTF8String], s_width, s_height,
