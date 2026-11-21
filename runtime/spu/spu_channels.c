@@ -2900,7 +2900,12 @@ void spu_indirect_branch(spu_context* ctx)
      * chase after phantom memory corruption. Decode the target word instead: a
      * `stop` is opcode 0 in the top 11 bits, so this is unambiguous. */
     if (!fn) {
-        uint32_t p0 = ctx->pc & SPU_LS_MASK;
+        /* The SPU ignores the low two bits of a branch target, and titles do
+         * branch through tagged pointers. Decoding the word at the unaligned
+         * address reads three bytes of one instruction and one of the next:
+         * PAIN's job at LS 0x12600 then looked like `stop 0x0C38`, and the
+         * job was ended instead of being interpreted. */
+        uint32_t p0 = ctx->pc & SPU_LS_MASK & ~3u;
         if (p0 + 3 < SPU_LS_SIZE) {
             uint32_t w = ((uint32_t)ctx->ls[p0] << 24) | ((uint32_t)ctx->ls[p0+1] << 16) |
                          ((uint32_t)ctx->ls[p0+2] << 8) | ctx->ls[p0+3];
