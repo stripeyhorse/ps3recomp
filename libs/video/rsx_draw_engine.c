@@ -167,13 +167,12 @@ typedef struct {
 
 typedef struct { u32 first, count; } eng_batch;
 
-/* A vertex program's identity hash, remembered with the exact bytes it was
- * computed from: the transform program changes only on upload, but every
- * draw re-derives the pipeline key from it. */
+/* Vertex analysis is reusable while the exact program bytes match. */
 typedef struct {
     const u8* uc;
-    u32 bytes;
-    u64 seed, hash;
+    u32 bytes, inputs;
+    u64 hash;
+    int uses_branch_bits;
     u8 copy[RSX_DSP_VP_INSTR * 16u];
 } eng_vp_memo;
 
@@ -387,24 +386,25 @@ static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
     return hash;
 }
 
-/* eng_fnv1a(uc, bytes, seed) for a vertex program, reused while the bytes
- * are unchanged. A byte compare is far cheaper than the byte-serial hash. */
-static u64 eng_vp_hash(const u8* uc, u32 bytes, u64 seed)
+/* Call with a positive, validated size within the dispatcher VP array. */
+static const eng_vp_memo* eng_vp_metadata(const u8* uc, u32 instrs)
 {
-    if (bytes > sizeof g.vp_memo[0].copy) return eng_fnv1a(uc, bytes, seed);
+    const u32 bytes = instrs * 16u;
     for (u32 i = 0; i < ENG_VP_MEMO; i++) {
         eng_vp_memo* m = &g.vp_memo[i];
-        if (m->uc == uc && m->bytes == bytes && m->seed == seed &&
-            !memcmp(m->copy, uc, bytes))
-            return m->hash;
+        if (m->uc == uc && m->bytes == bytes && !memcmp(m->copy, uc, bytes))
+            return m;
     }
     eng_vp_memo* m = &g.vp_memo[g.vp_memo_next++ % ENG_VP_MEMO];
     m->uc = uc;
     m->bytes = bytes;
-    m->seed = seed;
     memcpy(m->copy, uc, bytes);
-    m->hash = eng_fnv1a(uc, bytes, seed);
-    return m->hash;
+    m->hash = eng_fnv1a(m->copy, bytes, 1469598103934665603ull);
+    m->uses_branch_bits = rsx_vp_uses_branch_bits(m->copy, bytes);
+    rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
+    m->inputs = rsx_vp_analyze_inputs(m->copy, bytes, &analysis) == (int)instrs &&
+                analysis.exact && analysis.input_mask ? analysis.input_mask : 0xFFFFu;
+    return m;
 }
 
 static u32 eng_pipeline_slot(u64 key)
@@ -1912,8 +1912,13 @@ static u32 eng_cube_mask(const rsx_dsp_texture* tex)
  * layout and by the pipeline, because they must not disagree: the built-in
  * program declares all sixteen inputs, so narrowing the layout for it would
  * leave the pipeline's vertex descriptor short of what the shader reads. */
-static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
-                              const u8** out_fp, u32* out_fp_size)
+typedef struct {
+    const eng_vp_memo* vp;
+    const u8* fp;
+    u32 fp_size;
+} eng_program_pair;
+
+static eng_program_pair eng_guest_programs(void)
 {
     const u8* vp_uc = NULL;
     u32 vp_instrs = 0;
@@ -1941,27 +1946,10 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
         if (!fp_uc) fp_size = 0;
     }
 
-    if (out_vp) *out_vp = vp_uc;
-    if (out_vp_instrs) *out_vp_instrs = vp_instrs;
-    if (out_fp) *out_fp = fp_uc;
-    if (out_fp_size) *out_fp_size = fp_size;
-    return vp_instrs && fp_size;
-}
-
-/* The layout the active vertex program actually reads. An uncertain analysis
- * falls back to all sixteen registers (rsx_live_draw.c:3625-3643). */
-static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
-{
-    u32 mask = 0xFFFFu;
-    const u8* uc = NULL;
-    u32 instrs = 0;
-    if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
-        rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
-        if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
-            analysis.exact && analysis.input_mask)
-            mask = analysis.input_mask;
-    }
-    rsx_vertex_layout_plan_init(layout, mask);
+    return (eng_program_pair){
+        vp_instrs && fp_size ? eng_vp_metadata(vp_uc, vp_instrs) : NULL,
+        fp_uc, fp_size
+    };
 }
 
 /* What a draw runs before a title has loaded programs of its own.
@@ -2155,7 +2143,8 @@ static int eng_depth_bounds_on(void)
 }
 
 static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs,
-                                      u32 cube_mask, u32 volume_mask)
+                                      u32 cube_mask, u32 volume_mask,
+                                      const eng_program_pair* programs)
 {
     s_dbz.unit = 0; s_dbz.copy = 0;
     if (g.be->set_depth_bounds || !g.be->depth_snapshot || !rs->depth_bounds_test ||
@@ -2169,11 +2158,10 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs,
     mn = mn > 0.0f ? (mn < 1.0f ? mn : 1.0f) : 0.0f;
     mx = mx > 0.0f ? (mx < 1.0f ? mx : 1.0f) : 0.0f;
     if (mn <= 0.0f && mx >= 1.0f) return;
-    const u8* vp_uc = NULL; const u8* fp_uc = NULL; u32 vp_instrs = 0, fp_size = 0;
-    if (!eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size)) return;
+    if (!programs->vp) return;
     /* A unit the program neither samples nor has declared as a cube or a
      * volume (rsx_fp_apply_depth_bounds reads it as a Texture2D). */
-    const u32 busy = rsx_fp_texture_units(fp_uc, fp_size) | cube_mask | volume_mask;
+    const u32 busy = rsx_fp_texture_units(programs->fp, programs->fp_size) | cube_mask | volume_mask;
     int unit = -1;
     for (int u = RSX_BE_MAX_TEXTURES - 1; u >= 0 && unit < 0; u--)
         if (!((busy >> u) & 1u)) unit = u;
@@ -2426,6 +2414,7 @@ static void eng_prepare_shaders(void)
 
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
+                            const eng_program_pair* programs,
                             const rsx_dsp_texture* tex, u32 cube_mask, u32 vol_mask,
                             u32 vtex_mask, const rsx_dsp_surface* sf,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
@@ -2434,11 +2423,12 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     *out_fixed = 1;
     *out_tex_used = 0;
     *out_fp_hash = 0;
-    const u8* vp_uc = NULL;
-    const u8* fp_uc = NULL;
-    u32 vp_instrs = 0, fp_size = 0;
     /* No resident program pair means the built-in one; see kEngFixedVS. */
-    const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
+    const int fixed = !programs->vp;
+    const u8* vp_uc = fixed ? NULL : programs->vp->copy;
+    const u32 vp_bytes = fixed ? 0 : programs->vp->bytes;
+    const u8* fp_uc = programs->fp;
+    const u32 fp_size = programs->fp_size;
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
@@ -2446,7 +2436,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu);
     /* BRB/CLB outcomes are baked into the program: the branch bits are
      * identity only for a program that tests them. */
-    const int vp_branch_bits_used = !fixed && rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16u);
+    const int vp_branch_bits_used = !fixed && programs->vp->uses_branch_bits;
     const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
     const u32 ucp = fixed ? 0 : eng_user_clip_key();
     const u32 dbz = fixed ? 0 : s_dbz.unit;   /* eng_depth_bounds_prepare: unit + 1 */
@@ -2508,7 +2498,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
     } else {
-        key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
+        key = programs->vp->hash;
         if (vp_branch_bits_used) key = eng_fnv1a(&vp_branch_bits, sizeof vp_branch_bits, key);
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
         if (!key) return 0;
@@ -2557,7 +2547,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
     eng_shader_recipe recipe = {0};
     recipe.key = key;
-    recipe.vp_bytes = vp_instrs * 16u; recipe.fp_bytes = fp_size;
+    recipe.vp_bytes = vp_bytes; recipe.fp_bytes = fp_size;
     recipe.rt_fmt = rt_fmt; recipe.rt_count = rt_count;
     recipe.fp_ctrl = fp_ctrl; recipe.cube_mask = cube_mask;
     recipe.vol_mask = vol_mask; recipe.vtex_mask = vtex_mask;
@@ -3566,8 +3556,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
         if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
     }
 
+    const eng_program_pair programs = eng_guest_programs();
     rsx_vertex_layout_plan layout;
-    eng_vertex_layout(&layout);
+    rsx_vertex_layout_plan_init(&layout, programs.vp ? programs.vp->inputs : 0xFFFFu);
     dc_fetch(&layout, rebuild);
     if (!dc.n_verts || !dc.fetch_ok) return;
 
@@ -3611,8 +3602,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 cube_mask = eng_cube_mask(tex);
     const u32 vol_mask = eng_volume_mask(tex);
     const u32 enabled_vtex = eng_vtex_mask();
-    eng_depth_bounds_prepare(zslot, &rs, cube_mask, vol_mask);
-    const u32 pipeline = eng_pipeline_get(&layout, &rs, tex, cube_mask, vol_mask,
+    eng_depth_bounds_prepare(zslot, &rs, cube_mask, vol_mask, &programs);
+    const u32 pipeline = eng_pipeline_get(&layout, &rs, &programs, tex, cube_mask, vol_mask,
                                           enabled_vtex, &sf,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
