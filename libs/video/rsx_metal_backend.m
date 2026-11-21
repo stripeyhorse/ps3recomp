@@ -2676,6 +2676,9 @@ static u32 s_eng_dropped;
 
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
+/* Bumped whenever the arena starts again from offset 0: an offset staged in
+ * an earlier epoch names other bytes now. */
+static u32 s_eng_stage_epoch = 1;
 /* The staging arena is the contents of a shared MTLBuffer, handed to the
  * command buffer that reads it instead of being copied into a new one at
  * every commit. A committed arena goes back to this pool when the GPU has
@@ -3170,20 +3173,34 @@ static id<MTLBuffer> eng_stage_buffer_acquire(u32 cap)
 {
     id<MTLBuffer> buf = nil;
     pthread_mutex_lock(&s_eng_stage_pool_lock);
-    for (NSUInteger i = 0; i < [s_eng_stage_pool count]; ++i)
-        if ([s_eng_stage_pool[i] length] >= cap) {
-            buf = s_eng_stage_pool[i];
-            [s_eng_stage_pool removeObjectAtIndex:i];
-            break;
-        }
+    /* The smallest that fits, so a large arena is not spent on a small ask. */
+    NSUInteger best = NSNotFound;
+    for (NSUInteger i = 0; i < [s_eng_stage_pool count]; ++i) {
+        const NSUInteger len = [s_eng_stage_pool[i] length];
+        if (len >= cap && (best == NSNotFound || len < [s_eng_stage_pool[best] length]))
+            best = i;
+    }
+    if (best != NSNotFound) {
+        buf = s_eng_stage_pool[best];
+        [s_eng_stage_pool removeObjectAtIndex:best];
+    }
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
     if (!buf) buf = [s_dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
     return buf;
 }
 
+/* The largest arena a frame has needed. A new arena starts at this size: it
+ * used to start at 4 MB every frame and double its way up, copying everything
+ * staged so far at each step (4 -> 8 -> 16 -> 32 -> 64 MB in a busy scene,
+ * about 60 MB of copying a frame), because the hand-off forgot the size and
+ * the pool handed the small buffers back first. */
+static u32 s_eng_stage_min_cap = 4u << 20;
+
 static void eng_stage_buffer_release(id<MTLBuffer> buf)
 {
     if (!buf) return;
+    /* Too small to start an arena with any more: let it go. */
+    if ([buf length] < s_eng_stage_min_cap) return;
     pthread_mutex_lock(&s_eng_stage_pool_lock);
     if (!s_eng_stage_pool) s_eng_stage_pool = [NSMutableArray new];
     if ([s_eng_stage_pool count] < ENG_STAGE_POOL_KEEP) [s_eng_stage_pool addObject:buf];
@@ -3214,8 +3231,9 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
         return eng_stage_reserve(bytes, out_off);
     }
     if (start + bytes > s_eng_stage_cap) {
-        u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
+        u32 cap = s_eng_stage_cap ? s_eng_stage_cap : s_eng_stage_min_cap;
         while (start + bytes > cap) cap *= 2u;
+        if (cap > s_eng_stage_min_cap) s_eng_stage_min_cap = cap;
         /* A pool of its own: the caller is the FIFO walker, a PPU host thread
          * with no autorelease pool, and the driver's -contents autoreleases
          * the buffer. Without the pool that reference stayed until the thread
@@ -3298,6 +3316,7 @@ static void eng_shutdown(void* user)
     s_eng_rec_count = 0;
     s_eng_stage_buf = nil; s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
+    s_eng_stage_epoch++;
     pthread_mutex_lock(&s_eng_stage_pool_lock);
     [s_eng_stage_pool removeAllObjects];
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
@@ -3893,17 +3912,43 @@ static void eng_bind_targets(void* user, const u32* surfaces, u32 count,
 static void eng_bind_pipeline(void* user, u32 pipeline)
 { (void)user; s_eng_pending.pipeline = pipeline; }
 
+/* The engine hands over the whole constant block with every draw: 8 KB of
+ * vertex constants, five thousand times a frame in a busy scene, most of them
+ * the same bytes as the draw before. Staging each copy was the largest single
+ * cost of recording a draw. A block equal to the last one staged in this arena
+ * reuses its offset; the compare stops at the first changed constant, so a
+ * draw that does differ pays little for it. PS3RECOMP_METAL_CB_DEDUPE=0 stages
+ * every block, as before. */
+typedef struct { u32 off, bytes, epoch; } EngStagedBlock;
+static EngStagedBlock s_eng_last_vs_cb, s_eng_last_ps_cb;
+
+static int eng_stage_block(EngStagedBlock* last, const void* data, u32 bytes, u32* out_off)
+{
+    static int dedupe = -1;
+    if (dedupe < 0) { const char* e = getenv("PS3RECOMP_METAL_CB_DEDUPE"); dedupe = !(e && *e == '0'); }
+    if (dedupe && bytes && last->epoch == s_eng_stage_epoch && last->bytes == bytes &&
+        last->off + bytes <= s_eng_stage_used && s_eng_stage &&
+        memcmp(s_eng_stage + last->off, data, bytes) == 0) {
+        *out_off = last->off;
+        return 1;
+    }
+    /* The reserve below can commit and restart the arena: read the epoch after. */
+    if (!eng_stage_copy(data, bytes, out_off)) { last->epoch = 0; return 0; }
+    last->off = *out_off; last->bytes = bytes; last->epoch = s_eng_stage_epoch;
+    return 1;
+}
+
 static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
-    if (!eng_stage_copy(data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
+    if (!eng_stage_block(&s_eng_last_vs_cb, data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
     s_eng_pending.vs_cb_bytes = bytes;
 }
 
 static void eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
-    if (!eng_stage_copy(data, bytes, &s_eng_pending.ps_cb_off)) bytes = 0;
+    if (!eng_stage_block(&s_eng_last_ps_cb, data, bytes, &s_eng_pending.ps_cb_off)) bytes = 0;
     s_eng_pending.ps_cb_bytes = bytes;
 }
 
@@ -5009,6 +5054,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         }
         s_eng_rec_count  = 0;
         s_eng_stage_used = 0;
+        s_eng_stage_epoch++;
         eng_collect_retired_objects();
     }
 }
