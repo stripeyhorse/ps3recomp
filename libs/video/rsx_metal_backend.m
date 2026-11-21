@@ -4162,39 +4162,55 @@ static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags,
 
 /* ---- replay -------------------------------------------------------------- */
 
-static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
-                            id<MTLBuffer> stage)
+static const EngRecord* eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+                                        const EngRecord* previous, id<MTLBuffer> stage)
 {
-    if (!r->pipeline || r->pipeline > s_eng_pipe_count) { s_eng_encoding_failed = 1; return; }
+    if (!r->pipeline || r->pipeline > s_eng_pipe_count) { s_eng_encoding_failed = 1; return previous; }
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
-    if (!p->pso) { s_eng_encoding_failed = 1; return; }
-    [enc setRenderPipelineState:p->pso];
-    [enc setDepthStencilState:p->ds];
-    [enc setCullMode:p->cull];
-    [enc setFrontFacingWinding:p->winding];
-    [enc setDepthClipMode:p->clip];
-    [enc setStencilFrontReferenceValue:r->stencil_ref backReferenceValue:r->back_stencil_ref];
-    [enc setDepthBias:r->depth_bias slopeScale:r->depth_slope clamp:0.0f];
-    MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
-    [enc setViewport:vp];
+    if (!p->pso) { s_eng_encoding_failed = 1; return previous; }
+    if (!previous || r->pipeline != previous->pipeline) {
+        [enc setRenderPipelineState:p->pso];
+        [enc setDepthStencilState:p->ds];
+        [enc setCullMode:p->cull];
+        [enc setFrontFacingWinding:p->winding];
+        [enc setDepthClipMode:p->clip];
+    }
+    if (!previous || r->stencil_ref != previous->stencil_ref ||
+        r->back_stencil_ref != previous->back_stencil_ref)
+        [enc setStencilFrontReferenceValue:r->stencil_ref backReferenceValue:r->back_stencil_ref];
+    if (!previous || r->depth_bias != previous->depth_bias || r->depth_slope != previous->depth_slope)
+        [enc setDepthBias:r->depth_bias slopeScale:r->depth_slope clamp:0.0f];
+    if (!previous || memcmp(r->vp, previous->vp, sizeof r->vp)) {
+        MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
+        [enc setViewport:vp];
+    }
     if (r->sc[2] && r->sc[3])
         [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
-    [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
-    if (r->vs_cb_bytes) [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
-    if (r->ps_cb_bytes) [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
+    if (!previous || r->vb_off != previous->vb_off)
+        [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
+    if (r->vs_cb_bytes && (!previous || !previous->vs_cb_bytes || r->vs_cb_off != previous->vs_cb_off))
+        [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
+    if (r->ps_cb_bytes && (!previous || !previous->ps_cb_bytes || r->ps_cb_off != previous->ps_cb_off))
+        [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
-        id<MTLTexture> t = eng_obj(r->tex[u]);
-        [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
-        [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
-                                                      : s_default_sampler)
-                             atIndex:(NSUInteger)u];
+        if (!previous || r->tex[u] != previous->tex[u]) {
+            id<MTLTexture> t = eng_obj(r->tex[u]);
+            [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
+        }
+        if (!previous || r->samp[u] != previous->samp[u])
+            [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
+                                                          : s_default_sampler)
+                                 atIndex:(NSUInteger)u];
     }
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
-        id<MTLTexture> t = eng_obj(r->vtex[u]);
-        [enc setVertexTexture:(t ? t : s_null_tex) atIndex:MTL_VTEX_INDEX(u)];
-        [enc setVertexSamplerState:(r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
-                                                     : s_default_sampler)
-                           atIndex:MTL_VSAMP_INDEX(u)];
+        if (!previous || r->vtex[u] != previous->vtex[u]) {
+            id<MTLTexture> t = eng_obj(r->vtex[u]);
+            [enc setVertexTexture:(t ? t : s_null_tex) atIndex:MTL_VTEX_INDEX(u)];
+        }
+        if (!previous || r->vsamp[u] != previous->vsamp[u])
+            [enc setVertexSamplerState:(r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
+                                                         : s_default_sampler)
+                               atIndex:MTL_VSAMP_INDEX(u)];
     }
     /* An indexed draw is really indexed here: the index buffer is what keeps a
      * strip's shared vertices from being fetched and uploaded per triangle.
@@ -4209,6 +4225,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     else
         [enc drawPrimitives:r->topology
                 vertexStart:0 vertexCount:r->vertex_count];
+    return r;
 }
 
 /* Is this record aimed at exactly these colour attachments, in this order? */
@@ -4603,11 +4620,14 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             continue;
         }
         s_ft_passes++;
+        /* Bindings belong to one encoder. Resource handles stay live until
+         * the recorded draws for this command buffer have been encoded. */
+        const EngRecord* previous = NULL;
         while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
                (s_eng_rec[i].depth == depth ||
                 (!s_eng_rec[i].depth && zbuf == zfb))) {
-            eng_encode_draw(enc, &s_eng_rec[i], stage);
+            previous = eng_encode_draw(enc, &s_eng_rec[i], previous, stage);
             i++;
         }
         [enc endEncoding];

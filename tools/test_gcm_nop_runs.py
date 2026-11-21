@@ -20,8 +20,9 @@ with tempfile.TemporaryDirectory(prefix='gcm-nop-runs-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
                     str(root / 'libs/video/tests/test_gcm_nop_runs.c'), *linker,
                     '-o', str(binary)], check=True)
-    result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)
-    print(result.stdout.strip())
-    if result.returncode:
-        print(result.stderr[-2000:])
-        raise SystemExit('test_gcm_nop_runs failed')
+    for env in (os.environ, dict(os.environ, TEST_DRAW_ENGINE='1')):
+        result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True, env=env)
+        print(result.stdout.strip())
+        if result.returncode:
+            print(result.stderr[-2000:])
+            raise SystemExit('test_gcm_nop_runs failed')

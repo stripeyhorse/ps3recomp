@@ -1861,12 +1861,11 @@ static u32 eng_vtex_mask(void)
  * dim. No host sampling mode is unnormalised for these, so the fragment
  * program divides the coordinates instead, and the divisor makes the sizes
  * pipeline identity (rsx_live_draw.c keys them the same way). */
-static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
+static u32 eng_unnorm_units(const rsx_dsp_texture* tex, u32 dim[RSX_DSP_NUM_TEXTURES][3])
 {
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = tex[u];
         dim[u][0] = dim[u][1] = dim[u][2] = 0;
         if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || !t.width || !t.height)
             continue;
@@ -1882,25 +1881,23 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
  * depth), declared Texture3D and sampled with three coordinates. Only when
  * the backend can create one: otherwise the first slice stays a 2D texture
  * and the program samples it in 2D, as before. */
-static u32 eng_volume_mask(void)
+static u32 eng_volume_mask(const rsx_dsp_texture* tex)
 {
     if (!g.be->texture_create_3d || !g.be->texture_upload_3d) return 0;
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = tex[u];
         if (t.enabled && !t.cubemap && t.dimension == 3 && t.depth > 1 && t.width && t.height)
             mask |= 1u << u;
     }
     return mask;
 }
 
-static u32 eng_cube_mask(void)
+static u32 eng_cube_mask(const rsx_dsp_texture* tex)
 {
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = tex[u];
         /* A cube face is square by construction, so a non-square image
          * cannot be one; the fragment program is compiled against this mask
          * and a texturecube slot filled with a 2D texture is a validation
@@ -2157,7 +2154,8 @@ static int eng_depth_bounds_on(void)
     return on;
 }
 
-static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
+static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs,
+                                      u32 cube_mask, u32 volume_mask)
 {
     s_dbz.unit = 0; s_dbz.copy = 0;
     if (g.be->set_depth_bounds || !g.be->depth_snapshot || !rs->depth_bounds_test ||
@@ -2175,7 +2173,7 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
     if (!eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size)) return;
     /* A unit the program neither samples nor has declared as a cube or a
      * volume (rsx_fp_apply_depth_bounds reads it as a Texture2D). */
-    const u32 busy = rsx_fp_texture_units(fp_uc, fp_size) | eng_cube_mask() | eng_volume_mask();
+    const u32 busy = rsx_fp_texture_units(fp_uc, fp_size) | cube_mask | volume_mask;
     int unit = -1;
     for (int u = RSX_BE_MAX_TEXTURES - 1; u >= 0 && unit < 0; u--)
         if (!((busy >> u) & 1u)) unit = u;
@@ -2428,6 +2426,8 @@ static void eng_prepare_shaders(void)
 
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
+                            const rsx_dsp_texture* tex, u32 cube_mask, u32 vol_mask,
+                            u32 vtex_mask, const rsx_dsp_surface* sf,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
                             u32* out_tex_used, u64* out_fp_hash)
 {
@@ -2444,9 +2444,6 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
         rsx_dsp_reg(&g.rsx, 0x1FECu), fp_ctrl,
         rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu);
-    const u32 cube_mask = eng_cube_mask();
-    const u32 vol_mask = eng_volume_mask();
-    const u32 vtex_mask = eng_vtex_mask();
     /* BRB/CLB outcomes are baked into the program: the branch bits are
      * identity only for a program that tests them. */
     const int vp_branch_bits_used = !fixed && rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16u);
@@ -2459,36 +2456,34 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         if (!(sampled_units & (1u << u))) continue;
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = tex[u];
         rsx_fp_shadow_desc_from_texture(&shadow[u], t.format, t.dimension,
             t.cubemap, t.mipmaps, t.filter, t.wrap, t.control0);
         if (shadow[u].enabled) shadow_mask |= 1u << u;
     }
     u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
-    if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
-        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
-        if (t.enabled) gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
-    }
-    const u32 gamma_units = fixed ? 0 : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
-    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
-        if (!(gamma_units & (1u << u))) gamma_masks[u] = 0;
     /* Texture sign expansion: SET_TEXTURE_ADDRESS's UNSIGNED_REMAP_BIASED
      * asks that every fetch come back re-centred to -1..1. Same rule as
      * gamma: only units the program samples count. */
     u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
+    u8 any_gamma = 0, any_expand = 0;
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
-        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
-        if (t.enabled) expand_masks[u] = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
+        const rsx_dsp_texture t = tex[u];
+        if (!t.enabled) continue;
+        any_gamma |= gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
+        any_expand |= expand_masks[u] = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
     }
-    const u32 expand_units = fixed ? 0 : rsx_fp_texture_expand_units(fp_uc, fp_size, expand_masks);
-    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
+    const u32 gamma_units = any_gamma ? rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks) : 0;
+    const u32 expand_units = any_expand ? rsx_fp_texture_expand_units(fp_uc, fp_size, expand_masks) : 0;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
+        if (!(gamma_units & (1u << u))) gamma_masks[u] = 0;
         if (!(expand_units & (1u << u))) expand_masks[u] = 0;
+    }
 
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][3];
     /* Shadow helpers normalize against the bound resource themselves. Only
      * sampled ordinary UN units need baked dimensions or cache identity. */
-    const u32 unnorm_mask = eng_unnorm_units(unnorm_dim) &
+    const u32 unnorm_mask = eng_unnorm_units(tex, unnorm_dim) &
         (fixed ? 0xFFFFu : sampled_units) & ~shadow_mask;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++)
         if (!(unnorm_mask & (1u << u)))
@@ -2500,9 +2495,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
     /* An antialiased target is held at its sample grid; WPOS must still count
      * pixels (rsx_fp_apply_wpos_grid). */
-    rsx_dsp_surface sf;
-    rsx_dsp_get_surface(&g.rsx, &sf);
-    const u32 wpos_grid[2] = { sf.aa_sx ? sf.aa_sx : 1u, sf.aa_sy ? sf.aa_sy : 1u };
+    const u32 wpos_grid[2] = { sf->aa_sx ? sf->aa_sx : 1u, sf->aa_sy ? sf->aa_sy : 1u };
     const int wpos_scaled = !fixed && (wpos_grid[0] > 1u || wpos_grid[1] > 1u);
 
     /* Identity: the vertex program's own bytes, the fragment program's
@@ -2995,12 +2988,13 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     u32 mask = 0;
     u32 feedback[RSX_BE_MAX_COLOR_TARGETS] = {0};
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
         /* A unit left enabled by an earlier draw but not sampled by this
          * program is skipped: resolving it would cost a cache check, and an
          * aliased surface a store to guest memory, for nothing. */
-        if (!t.enabled || !((tex_used >> u) & 1u)) continue;
+        if (!((tex_used >> u) & 1u)) continue;
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (!t.enabled) continue;
         mask |= 1u << u;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
         samplers[u].border = eng_border_class(t.format, t.border_color);
@@ -3610,8 +3604,16 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
     u64 fp_hash = 0;
-    eng_depth_bounds_prepare(zslot, &rs);
-    const u32 pipeline = eng_pipeline_get(&layout, &rs,
+    /* Decode each slot once for the shader variant and depth-bounds unit. */
+    rsx_dsp_texture tex[RSX_DSP_NUM_TEXTURES];
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++)
+        rsx_dsp_get_texture(&g.rsx, u, &tex[u]);
+    const u32 cube_mask = eng_cube_mask(tex);
+    const u32 vol_mask = eng_volume_mask(tex);
+    const u32 enabled_vtex = eng_vtex_mask();
+    eng_depth_bounds_prepare(zslot, &rs, cube_mask, vol_mask);
+    const u32 pipeline = eng_pipeline_get(&layout, &rs, tex, cube_mask, vol_mask,
+                                          enabled_vtex, &sf,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
                                           &fp_hash);
@@ -3639,7 +3641,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
         memset(&samplers[s_dbz.unit - 1u], 0, sizeof samplers[0]);
         tex_mask |= dbz_bit;
     }
-    const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
+    const u32 vtex_mask = sink_bind_vertex_textures(enabled_vtex, vtextures,
                                                     vsamplers);
 
     if (indexed) {

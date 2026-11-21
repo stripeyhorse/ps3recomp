@@ -39,10 +39,13 @@ void rsx_state_init(rsx_state* state) { (void)state; }
 /* Every method the walker delivers, in order. */
 #define PROBE_METHOD 0x1EE0u
 static u32 seen_m[16], seen_d[16], seen_n;
+static u32 mirror_m[16], mirror_d[16], mirror_n;
+static int draw_engine;
+static rsx_backend legacy_backend;
 int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
 { (void)state; (void)method; (void)src; (void)count; return 0; }
 /* cellGcmSys asks whether a vtable backend is registered (#466). */
-rsx_backend* rsx_get_backend(void) { return NULL; }
+rsx_backend* rsx_get_backend(void) { return draw_engine ? &legacy_backend : NULL; }
 int  rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     (void)state;
@@ -50,8 +53,12 @@ int  rsx_process_method(rsx_state* state, u32 method, u32 data)
     seen_n++;
     return 0;
 }
-int  rsx_draw_engine_enabled(void) { return 0; }
-void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
+int  rsx_draw_engine_enabled(void) { return draw_engine; }
+void rsx_draw_engine_method(u32 method, u32 arg)
+{
+    if (mirror_n < 16) { mirror_m[mirror_n] = method; mirror_d[mirror_n] = arg; }
+    mirror_n++;
+}
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -105,6 +112,7 @@ static u32 put_probe(u32 io, u32 arg)
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    draw_engine = getenv("TEST_DRAW_ENGINE") != NULL;
     const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
     vm_base = (uint8_t*)calloc(1, vm_size);
     if (!vm_base) { puts("FAIL: guest VM alloc"); return 1; }
@@ -153,6 +161,31 @@ int main(void)
     check(seen_n == 5 && seen_m[4] == PROBE_METHOD && seen_d[4] == 5,
           "pass 3: the first word of the next IO page is not skipped");
     check(s_fifo_getoff == put3, "pass 3: get reaches put");
+
+    if (draw_engine) {
+        /* NI packet on subchannel 1 keeps its method and subchannel in the
+         * mirror. Place the header after a boundary-crossing packet. */
+        const u32 tail2 = PAGE2 - 8;
+        gw32(IO_ADDR + tail2, (2u << 18) | PROBE_METHOD);
+        gw32(IO_ADDR + tail2 + 4, 6);
+        gw32(IO_ADDR + PAGE2, 7);
+        gw32(IO_ADDR + PAGE2 + 4, 0x40000000u | (2u << 18) | (1u << 13) | PROBE_METHOD);
+        gw32(IO_ADDR + PAGE2 + 8, 8);
+        gw32(IO_ADDR + PAGE2 + 12, 9);
+        s_fifo_getoff = tail2;
+        vm_write32(ctrl + 4, tail2);
+        vm_write32(ctrl + 0, PAGE2 + 16);
+        cellGcm_rsx_process_fifo();
+        check(mirror_n == 9 && seen_n == mirror_n, "every method reaches both consumers once");
+        for (u32 i = 0; i < 9; i++) {
+            const u32 subch = i >= 7 ? 1u << 13 : 0;
+            check(mirror_m[i] == (seen_m[i] | subch) && mirror_d[i] == seen_d[i],
+                  "draw engine receives the same word and the original subchannel");
+        }
+        check(mirror_d[5] == 6 && mirror_d[6] == 7 && mirror_d[7] == 8 && mirror_d[8] == 9 &&
+              seen_m[6] == PROBE_METHOD + 4 && seen_m[7] == PROBE_METHOD &&
+              seen_m[8] == PROBE_METHOD, "page-crossing incrementing and contiguous NI runs");
+    }
 
     printf("[gcm_nop_runs] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     free(vm_base);
