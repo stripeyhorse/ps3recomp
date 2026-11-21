@@ -1260,6 +1260,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
+            if (ps3_log_verbose())
             printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
                    " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
                    s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
@@ -1669,6 +1670,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
 
             /* wid out-param is guest BE */
             vm_write32((u32)(uintptr_t)wid, i);
+            if (ps3_log_verbose())
             printf("[cellSpurs] AddWorkload(wid=%u, pm=%p, size=%u)\n",
                    i, pm, sizePm);
             spurs_api_unlock(si);
@@ -1893,7 +1895,7 @@ s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
     vm_write32(si->ea + SPURS_WKL_ENABLED,
                vm_read32(si->ea + SPURS_WKL_ENABLED) & ~(0x80000000u >> wid));
     spurs_scheduler_forget(wid);
-    printf("[cellSpurs] RemoveWorkload(wid=%u)\n", wid);
+    if (ps3_log_verbose()) printf("[cellSpurs] RemoveWorkload(wid=%u)\n", wid);
     spurs_api_unlock(si);
     return CELL_OK;
 }
@@ -1950,10 +1952,11 @@ static WklPm* spurs_resolve_pm(u32 wid)
                                            w->sizePm);
     r->fn = spu_workload_find_img(fp, &r->image_id);
     r->resolved = r->fn ? 1 : -1;
-    if (r->fn)
+    if (r->fn) {
+        if (ps3_log_verbose())
         printf("[cellSpurs] wid=%u PM resolved (fp=0x%016llX image=%d)\n",
                wid, (unsigned long long)fp, r->image_id);
-    else {
+    } else {
         printf("[cellSpurs] wid=%u PM NOT LIFTED (fp=0x%016llX size=%u) -- workload will not run\n",
                wid, (unsigned long long)fp, w->sizePm);
         /* SPU_DUMP_MISS=<dir>: write the PM exactly as fingerprinted, like the
