@@ -483,21 +483,17 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
 }
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
-/* NEON version: tbl over the 32-byte {a,b} concatenation. SPU byte P lives at
- * host byte P^3 (each word's bytes reversed), so rev32 into SPU order,
- * select, and rev32 back. */
+/* SPU byte P lives at host byte P^3. Flip the low two selector bits to
+ * address the host-order table directly. Selectors with bit 7 set fall
+ * outside that table and take their value from the special-selector table. */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-    uint8x16x2_t t;
-    t.val[0] = vrev32q_u8(vld1q_u8(a._u8));
-    t.val[1] = vrev32q_u8(vld1q_u8(b._u8));
-    const uint8x16_t C = vrev32q_u8(vld1q_u8(c._u8));
-    uint8x16_t r = vqtbl2q_u8(t, vandq_u8(C, vdupq_n_u8(0x1F)));
-    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
-    const uint8x16_t m80 = vtstq_u8(C, vdupq_n_u8(0x80));
-    const uint8x16_t mC0 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0xC0)), vdupq_n_u8(0xC0));
-    const uint8x16_t mE0 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0xE0)), vdupq_n_u8(0xE0));
-    const uint8x16_t special = vbslq_u8(mE0, vdupq_n_u8(0x80), mC0);
-    r = vrev32q_u8(vbslq_u8(m80, special, r));
+    const uint8x16x2_t table = {{vld1q_u8(a._u8), vld1q_u8(b._u8)}};
+    const uint8x16_t selectors = vld1q_u8(c._u8);
+    const uint8x16_t index = veorq_u8(vandq_u8(selectors, vdupq_n_u8(0x9F)),
+                                      vdupq_n_u8(3));
+    const uint8x16_t special = {0, 0, 0, 0, 0, 0, 0xFF, 0x80};
+    const uint8x16_t r = vorrq_u8(vqtbl2q_u8(table, index),
+                                 vqtbl1q_u8(special, vshrq_n_u8(selectors, 5)));
     u128 out; vst1q_u8(out._u8, r); return out;
 }
 #endif
