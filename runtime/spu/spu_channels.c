@@ -17,9 +17,11 @@
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
+#include "spu_lifted_job.h"
 #include "ps3emu/ps3_ftrace.h"
 #include "spu_overlay_residency.h"
 #include <stdint.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -429,17 +431,52 @@ static SPU_TLS struct {
     mfc_engine* engine;
     uint64_t generation;
 } s_mfc_recent;
-static int spu_mfc_cache_enabled(void)
+static SPU_TLS spu_context* s_mfc_scoped_ctx;
+
+enum {
+    MFC_CACHE_GLOBAL = -2,
+    MFC_CACHE_DISABLED = -1,
+};
+
+/* Positive settings select a single lifted async SPURS task image. */
+static int spu_mfc_cache_mode(void)
 {
     static atomic_int cached;
     int value = atomic_load_explicit(&cached, memory_order_relaxed);
     if (!value) {
         const char* flag = getenv("SPU_MFC_LOOKUP_CACHE");
-        value = flag && !strcmp(flag, "1") ? 2 : 1;
+        value = MFC_CACHE_DISABLED;
+        if (flag && !strcmp(flag, "1")) {
+            value = MFC_CACHE_GLOBAL;
+        } else {
+            const char* image = getenv("SPU_MFC_ASYNC_CACHE_IMAGE");
+            if (image && *image >= '0' && *image <= '9') {
+                char* end;
+                /* strtoull saturates above INT_MAX even on hosts with 32-bit long. */
+                unsigned long long id = strtoull(image, &end, 10);
+                if (!*end && id > 0 && id <= INT_MAX) value = (int)id;
+            }
+        }
         atomic_store_explicit(&cached, value, memory_order_relaxed);
     }
-    return value == 2;
+    return value;
 }
+
+int spu_mfc_async_cache_matches(int image_id)
+{
+    return image_id > 0 && spu_mfc_cache_mode() == image_id;
+}
+
+int spu_run_with_cached_mfc(spu_lifted_entry_fn entry, spu_context* ctx)
+{
+    /* spu_run_with_halt catches guest halt and stack reset within this scope. */
+    spu_context* previous = s_mfc_scoped_ctx;
+    s_mfc_scoped_ctx = ctx;
+    int halted = spu_run_with_halt(entry, ctx);
+    s_mfc_scoped_ctx = previous;
+    return halted;
+}
+
 static void spu_mfc_cache_remember(spu_context* ctx, mfc_engine* engine)
 {
     /* Caller holds either registry lock; removal cannot interleave here. */
@@ -457,7 +494,9 @@ static void spu_mfc_cache_invalidate(void)
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    int cache_enabled = spu_mfc_cache_enabled();
+    int mode = spu_mfc_cache_mode();
+    int cache_enabled = mode == MFC_CACHE_GLOBAL ||
+                        (mode > 0 && ctx && ctx == s_mfc_scoped_ctx);
     if (cache_enabled) {
         uint64_t generation = atomic_load_explicit(&s_mfc_cache_generation, memory_order_acquire);
         if (generation != UINT64_MAX && generation == s_mfc_recent.generation &&

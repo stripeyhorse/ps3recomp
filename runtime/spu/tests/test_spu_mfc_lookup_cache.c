@@ -70,7 +70,43 @@ static void cache_join(struct cache_request* request)
     CHECK(pthread_create(&thread, NULL, cache_worker, request) == 0);
     CHECK(pthread_join(thread, NULL) == 0);
 }
-int main(void)
+
+static void check_scoped_lookups(spu_context* ctx)
+{
+    mfc_engine* engine = mfc_for(ctx);
+    unsigned reads = atomic_load(&cache_fixture_reads);
+    for (unsigned i = 0; i < 1000; ++i) CHECK(mfc_for(ctx) == engine);
+    CHECK(atomic_load(&cache_fixture_reads) == reads);
+}
+
+static void check_scoped_halt(spu_context* ctx)
+{
+    check_scoped_lookups(ctx);
+    spu_halt(ctx);
+}
+
+static void check_nested_scope(spu_context* ctx)
+{
+    CHECK(s_mfc_scoped_ctx == ctx);
+    spu_context* inner = calloc(1, sizeof(*inner));
+    CHECK(inner != NULL);
+    if (!inner) return;
+    inner->image_id = ctx->image_id;
+
+    /* A look up for another owner on the same host thread is still locked. */
+    (void)mfc_for(inner);
+    unsigned reads = atomic_load(&cache_fixture_reads);
+    (void)mfc_for(inner);
+    CHECK(atomic_load(&cache_fixture_reads) == reads + 1);
+
+    CHECK(spu_run_with_cached_mfc(check_scoped_halt, inner) == 1);
+    CHECK(s_mfc_scoped_ctx == ctx);
+    spu_mfc_release(inner);
+    free(inner);
+    check_scoped_lookups(ctx);
+}
+
+int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (cache_existing_main()) return 1;
@@ -85,6 +121,21 @@ int main(void)
     printf("100000 established lookups: %u registry read locks (cache %d)\n", reads, enabled);
     CHECK(reads == (enabled ? 0u : 100000u));
     CHECK(original->tag_completed == 0x12345678);
+
+    int async_cache_enabled = argc == 2 && !strcmp(argv[1], "scoped");
+    CHECK(spu_mfc_async_cache_matches(2) == async_cache_enabled);
+    CHECK(!spu_mfc_async_cache_matches(0) && !spu_mfc_async_cache_matches(3));
+    if (async_cache_enabled) {
+        ctx->image_id = 2;
+        CHECK(spu_run_with_cached_mfc(check_nested_scope, ctx) == 0);
+        CHECK(s_mfc_scoped_ctx == NULL);
+        CHECK(spu_run_with_cached_mfc(check_scoped_halt, ctx) == 1);
+        CHECK(s_mfc_scoped_ctx == NULL);
+        reads = atomic_load(&cache_fixture_reads);
+        CHECK(mfc_for(ctx) == original && mfc_for(ctx) == original);
+        CHECK(atomic_load(&cache_fixture_reads) == reads + 2);
+        puts("Scoped MFC cache: owner isolation, nested run and halt restore checked");
+    }
 
     /* A new host thread must resolve the same virtual engine, then reuse it;
      * its own TLS cannot borrow an engine from a previous physical SPU. */

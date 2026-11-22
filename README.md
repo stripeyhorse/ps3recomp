@@ -662,6 +662,9 @@ the hot loops are now all behind gates.*
   Indirect-dispatch registry lookups are memoized per thread (#436), as is the
   per-thread MFC engine lookup (#421), and an image's fingerprint is reused
   while its bytes are unchanged (#433).
+  Set `SPU_MFC_ASYNC_CACHE_IMAGE` to a positive decimal image ID to enable
+  MFC lookup caching during that image's lifted async SPURS tasks. The setting
+  defaults off. `SPU_MFC_LOOKUP_CACHE=1` enables caching across all images.
 - **Exact float**: NEON float ops without scalar fix-up lanes (*@tekulvw*,
   #445), and opt-in `SPU_FLOAT_RZ` running single precision natively under a
   round-toward-zero FPCR (#479). SSE4.1 and AVX2 forms of the per-lane integer

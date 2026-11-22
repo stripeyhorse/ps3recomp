@@ -32,6 +32,9 @@ void spu_mfc_release(spu_context* c) { (void)c; }
 int spu_run_spurs_job(spu_lifted_entry_fn e, int id, uint32_t ea, uint32_t sz)
 { (void)e; (void)id; (void)ea; (void)sz; return -1; }
 int spu_run_with_halt(void (*f)(spu_context*), spu_context* c) { (void)f; (void)c; return -1; }
+int spu_mfc_async_cache_matches(int image_id) { (void)image_id; return 0; }
+int spu_run_with_cached_mfc(spu_lifted_entry_fn f, spu_context* c)
+{ (void)f; (void)c; assert(!"workload caching is outside this fixture"); return -1; }
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; }
 uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
 { (void)ls; (void)a; (void)b; (void)c; (void)d; return 0; }

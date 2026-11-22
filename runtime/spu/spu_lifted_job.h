@@ -23,6 +23,10 @@
 void spu_mfc_release(spu_context* ctx);   /* spu_channels.c */
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
+typedef int (*spu_lifted_runner_fn)(spu_lifted_entry_fn, spu_context*);
+int spu_run_with_halt(spu_lifted_entry_fn entry, spu_context* ctx);
+int spu_run_with_cached_mfc(spu_lifted_entry_fn entry, spu_context* ctx);
+int spu_mfc_async_cache_matches(int image_id);
 /* Guest RAM base, for decoding a raw SPU thread's argument block. */
 extern uint8_t* vm_base;
 
@@ -154,13 +158,14 @@ typedef struct spu_run_opts {
     uint32_t group_id;
 } spu_run_opts;
 
-static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
-                                             uint8_t* local_store,
-                                             uint32_t args_ea,
-                                             int image_id,
-                                             int spurs_task_abi,
-                                             const uint32_t* r3_override,
-                                             const spu_run_opts* opts)
+static inline int32_t spu_run_lifted_job_with_runner(spu_lifted_entry_fn entry,
+                                                    uint8_t* local_store,
+                                                    uint32_t args_ea,
+                                                    int image_id,
+                                                    int spurs_task_abi,
+                                                    const uint32_t* r3_override,
+                                                    const spu_run_opts* opts,
+                                                    spu_lifted_runner_fn run)
 {
     if (!entry) return -1;
     spu_context ctx;
@@ -299,9 +304,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
                 ctx.gpr[4]._u32[0], ctx.gpr[4]._u32[1], ctx.gpr[4]._u32[2], ctx.gpr[4]._u32[3]);
         fflush(stderr);
     }
-    int _halted = 0;
-    { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
-      _halted = spu_run_with_halt(entry, &ctx); }               /* run with halt pad   */
+    const int _halted = run(entry, &ctx);
     /* Raw-worker run summary (env SPU_WORKER_TRACE). A worker that produces no
      * outbound word leaves the PPU blocked in sys_event_queue_receive forever,
      * and the difference between "parked at its idle poll" and "fell over after
@@ -341,6 +344,19 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     spu_mfc_release(&ctx);   /* or its MFC slot leaks and later SPUs share one engine */
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
     return 0;
+}
+
+static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+                                            uint8_t* local_store,
+                                            uint32_t args_ea,
+                                            int image_id,
+                                            int spurs_task_abi,
+                                            const uint32_t* r3_override,
+                                            const spu_run_opts* opts)
+{
+    return spu_run_lifted_job_with_runner(entry, local_store, args_ea, image_id,
+                                          spurs_task_abi, r3_override, opts,
+                                          spu_run_with_halt);
 }
 
 static inline int32_t spu_run_lifted_job_img(spu_lifted_entry_fn entry,
