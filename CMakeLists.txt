@@ -554,6 +554,21 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_lockline_wait COMMAND test_spu_lockline_wait)
         set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
 
+        # PS3_HAVOK_REREQUEST: a Havok pool request is repeated for a task left
+        # spinning on the empty pool (runtime/spu/spu_channels.c).
+        add_executable(test_spu_havok_rerequest
+            runtime/spu/tests/test_spu_havok_rerequest.c
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c
+            runtime/spu/spu_workload.c runtime/spu/spurs_policy.c runtime/spu/spurs_job.c
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c
+            runtime/platform/win32_compat.c)
+        target_include_directories(test_spu_havok_rerequest PRIVATE include runtime/spu runtime/platform)
+        target_compile_options(test_spu_havok_rerequest PRIVATE -UNDEBUG -w)
+        target_link_libraries(test_spu_havok_rerequest PRIVATE Threads::Threads m)
+        add_test(NAME spu_havok_rerequest COMMAND test_spu_havok_rerequest)
+        set_tests_properties(spu_havok_rerequest PROPERTIES TIMEOUT 60)
+
     endif()
     add_executable(test_rsx_present_policy tests/test_rsx_present_policy.c)
     target_include_directories(test_rsx_present_policy PRIVATE

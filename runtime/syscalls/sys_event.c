@@ -11,6 +11,9 @@
 #include <string.h>
 #include <stdlib.h>               /* getenv */
 #include "ps3emu/log_first.h"
+#include "stall_watchdog.h"
+void (*g_ps3_stall_recv_begin)(uint64_t, uint32_t);
+void (*g_ps3_stall_recv_end)(uint64_t, int64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
  * context EA the title's SPU task runtime is dispatched against. */
@@ -68,6 +71,21 @@ static void write_be32(uint32_t addr, uint32_t val)
 /* Last event pushed to each queue, for EVT_RECV_KICK. */
 static sys_event_t s_last_evt[SYS_EVENT_QUEUE_MAX];
 static int s_have_last_evt[SYS_EVENT_QUEUE_MAX];
+/* Per-queue push statistics for the stall watchdog (stall_watchdog.c). An
+ * event refused because the queue is full is lost to a sender that does not
+ * check the result -- SPU code under SPURS generally does not. */
+static unsigned long s_evq_pushed[SYS_EVENT_QUEUE_MAX], s_evq_full[SYS_EVENT_QUEUE_MAX];
+static int s_evq_hwm[SYS_EVENT_QUEUE_MAX];
+void sys_event_dump_state(FILE* f)
+{
+    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
+        const sys_event_queue_info* q = &g_sys_event_queues[i];
+        if (!q->active) continue;
+        fprintf(f, "  queue %d: %d/%d pending, high water %d, %d receiver(s), %lu pushed, %lu refused full%s\n",
+                i + 1, q->count, q->capacity, s_evq_hwm[i], q->waiters, s_evq_pushed[i], s_evq_full[i],
+                q->cancelled ? ", CANCELLED" : "");
+    }
+}
 
 static uint64_t bswap64(uint64_t v)
 {
@@ -349,7 +367,18 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
 /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
 static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
 
+static int64_t sys_event_queue_receive_impl(ppu_context* ctx);
+/* The stall watchdog (stall_watchdog.c) needs to know which PPU threads sit in
+ * a receive and since when; every exit path of the body is covered here. */
 int64_t sys_event_queue_receive(ppu_context* ctx)
+{
+    PS3_STALL_CALL(g_ps3_stall_recv_begin, ctx->thread_id, LV2_ARG_U32(ctx, 0));
+    const int64_t rc = sys_event_queue_receive_impl(ctx);
+    PS3_STALL_CALL(g_ps3_stall_recv_end, ctx->thread_id, rc, ctx->gpr[4], ctx->gpr[5], ctx->gpr[6], ctx->gpr[7]);
+    return rc;
+}
+
+static int64_t sys_event_queue_receive_impl(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
@@ -867,7 +896,9 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
     pthread_mutex_lock(&q->lock);
 #endif
 
+    const int qi_stat = (int)(q - g_sys_event_queues);
     if (q->count >= q->capacity) {
+        s_evq_full[qi_stat]++;
 #ifdef _WIN32
         LeaveCriticalSection(&q->lock);
 #else
@@ -879,6 +910,8 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
     q->buffer[q->tail] = *evt;
     q->tail = (q->tail + 1) % q->capacity;
     q->count++;
+    s_evq_pushed[qi_stat]++;
+    if (q->count > s_evq_hwm[qi_stat]) s_evq_hwm[qi_stat] = q->count;
 
 #ifdef _WIN32
     WakeConditionVariable(&q->not_empty);

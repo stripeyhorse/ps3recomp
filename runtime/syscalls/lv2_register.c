@@ -48,6 +48,8 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 #include "ps3emu/log_first.h"
+#include "stall_watchdog.h"
+void (*g_ps3_stall_user_event)(const struct spu_context*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int);
 #include "ps3emu/thread_name.h"
 
 /* ---------------------------------------------------------------------------
@@ -1704,9 +1706,13 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
      * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
     extern uint32_t spurs_port_queue(uint32_t port);
     if (!spu->spu_group_id && (code >= 128 || !spurs_port_queue(code & 63))) {
-        if (code < 128) { static int n; if (PS3_LOG_FIRST(n, 16))
-            fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X)\n",
-                    code & 63, spu->image_id, value); }
+        if (code < 128) {
+            static int n;
+            if (PS3_LOG_FIRST(n, 16))
+                fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X)\n",
+                        code & 63, spu->image_id, value);
+            PS3_STALL_CALL(g_ps3_stall_user_event, spu, code & 63, value & 0xFFFFFFu, 0, 0, 0, 2);
+        }
         return 0;
     }
     /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.
@@ -1756,7 +1762,17 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
             int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
                 spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
             result = rc == 0 ? CELL_OK : CELL_EBUSY;
+            /* EBUSY is what lv2 answers too, but SPU code under SPURS rarely
+             * checks it (Havok's hkSpuUtil request at LS 0xAA18 does not), so
+             * a refusal is a lost request. Say so. */
+            if (rc) { static int n; if (PS3_LOG_FIRST(n, 16))
+                fprintf(stderr, "[spu-evt] user event port %u -> queue %u REFUSED (queue full): img=%d value=0x%08X data=0x%08X\n",
+                        port, queue, spu->image_id, value, data); }
         }
+        PS3_STALL_CALL(g_ps3_stall_user_event, spu, port, value & 0xFFFFFFu, data, queue, result,
+                       !queue ? 2 : result == CELL_EBUSY ? 1 : 0);
+    } else {
+        PS3_STALL_CALL(g_ps3_stall_user_event, spu, code & 63, value & 0xFFFFFFu, 0, 0, result, 3);
     }
     if (code < 64) spu_channel_write(&spu->ch_in_mbox, result);
     return 1;

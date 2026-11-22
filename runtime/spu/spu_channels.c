@@ -42,6 +42,11 @@
 #include <time.h>
 #include "../platform/win32_compat.h"
 #include "ps3emu/log_first.h"
+#include "../syscalls/stall_watchdog.h"
+/* Stall watchdog: SPURS code that found a word waiting in SPU_RdInMbox. */
+void (*g_ps3_stall_spin)(uint32_t ea);   /* stall_watchdog.h */
+volatile unsigned long g_spurs_inmbox_busy_polls;
+volatile uint32_t g_spurs_inmbox_busy_where;
 
 #ifdef __cplusplus
 extern "C" {
@@ -861,6 +866,150 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
+/* ===========================================================================
+ * Havok SPU allocator: re-send a refill request that another task drained
+ * (PS3_HAVOK_REREQUEST=<GETLLARs>: unset = 2048, 0 = off, the old behaviour).
+ *
+ * Havok's SPU job runner keeps small slot pools in 128-byte lines (word 0: 15
+ * slot bits plus a busy bit). A task that finds a pool empty sends ONE
+ * sys_spu_thread_send_event (port 10, "refill pool N") to the PPU thread
+ * "hkSpuUtil Helper" -- the block at LS 0xAA18, which then sets r18 so it
+ * never asks again in that wait -- and waits for the lock-line to change.
+ * The helper refills 2 slots if the pool is empty and does nothing if it is
+ * not. A refill is first come, first served: a peer that needs two slots in a
+ * row (0xE358 allocates twice back to back) can take both, ask once more for
+ * itself, take that refill too, and go idle. The first task is then left
+ * waiting with its one request spent and nobody else asking -- a permanent
+ * freeze (Crash Course, about one run in five). Captured with the stall
+ * watchdog and PS3_STALL_TRACE_LINE: every request was delivered and handled,
+ * every refill went to the other task.
+ *
+ * That race is in the guest protocol; hardware timing makes it rare and ours
+ * does not. The helper's handler is idempotent, so the runtime repeats the
+ * stuck task's request for it: when a SPURS task sends from exactly that code
+ * (its 32 bytes are checked, so no other title or call site can match) and
+ * then spins on the line it held at the send without one successful PUTLLC,
+ * the same event is delivered again (threshold and back-off below) and its
+ * reply word discarded. Nothing else changes; the task still takes its slot
+ * through its own GETLLAR/PUTLLC. Counters: a line at exit and every 64th
+ * repeat ("[spu-evt] Havok pool re-requests: ..."), and in the stall
+ * watchdog's dump.
+ * ===========================================================================*/
+static const uint8_t k_havok_req_site[32] = {
+    0x18,0x15,0xc1,0x02, 0x3f,0xe0,0x2b,0x04, 0x40,0x80,0x05,0x03, 0x34,0x0d,0x81,0x05,
+    0x3b,0x80,0x82,0x85, 0x33,0x33,0x1d,0x80, 0x40,0x80,0x00,0x92, 0x32,0x7f,0xa7,0x80,
+};
+/* Threshold: PS3_HAVOK_REREQUEST=<GETLLARs> (unset: 2048, 0: off). A stuck
+ * task's wait loop (0xA770 -> 0xA69C) runs about 5,700 GETLLARs/ms alone on
+ * an x86-64 core and 1,150-1,500/ms inside a loaded Linux game run, so 2048
+ * is 0.4-1.8 ms of spinning: under a frame, and longer than a refill normally
+ * takes (the helper answers within ~1 ms of a send in every trace). Each
+ * repeat that is accepted doubles the interval, up to 2048 << 10 GETLLARs
+ * (~0.4-1.8 s), so a long genuine wait costs log2(spins/2048) extra events,
+ * not one per interval. A repeat that queue 3 refuses (EBUSY, capacity 10)
+ * is retried after the base interval again, not dropped.
+ * Worst case, per task stuck for a whole second at the uncontended rate:
+ * ~12 events in the first second, then fewer than 3 per second. */
+#define HK_REREQ_DEFAULT 2048u
+#define HK_REREQ_CAP_SHIFT 10
+static SPU_THREAD_LOCAL struct {
+    spu_context* ctx;
+    uint32_t intr, data, line;
+    uint64_t spins, next, interval;
+} t_hk_req;
+volatile unsigned long g_havok_rerequests, g_havok_rerequests_refused;
+static uint32_t havok_rereq_threshold(void)
+{
+    static int64_t v = -1;
+    if (v < 0) {
+        const char* e = getenv("PS3_HAVOK_REREQUEST");
+        v = (e && *e) ? (int64_t)strtoul(e, NULL, 0) : (int64_t)HK_REREQ_DEFAULT;
+    }
+    return (uint32_t)v;
+}
+static int havok_rereq_on(void) { return havok_rereq_threshold() != 0; }
+/* Per pool line, for the counters: up to 8 lines, then "other". */
+#define HK_LINES 8
+static uint32_t s_hk_line[HK_LINES];
+static volatile unsigned long s_hk_line_n[HK_LINES + 1], s_hk_line_refused[HK_LINES + 1];
+static int hk_line_slot(uint32_t line)
+{
+    for (int i = 0; i < HK_LINES; i++) {
+        uint32_t cur = __atomic_load_n(&s_hk_line[i], __ATOMIC_RELAXED);
+        if (cur == line) return i;
+        if (!cur && __atomic_compare_exchange_n(&s_hk_line[i], &cur, line, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return i;
+        if (cur == line) return i;
+    }
+    return HK_LINES;
+}
+void havok_rerequest_report(FILE* f)
+{
+    fprintf(f, "[spu-evt] Havok pool re-requests: %lu sent, %lu refused (threshold %u GETLLARs)",
+            (unsigned long)g_havok_rerequests, (unsigned long)g_havok_rerequests_refused, havok_rereq_threshold());
+    for (int i = 0; i <= HK_LINES; i++) {
+        if (!s_hk_line_n[i] && !s_hk_line_refused[i]) continue;
+        if (i < HK_LINES) fprintf(f, "; line 0x%08X: %lu", s_hk_line[i], (unsigned long)s_hk_line_n[i]);
+        else              fprintf(f, "; other lines: %lu", (unsigned long)s_hk_line_n[i]);
+        if (s_hk_line_refused[i]) fprintf(f, " (+%lu refused)", (unsigned long)s_hk_line_refused[i]);
+    }
+    fprintf(f, "\n");
+    fflush(f);
+}
+static void havok_rerequest_atexit(void) { if (g_havok_rerequests || g_havok_rerequests_refused) havok_rerequest_report(stderr); }
+static int havok_req_site(const spu_context* ctx)
+{
+    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK & ~3u;
+    return pc <= SPU_LS_SIZE - sizeof k_havok_req_site &&
+           memcmp(&ctx->ls[pc], k_havok_req_site, sizeof k_havok_req_site) == 0;
+}
+static void havok_rerequest_arm(spu_context* ctx, uint32_t intr, uint32_t data)
+{
+    static volatile LONG s_atexit;
+    if (!s_atexit && !InterlockedExchange(&s_atexit, 1)) atexit(havok_rerequest_atexit);
+    t_hk_req.ctx = ctx; t_hk_req.intr = intr; t_hk_req.data = data;
+    t_hk_req.line = ctx->resv_ea & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
+    t_hk_req.spins = 0;
+    t_hk_req.interval = t_hk_req.next = havok_rereq_threshold();
+}
+static void havok_rerequest(spu_context* ctx)
+{
+    const uint64_t base = havok_rereq_threshold();
+    /* The task is spinning in GETLLAR, not in its send: both mailboxes are
+     * idle. If not, try again after another base interval. */
+    if (!g_spu_user_event_hook || ctx->ch_in_mbox.count || ctx->ch_out_mbox.count) {
+        t_hk_req.next = t_hk_req.spins + base;
+        return;
+    }
+    spu_channel_write(&ctx->ch_out_mbox, t_hk_req.data);
+    uint32_t reply = 0xFFFFFFFFu;
+    if (g_spu_user_event_hook(ctx, t_hk_req.intr)) {
+        if (ctx->ch_in_mbox.count) reply = spu_channel_read(&ctx->ch_in_mbox);   /* nobody else reads it */
+    } else if (ctx->ch_out_mbox.count) {
+        spu_channel_read(&ctx->ch_out_mbox);                                     /* undelivered: take it back */
+    }
+    const int slot = hk_line_slot(t_hk_req.line);
+    if (reply != 0) {   /* CELL_EBUSY (queue 3 full), unbound, ...: retry soon */
+        __atomic_add_fetch(&g_havok_rerequests_refused, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&s_hk_line_refused[slot], 1, __ATOMIC_RELAXED);
+        t_hk_req.next = t_hk_req.spins + base;
+        return;
+    }
+    if (t_hk_req.interval < (base << HK_REREQ_CAP_SHIFT)) t_hk_req.interval <<= 1;
+    t_hk_req.next = t_hk_req.spins + t_hk_req.interval;
+    __atomic_add_fetch(&s_hk_line_n[slot], 1, __ATOMIC_RELAXED);
+    const unsigned long n = __atomic_add_fetch(&g_havok_rerequests, 1, __ATOMIC_RELAXED);
+    if (n <= 4)
+        fprintf(stderr, "[spu-evt] Havok pool request re-sent (#%lu): img=%d ctx=%p port=%u value=0x%06X line=0x%08X after %llu GETLLARs\n",
+                n, ctx->image_id, (void*)ctx, t_hk_req.intr >> 24, t_hk_req.intr & 0xFFFFFFu, t_hk_req.line,
+                (unsigned long long)t_hk_req.spins);
+    /* A benchmark is usually ended with SIGKILL, which runs no atexit
+     * handler: also report every 64th repeat and at most every 10 s. */
+    static volatile uint64_t s_last_report_ms;
+    const uint64_t now = GetTickCount64(), last = s_last_report_ms;
+    if ((n % 64) == 0 || now - last >= 10000) { s_last_report_ms = now; havok_rerequest_report(stderr); }
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -1008,6 +1157,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * the lock; any write the copy misses ends that reservation (see
          * spu_coh_reserve_fast). Anything else takes the lock as before. */
         const int llar_fast = spu_coh_reserve_fast(ctx, ea);
+        /* PS3_HAVOK_REREQUEST: count this task's GETLLARs of the line it asked
+         * about; the repeat itself runs below, outside the lock. */
+        const int hk_resend = t_hk_req.ctx == ctx && t_hk_req.line == ea &&
+                              ++t_hk_req.spins >= t_hk_req.next;
         if (!llar_fast) {
             spu_lockline_lock();
             /* Tell the PPU store paths this line is live, so a store into it goes
@@ -1057,7 +1210,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * without a per-function probe. */
         { static SPU_THREAD_LOCAL uint32_t t_ea; static SPU_THREAD_LOCAL unsigned long t_n;
           if (ea != t_ea) { t_ea = ea; t_n = 0; }
-          else if (++t_n == 4000000) {
+          else if ((++t_n % 1000000u) == 0) {
+              /* Every millionth, not once: the stall watchdog wants a spin
+               * that is still going, not one that started before the PPU
+               * began waiting. */
+              PS3_STALL_CALL(g_ps3_stall_spin, ea);
+          }
+          if (t_n == 4000000) {
               const uint8_t* m = vm_base + ea;
               fprintf(stderr, "[spu-spin] img=%d pc=0x%05X lr=0x%05X GETLLAR ea=0x%08X x4M; line:"
                               " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
@@ -1065,6 +1224,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
         if (!llar_fast) spu_lockline_unlock();
+        /* Outside the lock-line lock: delivery takes the event queue's lock. */
+        if (hk_resend) havok_rerequest(ctx);
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -1164,8 +1325,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                                         " line=%08X %08X %08X %08X %08X %08X %08X %08X\n",
                                 n, ctx->image_id, (void*)ctx, ea,
                                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); } } }
-            spu_coh_notify_write(ea);
+            /* _except(self) only so a traced line (PS3_STALL_TRACE_LINE) names the
+             * committer: our reservation is already gone, so the walk is the same. */
+            spu_coh_notify_write_except(ea, ctx);
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
+            if (t_hk_req.ctx == ctx) t_hk_req.ctx = NULL;   /* it got its slot: nothing to repeat */
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
             /* SPU_PUTLLC_WHY=1: which of the three conditions failed.
@@ -1377,7 +1541,15 @@ static void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
         { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_MBOXTRACE") ? 1 : 0;
           if (s_t) fprintf(stderr, "[spu-mbox] INTR grp=0x%X spu=0x%X val=0x%08X\n",
                            ctx->spu_group_id, ctx->spu_id, v); }
-        if (g_spu_user_event_hook && g_spu_user_event_hook(ctx, v)) break;
+        { /* PS3_HAVOK_REREQUEST: remember a Havok pool request (see havok_rerequest). */
+          const int hk = !ctx->spu_group_id && (v >> 24) < 64 && ctx->ch_out_mbox.count &&
+                         havok_rereq_on() && havok_req_site(ctx);
+          const uint32_t hk_data = hk ? ctx->ch_out_mbox.value : 0;
+          if (!hk && t_hk_req.ctx == ctx) t_hk_req.ctx = NULL;   /* a later send supersedes it */
+          if (g_spu_user_event_hook && g_spu_user_event_hook(ctx, v)) {
+              if (hk) havok_rerequest_arm(ctx, v, hk_data);
+              break;
+          } }
         spu_channel_write(&ctx->ch_out_intr_mbox, v);
         if (g_spu_out_mbox_hook) g_spu_out_mbox_hook(ctx->spu_group_id, ctx->spu_id, 1, v);
         break;
@@ -1818,7 +1990,15 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
             extern void spu_halt(spu_context*);
             spu_halt(ctx);
         }
-        return (uint32_t)ctx->rcv_evt_n + ctx->ch_in_mbox.count;           /* readable */
+        { const uint32_t readable = (uint32_t)ctx->rcv_evt_n + ctx->ch_in_mbox.count;
+          /* Stall watchdog: SPU code under SPURS polls this before
+           * sys_spu_thread_send_event and skips the send when it is nonzero.
+           * A stale word left here turns every later send into a silent no-op. */
+          if (readable && !ctx->spu_group_id) {
+              g_spurs_inmbox_busy_polls++;
+              g_spurs_inmbox_busy_where = ((uint32_t)(ctx->image_id & 0xFF) << 24) | (uint32_t)(ctx->pc & SPU_LS_MASK);
+          }
+          return readable; }                                                 /* readable */
     /* Free slots, CLAMPED. The queue behind each channel is SPU_CHANNEL_CAP
      * deep -- deeper than the hardware depth reported here -- so `count` can
      * exceed the depth and a bare subtraction underflows, telling the SPU it

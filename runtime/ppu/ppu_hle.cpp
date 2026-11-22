@@ -182,6 +182,14 @@ extern "C" void flow_spurs_kernel_spawn_postinit(void) {}
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/log_first.h"
 
+/* The stall watchdog (runtime/syscalls/stall_watchdog.c) arms its hooks here,
+ * before main. This file, not ppu_loader.cpp: everything that compiles
+ * ppu_hle.cpp also links the runtime library (the game, tests/torture), while
+ * several single-file fixtures compile ppu_loader.cpp without it. Fixtures
+ * that compile the hooked files alone leave the hooks NULL. */
+extern "C" void ps3_stall_watchdog_install(void);
+[[maybe_unused]] static const int s_stall_watchdog_installed = (ps3_stall_watchdog_install(), 0);
+
 /* An unresolved NID is a firmware import we never registered. Returning
  * CELL_OK "so the game keeps going" is the single biggest source of
  * days-long debugging in this project: the title reads back untouched

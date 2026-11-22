@@ -913,9 +913,23 @@ static volatile LONG g_resv_locks[PPU_RESV_LOCKS];
  * vm_write* reads g_resv_store_active directly (a hot global) so the default-off
  * path costs one predictable branch. */
 extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
+/* PPU_RESV_DEDUP (default on; =0 restores the old append): a context is
+ * registered once. Contexts are slots of the fixed g_ppu_threads table and
+ * are re-registered on every thread creation, so the registry used to fill
+ * with duplicates; after PPU_RESV_MAX creations a thread in a slot not seen
+ * before was never registered, and nothing could break its reservations.
+ * With the table at 64 slots plus the entry context, it now cannot fill. A
+ * racing pair of registrations can still add one duplicate, which is
+ * harmless. */
 extern "C" void ppu_resv_register(ppu_context* c)
 {
     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
+    static int s_dedup = -1;
+    if (s_dedup < 0) { const char* e = getenv("PPU_RESV_DEDUP"); s_dedup = !(e && e[0] == '0'); }
+    if (s_dedup) {
+        long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+        for (long j = 0; j < n; j++) if (g_resv_ctxs[j] == c) return;
+    }
     long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
     if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
 }
@@ -961,6 +975,30 @@ extern "C" void ppu_report_guest_lrs(void)
     }
     fflush(stderr);
 }
+
+/* Stall watchdog (runtime/syscalls/stall_watchdog.c): each registered PPU
+ * thread's reservation and last direct call site. Unlocked, like the lr report
+ * above. */
+extern "C" void ppu_resv_dump_state(FILE* f)
+{
+    long n = g_resv_ctx_n;
+    fprintf(f, "  %ld registrations (cap %d)\n", n, PPU_RESV_MAX);
+    if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++) {
+        const ppu_context* c = g_resv_ctxs[i];
+        if (!c) continue;
+        int dup = 0;
+        for (long j = 0; j < i; j++) if (g_resv_ctxs[j] == c) { dup = 1; break; }
+        if (dup) continue;
+        if (c->reserve_addr < PPU_RESV_INVALID && c->reserve_addr)
+            fprintf(f, "  tid %-3u lr=0x%08X reserve=0x%08X value=0x%08X\n", (unsigned)c->thread_id,
+                    (uint32_t)c->lr, (uint32_t)c->reserve_addr, (uint32_t)c->reserve_value);
+        else
+            fprintf(f, "  tid %-3u lr=0x%08X reserve=%s\n", (unsigned)c->thread_id, (uint32_t)c->lr,
+                    c->reserve_addr ? "broken" : "none");
+    }
+}
+
 
 /* Break every reservation on ea's word (real-PPC granule semantics on a store).
  * Best-effort/unlocked: the break is a single word write; a concurrent stwcx

@@ -151,15 +151,40 @@ extern uint8_t* vm_base;
 #define VM_RAW_LD(T, ea) ({ const uint8_t* _p = vm_base + (uint32_t)(ea); T _v; \
     if (!((uintptr_t)_p & (sizeof(T) - 1))) _v = __atomic_load_n((const T*)_p, __ATOMIC_RELAXED); \
     else memcpy(&_v, _p, sizeof(T)); _v; })
-#define VM_RAW_ST(T, ea, val) do { uint8_t* _p = vm_base + (uint32_t)(ea); T _v = (val); \
+/* The raw stores skip vm_write*, so they test the SPU reservation bitmap
+ * themselves: a store into a line an SPU holds goes through the lock-line
+ * lock and raises the lost-reservation event (spu_coh_store_raw), or it can
+ * land between a PUTLLC's compare and its copy and be written back over.
+ * Common case: one bitmap byte load and a branch; the second line is looked
+ * at only for a store that crosses into it, which an aligned one never does.
+ * The bitmap pointer is not snapshotted (PPU_MM_SNAP): marks appear while the
+ * function runs. PS3_RAW_STORE_COH=0 keeps the old unlocked store. */
+extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until the first */
+void spu_coh_store_raw(uint32_t ea, const void* src, uint32_t n);   /* src NULL: zeros */
+static inline int vm_raw_st_coh(uint32_t ea, uint32_t n) {
+    const unsigned char* b = g_spu_coh_bits;
+    if (!b) return 0;
+    const uint32_t l0 = ea >> 7;
+    if ((b[l0 >> 3] >> (l0 & 7)) & 1u) return 1;
+    if (__builtin_expect((ea & 127u) + n <= 128u, 1)) return 0;
+    const uint32_t l1 = (ea + n - 1u) >> 7;
+    return (b[l1 >> 3] >> (l1 & 7)) & 1u; }
+#define VM_RAW_ST_PLAIN(T, ea, val) do { uint8_t* _p = vm_base + (uint32_t)(ea); T _v = (val); \
     if (!((uintptr_t)_p & (sizeof(T) - 1))) __atomic_store_n((T*)_p, _v, __ATOMIC_RELAXED); \
     else memcpy(_p, &_v, sizeof(T)); } while (0)
+#define VM_RAW_ST(T, ea, val) do { const uint32_t _a = (uint32_t)(ea); T _w = (val); \
+    if (__builtin_expect(vm_raw_st_coh(_a, sizeof(T)), 0)) spu_coh_store_raw(_a, &_w, sizeof(T)); \
+    else VM_RAW_ST_PLAIN(T, _a, _w); } while (0)
 static inline void vm_raw_ld16(void* dst, uint64_t ea) {   /* quadword-aligned */
     uint64_t lo = VM_RAW_LD(uint64_t, ea), hi = VM_RAW_LD(uint64_t, ea + 8);
     memcpy(dst, &lo, 8); memcpy((uint8_t*)dst + 8, &hi, 8); }
-static inline void vm_raw_st16(uint64_t ea, const void* src) {
+static inline void vm_raw_st16(uint64_t ea, const void* src) {   /* quadword-aligned */
+    if (__builtin_expect(vm_raw_st_coh((uint32_t)ea, 16), 0)) { spu_coh_store_raw((uint32_t)ea, src, 16); return; }
     uint64_t lo, hi; memcpy(&lo, src, 8); memcpy(&hi, (const uint8_t*)src + 8, 8);
-    VM_RAW_ST(uint64_t, ea, lo); VM_RAW_ST(uint64_t, ea + 8, hi); }
+    VM_RAW_ST_PLAIN(uint64_t, ea, lo); VM_RAW_ST_PLAIN(uint64_t, ea + 8, hi); }
+static inline void vm_dcbz(uint64_t ea) {   /* ea 128-byte aligned */
+    if (__builtin_expect(vm_raw_st_coh((uint32_t)ea, 128), 0)) { spu_coh_store_raw((uint32_t)ea, 0, 128); return; }
+    memset(vm_base + (uint32_t)ea, 0, 128); }
 extern int      vm_inline_ok;
 extern int      vm_inline_st_ok;
 extern uint32_t ppu_vm_size;
@@ -2769,13 +2794,19 @@ class PPULifter:
         if mn in ("stvlx", "stvlxl", "stvrx", "stvrxl"):
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra, rb = _reg_idx(ops[1]), _reg_idx(ops[2])
+            # The stored bytes are one contiguous run; a run into an
+            # SPU-reserved line goes through spu_coh_store_raw (see VM_RAW_ST).
             if mn.startswith("stvl"):
                 loop = "for (uint32_t i = 0; i < 16u - sh; i++) m[sh + i] = s[i];"
+                coh = ("if (vm_raw_st_coh((uint32_t)(ea & ~0xFULL) + sh, 16u - sh)) "
+                       "spu_coh_store_raw((uint32_t)(ea & ~0xFULL) + sh, s, 16u - sh); else ")
             else:
                 loop = "for (uint32_t i = 16u - sh; i < 16u; i++) m[i - (16u - sh)] = s[i];"
+                coh = ("if (sh && vm_raw_st_coh((uint32_t)(ea & ~0xFULL), sh)) "
+                       "spu_coh_store_raw((uint32_t)(ea & ~0xFULL), s + 16u - sh, sh); else ")
             return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint32_t sh = (uint32_t)(ea & 0xF); "
                     f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
-                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; {loop} }}")
+                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; {coh}{{ {loop} }} }}")
 
         if mn == "lwaux":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -2880,7 +2911,7 @@ class PPULifter:
             ra = _reg_idx(ops[0])
             rb = _reg_idx(ops[1])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0x7FULL; "
-                    f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
+                    f"vm_dcbz(ea); }}")
 
         if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi"):
             return f"/* {mn}: cache hint, no-op */;"

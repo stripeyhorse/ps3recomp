@@ -160,6 +160,87 @@ static spu_coh_watch* s_coh_watches;
 
 unsigned long g_spu_lr_raise = 0;
 
+
+/* PS3_STALL_TRACE_LINE=<hex EA> (diagnostic, default off): a ring of the
+ * last writes to that one line, taken in the notifier every coherent writer
+ * calls under the lock-line lock -- SPU PUTLLC/PUTLLUC/PUT, PPU stwcx. and
+ * coherent stores, and (with PS3_RAW_STORE_COH) raw stores. Each entry is the
+ * line's first two words AFTER the write, who wrote it, and from where. A
+ * change between two entries that no entry accounts for is a write that went
+ * round the lock. Printed by the stall watchdog. */
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
+#include "../platform/win32_compat.h"
+#define COH_TRACE_LINES 4
+static uint32_t s_trace_line[COH_TRACE_LINES] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+static uint32_t s_trace_lo = 0xFFFFFFFFu, s_trace_hi = 0;   /* bounds, for one compare in the notifiers */
+typedef struct { uint64_t ms; uint32_t w0, w1; const void* self; int img; uint32_t pc, lr; void* ra; char who[16]; } coh_trace;
+#define COH_TRACE_N 64
+static coh_trace s_trace[COH_TRACE_LINES][COH_TRACE_N];
+static unsigned long s_trace_n[COH_TRACE_LINES];
+static uint8_t* const* s_trace_base;
+/* The stall watchdog arms this before any guest code runs, with the address
+ * of vm_base (not yet set then). This file reads guest memory only through
+ * it, so fixtures that compile spu_coherency.c alone need no vm_base. */
+void spu_coh_trace_arm(uint8_t* const* vm_base_var)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    s_trace_base = vm_base_var;
+    /* Up to four comma-separated EAs. */
+    const char* e = getenv("PS3_STALL_TRACE_LINE");
+    for (int i = 0; e && *e && i < COH_TRACE_LINES; i++) {
+        char* end;
+        s_trace_line[i] = (uint32_t)strtoul(e, &end, 16) & ~127u;
+        if (s_trace_line[i] < s_trace_lo) s_trace_lo = s_trace_line[i];
+        if (s_trace_line[i] > s_trace_hi) s_trace_hi = s_trace_line[i];
+        e = *end == ',' ? end + 1 : NULL;
+    }
+}
+static void coh_trace_add(uint32_t line, const spu_context* self, void* ra)
+{
+    const uint8_t* vm_base = s_trace_base ? *s_trace_base : NULL;
+    if (!vm_base) return;
+    int k = 0;
+    while (k < COH_TRACE_LINES && s_trace_line[k] != line) k++;
+    if (k == COH_TRACE_LINES) return;
+    coh_trace* t = &s_trace[k][s_trace_n[k]++ % COH_TRACE_N];
+    const uint8_t* m = vm_base + line;
+    t->ms = GetTickCount64();
+    t->w0 = ((uint32_t)m[0] << 24) | ((uint32_t)m[1] << 16) | ((uint32_t)m[2] << 8) | m[3];
+    t->w1 = ((uint32_t)m[4] << 24) | ((uint32_t)m[5] << 16) | ((uint32_t)m[6] << 8) | m[7];
+    t->self = self; t->ra = ra;
+    t->img = self ? self->image_id : -1;
+    t->pc = self ? (uint32_t)(self->pc & SPU_LS_MASK) : 0;
+    t->lr = self ? (self->gpr[0]._u32[0] & SPU_LS_MASK) : 0;
+    /* No thread-name lookup here: on Linux it reads /proc, under the lock-line
+     * lock, on every write to the line -- enough to change the timing being
+     * traced. ra (PPU stwcx vs SPU PUTLLC vs store path) and ctx name the
+     * writer; the host thread is recorded by its pthread_t. */
+#if defined(_WIN32)
+    snprintf(t->who, sizeof t->who, "%lx", (unsigned long)GetCurrentThreadId());
+#else
+    snprintf(t->who, sizeof t->who, "%lx", (unsigned long)(uintptr_t)pthread_self() & 0xFFFFFFFul);
+#endif
+}
+static void coh_trace_dump(FILE* f)
+{
+    const uint64_t now = GetTickCount64();
+    for (int k = 0; k < COH_TRACE_LINES && s_trace_line[k] != 0xFFFFFFFFu; k++) {
+        const unsigned long n = s_trace_n[k];
+        fprintf(f, "  writes to traced line 0x%08X: %lu; last %d, oldest first (word0 word1 after the write):\n",
+                s_trace_line[k], n, COH_TRACE_N);
+        for (unsigned long i = n > COH_TRACE_N ? n - COH_TRACE_N : 0; i < n; i++) {
+            const coh_trace* t = &s_trace[k][i % COH_TRACE_N];
+            fprintf(f, "    -%6llu ms %08X %08X  %-15s %s img=%d pc=0x%05X lr=0x%05X ctx=%p ra=%p\n",
+                    (unsigned long long)(now - t->ms), t->w0, t->w1, t->who, t->self ? "SPU" : "   ",
+                    t->img, t->pc, t->lr, t->self, t->ra);
+        }
+    }
+}
+
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     /* Read before writing. The kernel reserves the same few lines over and
@@ -277,6 +358,40 @@ int spu_coh_is_reserved(uint32_t addr)
     return spu_coh_line_reserved(addr);
 }
 
+/* Stall watchdog (runtime/syscalls/stall_watchdog.c): every registered
+ * reservation holder and the line it holds. Under the lock-line lock, so the
+ * set cannot change underneath the walk; the fields of a running SPU are read
+ * racily, which is fine for a once-per-stall report. */
+void spu_coh_dump_state(FILE* f, const uint8_t* vm_base)
+{
+    spu_lockline_lock();
+    fprintf(f, "  %u holders, %lu LR events raised\n", s_coh_n, g_spu_lr_raise);
+    for (unsigned i = 0; i < s_coh_n; i++) {
+        const spu_context* c = s_coh_ctxs[i];
+        fprintf(f, "  [%u] ctx=%p img=%d spu=0x%X grp=0x%X pc=0x%05X lr=0x%05X resv=%s ea=0x%08X"
+                   " ev=0x%X/0x%X inmbox=%u outmbox=%u intrmbox=%u getllar=%llu\n",
+                i, (const void*)c, c->image_id, c->spu_id, c->spu_group_id,
+                (unsigned)(c->pc & SPU_LS_MASK), c->gpr[0]._u32[0] & SPU_LS_MASK,
+                c->resv_valid ? "valid" : "none", c->resv_ea, c->event_status, c->event_mask,
+                c->ch_in_mbox.count, c->ch_out_mbox.count, c->ch_out_intr_mbox.count,
+                (unsigned long long)c->dbg_getllar);
+        if (vm_base && c->resv_ea) {
+            const uint8_t* m = vm_base + (c->resv_ea & ~127u);
+            int same = memcmp(m, c->resv_line, 128) == 0;
+            fprintf(f, "      line 0x%08X (%s snapshot):", c->resv_ea & ~127u,
+                    same ? "matches" : "DIFFERS from");
+            for (int k = 0; k < 128; k += 4)
+                fprintf(f, "%s%02X%02X%02X%02X", (k % 32) ? " " : "\n        ",
+                        m[k], m[k + 1], m[k + 2], m[k + 3]);
+            fprintf(f, "\n");
+        }
+    }
+    for (const spu_coh_watch* w = s_coh_watches; w; w = w->next)
+        fprintf(f, "  watch on line 0x%08X\n", w->line);
+    coh_trace_dump(f);
+    spu_lockline_unlock();
+}
+
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
  * reservation away for its own MFC write -- the MFC is part of the same SPE.
  * Our notify had no way to say "everyone but me", so an SPU that reserved a
@@ -368,6 +483,7 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
+    if (__builtin_expect(line - s_trace_lo <= s_trace_hi - s_trace_lo, 0)) coh_trace_add(line, (const spu_context*)self, __builtin_return_address(0));
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_coh_wake_watches(line);
@@ -388,6 +504,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
+    if (__builtin_expect(line - s_trace_lo <= s_trace_hi - s_trace_lo, 0)) coh_trace_add(line, NULL, __builtin_return_address(0));
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_coh_wake_watches(line);
