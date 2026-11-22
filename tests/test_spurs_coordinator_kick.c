@@ -70,21 +70,35 @@ int main(void)
      * timeout. Taking the lock after `waiting` is set proves the waiter is
      * inside the wait (it releases the lock only by sleeping), so the wake
      * cannot fall before it; a missing wake hangs here. */
-    HANDLE t = CreateThread(NULL, 0, waiter, NULL, 0, NULL);
-    assert(t);
-    for (;;) {
-        AcquireSRWLockExclusive(&si->lock);
-        int w = waiting;
+    for (int self_admit = 0; self_admit < 2; self_admit++) {
+        si->self_admit = self_admit;
+        si->free_lanes = 1;   /* a free lane: the coordinator has work to look for */
+        waiting = woken = 0;
+        HANDLE t = CreateThread(NULL, 0, waiter, NULL, 0, NULL);
+        assert(t);
+        for (;;) {
+            AcquireSRWLockExclusive(&si->lock);
+            int w = waiting;
+            ReleaseSRWLockExclusive(&si->lock);
+            if (w) break;
+            Sleep(0);
+        }
+        AcquireSRWLockExclusive(&si->lock);   /* waiter is now asleep */
         ReleaseSRWLockExclusive(&si->lock);
-        if (w) break;
-        Sleep(0);
+        g_spu_line_commit_hook(SPURS_EA);
+        WaitForSingleObject(t, INFINITE);
+        CloseHandle(t);
+        assert(woken);
+        assert(take_kick() == 1);
     }
-    AcquireSRWLockExclusive(&si->lock);   /* waiter is now asleep */
-    ReleaseSRWLockExclusive(&si->lock);
+
+    /* Self-admission with every lane admitted: the commit is recorded for the
+     * coordinator's next look (the worker that frees a lane wakes it), with
+     * no wake of its own. */
+    si->self_admit = 1; si->free_lanes = 0;
     g_spu_line_commit_hook(SPURS_EA);
-    WaitForSingleObject(t, INFINITE);
-    CloseHandle(t);
-    assert(woken);
+    assert(take_kick() == 1);
+    si->self_admit = 0;
 
     puts("PASS: an SPU commit to the SPURS request line kicks and wakes the coordinator");
     return 0;

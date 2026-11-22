@@ -1,0 +1,19 @@
+# ThreadSanitizer suppressions for the SPURS scheduler fixtures.
+#
+# Guest memory is shared, unsynchronised memory by design: guest code (here the
+# manufactured policies and the fake SPU producer) reads and writes it with
+# plain accesses, and the scheduler's first look at a request byte is a
+# lock-free peek that is re-read under spu_lockline_lock before anything is
+# consumed. Only accesses made through the guest-memory accessors are listed,
+# so a race on host scheduler state (locks, lanes, counters) still reports.
+race:vm_read8
+race:vm_read16
+race:vm_read32
+race:vm_write8
+race:wkl_count_get
+race:wkl_count_set
+race:spu_raise_ready
+# Pre-existing lazy initialisation in the SPU runtime, unrelated to SPURS
+# admission (racy first-use flags that settle to one value).
+race:yz_lockstep_enabled
+race:spu_direct_init

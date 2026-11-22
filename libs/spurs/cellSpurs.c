@@ -473,6 +473,16 @@ struct SpursPmSlot {
     const uint8_t* pm;
     u64 data;
     HANDLE thread;
+    /* PS3_SPURS_SELF_ADMIT: this lane's worker sleeps here, not on the
+     * instance condition, so an admission wakes only the lane it fills.
+     * Kept across scheduler restarts (a POSIX slot owns a heap object). */
+    CONDITION_VARIABLE wake;
+};
+/* Scheduler counters (PS3_SPURS_SCHED_STATS=1), all changed under si->lock. */
+struct SpursSchedStats {
+    u64 worker_admits, worker_misses, coord_admits;
+    u64 coord_wakes, full_passes, kick_passes, follow_passes;
+    u64 last_ms;
 };
 static struct SpursInst {
     u32 ea, nspus;
@@ -486,6 +496,14 @@ static struct SpursInst {
     u8 active[SPURS_MAX_WID], idle[SPURS_MAX_WID];
     u8 is2;   /* CellSpurs2: 32 workloads */
     u32 cursor, pass_no;
+    /* Self-admission (PS3_SPURS_SELF_ADMIT, fixed for one scheduler
+     * lifetime). free_lanes counts host lanes with no admitted policy; it is
+     * written under lock and read without it by the request-line hook.
+     * follow_up asks the coordinator to finish a pass a returning worker began
+     * for its own lane. shutdown_waiters counts WaitForWorkloadShutdown
+     * callers asleep on `wake`. */
+    int self_admit, free_lanes, follow_up, shutdown_waiters;
+    struct SpursSchedStats stats;
 } s_inst[MAX_SPURS_INST];
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
 
@@ -510,7 +528,15 @@ static void spurs_line_committed(uint32_t line)
         const u32 ea = __atomic_load_n(&si->ea, __ATOMIC_ACQUIRE);
         if (!ea || (ea & ~127u) != line || !__atomic_load_n(&si->kernel_live, __ATOMIC_ACQUIRE))
             continue;
-        __atomic_store_n(&si->kick, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&si->kick, 1, __ATOMIC_SEQ_CST);
+        /* With self-admission, a coordinator whose lanes are all admitted
+         * sleeps until a lane frees, and has nothing to do before then: the
+         * returning worker reads this line when it admits its next run, and
+         * the worker that leaves a lane free wakes the coordinator, which
+         * then sees this kick. */
+        if (__atomic_load_n(&si->self_admit, __ATOMIC_RELAXED) &&
+            !__atomic_load_n(&si->free_lanes, __ATOMIC_SEQ_CST))
+            continue;
         WakeAllConditionVariable(&si->wake);
     }
 }
@@ -1998,10 +2024,143 @@ static u32 spurs_idle_max(void)
     return (u32)s_max;
 }
 
+/* PS3_SPURS_LANES_OF_2=<n> (experiment): run a two-SPU instance's work on n
+ * host lanes instead of two. n=1 serialises it, which measured PAIN's ICE
+ * Mesh frame at 82 ms against 49 ms on two lanes: about 65 ms of mesh work a
+ * frame that does divide between lanes. n=3 or 4 lets host threads beyond the
+ * guest's SPU count take jobs from the same lists; the guest still sees two
+ * SPUs, and an extra lane uses the priority row of the guest lane it shadows
+ * (sn % nspus). Unset, every instance runs exactly its own SPU count. */
+static u32 spurs_host_lanes(const struct SpursInst* si)
+{
+    static int lanes_of_2 = -1;
+    if (lanes_of_2 < 0) { const char* e = getenv("PS3_SPURS_LANES_OF_2"); lanes_of_2 = e ? atoi(e) : 0; }
+    if (si->nspus != 2 || lanes_of_2 <= 0) return si->nspus;
+    return (u32)lanes_of_2 > 6u ? 6u : (u32)lanes_of_2;
+}
+
+/* PS3_SPURS_SELF_ADMIT (default 1): a worker whose policy run returns makes
+ * the admission decision for its own lane and starts the next run itself, and
+ * wakes are targeted (the admitted lane only; the coordinator only while a
+ * lane is free). 0 restores coordinator-only admission with broadcast wakes.
+ * Read once per process; each scheduler keeps its value for its lifetime. */
+static int spurs_self_admit_env(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3_SPURS_SELF_ADMIT"); v = !(e && *e == '0'); }
+    return v;
+}
+/* PS3_NO_SPURS_PM: admit nothing (diagnostic). */
+static int spurs_pm_disabled(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("PS3_NO_SPURS_PM") != NULL;
+    return v;
+}
+/* PS3_SPURS_SCHED_STATS=1: print each instance's admission counters about
+ * every two seconds and when its scheduler stops. */
+static int spurs_stats_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3_SPURS_SCHED_STATS"); v = e && *e == '1'; }
+    return v;
+}
+static u64 spurs_now_ms(void)
+{
+    LARGE_INTEGER n, f;
+    QueryPerformanceCounter(&n); QueryPerformanceFrequency(&f);
+    return (u64)((double)n.QuadPart * 1000.0 / (double)f.QuadPart);
+}
+/* Under si->lock. */
+static void spurs_stats_print(struct SpursInst* si, int force)
+{
+    if (!spurs_stats_on()) return;
+    u64 now = spurs_now_ms();
+    if (!si->stats.last_ms) si->stats.last_ms = now;
+    if (!force && now - si->stats.last_ms < 2000) return;
+    const struct SpursSchedStats* t = &si->stats;
+    printf("[cellSpurs] sched ea=0x%08X lanes=%u self=%d t=%llu: admits worker=%llu coord=%llu "
+           "worker-miss=%llu | coord wakes=%llu passes full=%llu kick=%llu follow=%llu\n",
+           si->ea, spurs_host_lanes(si), si->self_admit, (unsigned long long)now,
+           (unsigned long long)t->worker_admits, (unsigned long long)t->coord_admits,
+           (unsigned long long)t->worker_misses, (unsigned long long)t->coord_wakes,
+           (unsigned long long)t->full_passes, (unsigned long long)t->kick_passes,
+           (unsigned long long)t->follow_passes);
+    fflush(stdout);
+    si->stats.last_ms = now;
+}
+
+/* The admission decision for one free lane `sn`, shared by the coordinator's
+ * pass over every free lane and a returning worker's look at its own. The
+ * caller holds si->lock and then s_workload_registry_lock; the guest header
+ * updates take spu_lockline_lock inside. A full pass has already advanced
+ * si->pass_no; a kick pass serves only requested workloads. Starting at the
+ * instance cursor, the first eligible workload is admitted: its ready unit,
+ * signal bit or workload flag is consumed, its contention published, and the
+ * lane loaded and marked busy. Returns 1 if a workload was admitted. */
+static int spurs_admit_lane(struct SpursInst* si, struct SpursPmSlot* slot, u32 sn,
+                            u32 enabled, int kick_pass)
+{
+    const u32 ea = si->ea;
+    const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
+    for (u32 checked = 0; checked < nwid; checked++) {
+        u32 wid = si->cursor % nwid;
+        si->cursor = (wid + 1) % nwid;
+        if (!(enabled & (0x80000000u >> wid)) ||
+            vm_read8(ea + wkl_state_off(wid)) != 2 ||
+            !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
+            continue;
+        if (!vm_read8(ea + wkl_info_off(wid) + 0x18 + sn % si->nspus))
+            continue; /* priority zero makes this physical lane ineligible */
+        u32 maxcont = wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2);
+        if (!maxcont || si->active[wid] >= maxcont) continue;
+        WklPm* pm = spurs_resolve_pm(wid);
+        if (!pm) continue;
+        u32 signal = vm_read16(ea + wkl_signal_off(wid));
+        u32 ready = vm_read8(ea + wkl_ready_off(wid));
+        /* The workload flag: the PPU stores 0 into it to make the
+         * receiver workload ready (cellSpursGetWorkloadFlag). */
+        int flagged = vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid &&
+                      vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0;
+        int kicked = ready || (signal & wkl_signal_bit(wid)) || flagged;
+        if (kicked) si->idle[wid] = 0;
+        if (!kicked && (kick_pass || (si->pass_no & ((1u << si->idle[wid]) - 1))))
+            continue;
+        spu_lockline_lock();
+        ready = vm_read8(ea + wkl_ready_off(wid));
+        signal = vm_read16(ea + wkl_signal_off(wid));
+        if (ready) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
+        if (signal & wkl_signal_bit(wid))
+            ef_w16(ea + wkl_signal_off(wid), (u16)(signal & ~wkl_signal_bit(wid)));
+        if (vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid)
+            ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
+        ef_line_end(ea);
+        slot->fn = pm->fn; slot->image_id = pm->image_id;
+        slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
+        slot->pm_size = s_workloads[wid].sizePm;
+        slot->data = vm_read64(ea + wkl_info_off(wid) + 8);
+        slot->wid = wid; slot->ea = ea;
+        si->active[wid]++;
+        spu_lockline_lock();
+        wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
+        ef_line_end(ea);
+        slot->busy = 1;
+        return 1;
+    }
+    return 0;
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
- * never runs under that lock, and only a genuine return releases contention. */
+ * never runs under that lock, and only a genuine return releases contention.
+ *
+ * With self-admission a returning worker, still under si->lock, makes the
+ * coordinator's decision for its own lane as a full pass, so a lane that stays
+ * busy never waits on the coordinator. If any lane is left free afterwards
+ * (its own or another) it hands the rest of that pass to the coordinator
+ * (follow_up), which looks at every free lane at the same pass number, as the
+ * coordinator's pass after each return did before. */
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
@@ -2021,9 +2180,10 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 #endif
     ps3_tprof_thread('S', (uint32_t)slot->spu_num);
     AcquireSRWLockExclusive(&si->lock);
+    const int self_admit = si->self_admit;
     for (;;) {
         while (!slot->busy && !si->stopping)
-            SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+            SleepConditionVariableSRW(self_admit ? &slot->wake : &si->wake, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
         ReleaseSRWLockExclusive(&si->lock);
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
@@ -2042,35 +2202,42 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         if (polls) si->idle[wid] = 0;
         else if (si->idle[wid] < spurs_idle_max()) si->idle[wid]++;
         slot->busy = 0;
-        WakeAllConditionVariable(&si->wake);
+        if (!self_admit) { WakeAllConditionVariable(&si->wake); continue; }
+
+        int admitted = 0;
+        if (!si->stopping && !spurs_pm_disabled()) {
+            AcquireSRWLockExclusive(&s_workload_registry_lock);
+            si->pass_no++;
+            admitted = spurs_admit_lane(si, slot, slot->spu_num,
+                                        vm_read32(si->ea + SPURS_WKL_ENABLED), 0);
+            ReleaseSRWLockExclusive(&s_workload_registry_lock);
+        }
+        if (admitted) si->stats.worker_admits++;
+        else {
+            si->stats.worker_misses++;
+            __atomic_store_n(&si->free_lanes, si->free_lanes + 1, __ATOMIC_SEQ_CST);
+        }
+        /* Wake the instance condition only for a free lane's follow-up pass or
+         * a WaitForWorkloadShutdown caller, which re-checks its state on
+         * every return as it did under the broadcast. */
+        int wake = si->shutdown_waiters > 0;
+        if (si->free_lanes) { si->follow_up = 1; wake = 1; }
+        if (wake) WakeAllConditionVariable(&si->wake);
+        spurs_stats_print(si, 0);
     }
     ReleaseSRWLockExclusive(&si->lock);
     ps3_tprof_thread_exit();
     return 0;
 }
 
-/* PS3_SPURS_LANES_OF_2=<n> (experiment): run a two-SPU instance's work on n
- * host lanes instead of two. n=1 serialises it, which measured PAIN's ICE
- * Mesh frame at 82 ms against 49 ms on two lanes: about 65 ms of mesh work a
- * frame that does divide between lanes. n=3 or 4 lets host threads beyond the
- * guest's SPU count take jobs from the same lists; the guest still sees two
- * SPUs, and an extra lane uses the priority row of the guest lane it shadows
- * (sn % nspus). Unset, every instance runs exactly its own SPU count. */
-static u32 spurs_host_lanes(const struct SpursInst* si)
-{
-    static int lanes_of_2 = -1;
-    if (lanes_of_2 < 0) { const char* e = getenv("PS3_SPURS_LANES_OF_2"); lanes_of_2 = e ? atoi(e) : 0; }
-    if (si->nspus != 2 || lanes_of_2 <= 0) return si->nspus;
-    return (u32)lanes_of_2 > 6u ? 6u : (u32)lanes_of_2;
-}
-
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
     ps3_thread_name("spurs kernel");
-    int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
+    const int disabled = spurs_pm_disabled();
     unsigned kick_run = 0;
     AcquireSRWLockExclusive(&si->lock);
+    const int self_admit = si->self_admit;
     while (!si->stopping) {
         /* A request line committed during the last pass: look again now. Such a
          * pass serves only requested workloads and leaves pass_no alone, so the
@@ -2081,86 +2248,74 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         int kick_pass = 0;
         if (__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL)) {
             kick_pass = ++kick_run < 16;
-        } else {
-            SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
+        } else if (!(self_admit && si->follow_up)) {
+            /* The timed wait finds work raised without a kick (a PPU store to
+             * the request line, a commit in the window the line hook
+             * describes) and drives the idle back-off probes, and both matter
+             * only to a free lane. With self-admission, a coordinator with no
+             * free lane sleeps until a returning worker leaves one free. */
+            const DWORD ms = self_admit && !si->free_lanes ? INFINITE : 1;
+            SleepConditionVariableSRW(&si->wake, &si->lock, ms, 0);
+            si->stats.coord_wakes++;
             /* This full pass reads the line after any commit that woke it. */
             (void)__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL);
         }
         if (!kick_pass) kick_run = 0;
         if (si->stopping) break;
+        /* Finishing the pass a returning worker began: same pass number. */
+        const int follow = self_admit && si->follow_up && !kick_pass;
+        si->follow_up = 0;
         if (disabled) continue;
         u32 ea = si->ea;
         AcquireSRWLockExclusive(&s_workload_registry_lock);
-        if (!kick_pass) si->pass_no++;
+        if (!kick_pass && !follow) si->pass_no++;
+        if (kick_pass) si->stats.kick_passes++;
+        else if (follow) si->stats.follow_passes++;
+        else si->stats.full_passes++;
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
         const u32 admit = spurs_host_lanes(si);
         for (u32 sn = 0; sn < admit; sn++) {
             struct SpursPmSlot* slot = &si->slots[sn];
             if (slot->busy) continue;
-            const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
-            for (u32 checked = 0; checked < nwid; checked++) {
-                u32 wid = si->cursor % nwid;
-                si->cursor = (wid + 1) % nwid;
-                if (!(enabled & (0x80000000u >> wid)) ||
-                    vm_read8(ea + wkl_state_off(wid)) != 2 ||
-                    !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
-                    continue;
-                if (!vm_read8(ea + wkl_info_off(wid) + 0x18 + sn % si->nspus))
-                    continue; /* priority zero makes this physical lane ineligible */
-                u32 maxcont = wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2);
-                if (!maxcont || si->active[wid] >= maxcont) continue;
-                WklPm* pm = spurs_resolve_pm(wid);
-                if (!pm) continue;
-                u32 signal = vm_read16(ea + wkl_signal_off(wid));
-                u32 ready = vm_read8(ea + wkl_ready_off(wid));
-                /* The workload flag: the PPU stores 0 into it to make the
-                 * receiver workload ready (cellSpursGetWorkloadFlag). */
-                int flagged = vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid &&
-                              vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0;
-                int kicked = ready || (signal & wkl_signal_bit(wid)) || flagged;
-                if (kicked) si->idle[wid] = 0;
-                if (!kicked && (kick_pass || (si->pass_no & ((1u << si->idle[wid]) - 1))))
-                    continue;
-                spu_lockline_lock();
-                ready = vm_read8(ea + wkl_ready_off(wid));
-                signal = vm_read16(ea + wkl_signal_off(wid));
-                if (ready) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
-                if (signal & wkl_signal_bit(wid))
-                    ef_w16(ea + wkl_signal_off(wid), (u16)(signal & ~wkl_signal_bit(wid)));
-                if (vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid)
-                    ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
-                ef_line_end(ea);
-                slot->fn = pm->fn; slot->image_id = pm->image_id;
-                slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
-                slot->pm_size = s_workloads[wid].sizePm;
-                slot->data = vm_read64(ea + wkl_info_off(wid) + 8);
-                slot->wid = wid; slot->ea = ea;
-                si->active[wid]++;
-                spu_lockline_lock();
-                wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
-                ef_line_end(ea);
-                slot->busy = 1;
-                WakeAllConditionVariable(&si->wake);
-                break;
-            }
+            if (!spurs_admit_lane(si, slot, sn, enabled, kick_pass)) continue;
+            si->stats.coord_admits++;
+            if (self_admit) {
+                __atomic_store_n(&si->free_lanes, si->free_lanes - 1, __ATOMIC_SEQ_CST);
+                WakeConditionVariable(&slot->wake);
+            } else WakeAllConditionVariable(&si->wake);
         }
         ReleaseSRWLockExclusive(&s_workload_registry_lock);
+        spurs_stats_print(si, 0);
     }
     ReleaseSRWLockExclusive(&si->lock);
     return 0;
+}
+
+/* Stopping: the coordinator, every worker and any shutdown waiter. */
+static void spurs_wake_everyone(struct SpursInst* si)
+{
+    WakeAllConditionVariable(&si->wake);
+    for (u32 sn = 0; sn < spurs_host_lanes(si); sn++)
+        WakeAllConditionVariable(&si->slots[sn].wake);
 }
 
 static s32 spurs_scheduler_start(struct SpursInst* si)
 {
     si->stopping = 0; si->cursor = si->pass_no = 0;
     __atomic_store_n(&si->kick, 0, __ATOMIC_RELAXED);
+    si->follow_up = 0; si->shutdown_waiters = 0;
+    memset(&si->stats, 0, sizeof(si->stats));
+    __atomic_store_n(&si->free_lanes, (int)spurs_host_lanes(si), __ATOMIC_SEQ_CST);
+    __atomic_store_n(&si->self_admit, spurs_self_admit_env(), __ATOMIC_RELAXED);
     { extern void (*g_spu_line_commit_hook)(uint32_t);
       g_spu_line_commit_hook = spurs_commit_hook; }
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
     for (u32 sn = 0; sn < spurs_host_lanes(si); sn++) {
         struct SpursPmSlot* slot = &si->slots[sn];
+        CONDITION_VARIABLE wake = slot->wake;
         memset(slot, 0, sizeof(*slot));
+        slot->wake = wake;
         slot->instance = si; slot->spu_num = sn;
         slot->thread = CreateThread(NULL, 1u << 20, spurs_pm_worker, slot, 0, NULL);
         if (!slot->thread) goto failed;
@@ -2170,7 +2325,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     return CELL_OK;
 failed:
     AcquireSRWLockExclusive(&si->lock);
-    si->stopping = 1; WakeAllConditionVariable(&si->wake);
+    si->stopping = 1; spurs_wake_everyone(si);
     ReleaseSRWLockExclusive(&si->lock);
     for (u32 sn = 0; sn < spurs_host_lanes(si); sn++) {
         HANDLE h = si->slots[sn].thread;
@@ -2189,7 +2344,8 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
     if (si->stopping || si->starting) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
     for (u32 wid = 0; wid < SPURS_MAX_WID; wid++)
         if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
-    si->stopping = 1; WakeAllConditionVariable(&si->wake);
+    si->stopping = 1; spurs_wake_everyone(si);
+    spurs_stats_print(si, 1);
     ReleaseSRWLockExclusive(&si->lock);
     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
     for (u32 sn = 0; sn < spurs_host_lanes(si); sn++) {
@@ -2284,7 +2440,8 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
     if (rc) return rc;
-    /* Work is admitted only by the coordinator, including explicit wakes. */
+    /* An explicit wake admits nothing itself: it clears the back-off and
+     * wakes the coordinator (spurs_api_unlock). */
     memset(si->idle, 0, sizeof(si->idle));
     spurs_api_unlock(si);
     return CELL_OK;
@@ -3568,8 +3725,11 @@ s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid)
     ReleaseSRWLockExclusive(&s_workload_registry_lock);
     const u32 state_ea = (u32)spurs_ea + wkl_state_off(wid);
     while (si->ea == (u32)spurs_ea && si->kernel_live && !si->stopping &&
-           vm_read8(state_ea) == WKL_SHUTTING_DOWN)
+           vm_read8(state_ea) == WKL_SHUTTING_DOWN) {
+        si->shutdown_waiters++;
         SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+        si->shutdown_waiters--;
+    }
     const int stopped = si->ea == (u32)spurs_ea && vm_read8(state_ea) == WKL_REMOVABLE;
     ReleaseSRWLockExclusive(&si->lock);
     return stopped ? CELL_OK : workload_error(CELL_SPURS_CORE_ERROR_STAT);
