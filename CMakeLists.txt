@@ -582,6 +582,26 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
+    # The packed triangle lists the GPU vertex decode reads, against the CPU
+    # fetch they replace; no GPU (the HLSL runs in test_metal_vertex_pull.m).
+    add_executable(test_rsx_packed_triangles
+        libs/video/tests/test_rsx_packed_triangles.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_dispatch.c)
+    target_include_directories(test_rsx_packed_triangles PRIVATE include libs/video)
+    if(NOT WIN32)
+        target_link_libraries(test_rsx_packed_triangles PRIVATE m)
+    endif()
+    add_test(NAME rsx_packed_triangles COMMAND test_rsx_packed_triangles)
+
+    # Transform program and constant packets applied whole, against the
+    # dispatcher's word-by-word path.
+    add_executable(test_rsx_upload_run
+        libs/video/tests/test_rsx_upload_run.c
+        libs/video/rsx_dispatch.c)
+    target_include_directories(test_rsx_upload_run PRIVATE include libs/video)
+    add_test(NAME rsx_upload_run COMMAND test_rsx_upload_run)
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
@@ -720,6 +740,24 @@ if(UNIX)
                 ps3recomp_msl_translation
                 "-framework Metal" "-framework QuartzCore" "-framework AppKit")
             target_link_options(test_metal_depth_bounds PRIVATE "-Wl,-dead_strip")
+
+            # The GPU vertex decode: the shader's packed-input decoder against
+            # the CPU decode, bit for bit.
+            add_executable(test_metal_vertex_pull
+                libs/video/tests/test_metal_vertex_pull.m
+                libs/video/rsx_shader_msl.cpp
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_dispatch.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_vertex_pull.m"
+                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+            target_include_directories(test_metal_vertex_pull PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            target_link_libraries(test_metal_vertex_pull PRIVATE
+                ps3recomp_msl_translation "-framework Metal" "-framework Foundation")
 
             # SET_ZMIN_MAX_CONTROL's depth clamp, the same way.
             add_executable(test_metal_depth_clamp

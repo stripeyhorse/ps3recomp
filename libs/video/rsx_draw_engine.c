@@ -2412,7 +2412,7 @@ static void eng_prepare_shaders(void)
     fprintf(stderr, "[shader-prep] Prepared %u of %u Metal pipelines before Play\n", built, total);
 }
 
-static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+static u32 eng_pipeline_resolve(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             const eng_program_pair* programs,
                             const rsx_dsp_texture* tex, u32 cube_mask, u32 vol_mask,
@@ -2636,6 +2636,258 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.n_pipelines++;
     *out_fixed = fixed;
     return handle;
+}
+
+/* ---- pipeline memo -------------------------------------------------------- */
+/*
+ * eng_pipeline_resolve decodes the shader variants, extracts the fragment
+ * constants and hashes the structural state before it finds a recorded handle,
+ * on every draw. The memo keeps its answer for exactly the same inputs: the
+ * fragment program's bytes, the texture register words that select a variant,
+ * the vertex program's identity, the layout and the render state. A program
+ * may move to another address and still hit; texture contents and buffer
+ * bindings take the ordinary path every draw. A resolve that sanitised a
+ * non-finite constant is never kept, so the counter keeps counting.
+ *
+ * PS3_RSX_PIPE_MEMO: 1 (default) on, 0 off, 2 also resolves every hit and
+ * aborts if any output differs.
+ */
+enum { PIPE_MEMO_SLOTS = 128, PIPE_MEMO_FP_MAX = 4096, PIPE_MEMO_CONST_MAX = 96 };
+
+typedef struct {
+    u64 vp_hash;
+    u32 vp_instr_bytes, vp_branch, vp_branch_used, fp_size;
+    u32 fp_ctrl, gamma_output, clip, dbz, cube, volume, vtex;
+    u32 aa_x, aa_y, color_format, rt_fmt, rt_count;
+    rsx_vertex_layout_plan layout;
+    rsx_be_render_state render;
+} PipeMemoInputs;
+
+/* Per unit: SET_TEXTURE_FORMAT..IMAGE_RECT and CONTROL3's depth bits, the
+ * words that select a shader variant. OFFSET, BORDER_COLOR and the pitch are
+ * binding state. */
+#define PIPE_TEX_WORDS 7
+
+typedef struct {
+    PipeMemoInputs input;
+    u64 tex_revision;
+    u32 tex[RSX_DSP_NUM_TEXTURES][PIPE_TEX_WORDS];
+    u8 fp[PIPE_MEMO_FP_MAX];
+    u32 constants[PIPE_MEMO_CONST_MAX][4];
+    u32 count, pipeline, tex_used;
+    int fixed;
+    u64 fp_hash;
+} PipeMemoEntry;
+
+static PipeMemoEntry s_pipe_memo[PIPE_MEMO_SLOTS];
+static u64 s_pipe_tex_revision = 1, s_pipe_snap_revision;
+static u32 s_pipe_tex_snapshot[RSX_DSP_NUM_TEXTURES][PIPE_TEX_WORDS];
+static u32 s_pipe_hits, s_pipe_checks;
+
+static int pipe_memo_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char* e = getenv("PS3_RSX_PIPE_MEMO");
+        mode = e && *e ? atoi(e) : 1;
+        if (mode < 0 || mode > 2) mode = 1;
+    }
+    return mode;
+}
+
+void rsx_draw_engine_pipeline_memo_counts(u32* hits, u32* checks)
+{
+    *hits = s_pipe_hits;
+    *checks = s_pipe_checks;
+}
+
+static void pipe_memo_reset(void)
+{
+    memset(s_pipe_memo, 0, sizeof s_pipe_memo);
+    s_pipe_tex_revision = 1;
+    s_pipe_snap_revision = 0;
+    s_pipe_hits = s_pipe_checks = 0;
+}
+
+/* A write that changes a variant-selecting texture register. The method
+ * path is the only writer of these engine registers. */
+static void pipe_memo_touch(u32 method, u32 arg)
+{
+    const int unit_word = method >= 0x1A00u && method < 0x1C00u &&
+                          (method & 0x1Fu) != 0 && (method & 0x1Fu) != 0x1Cu;
+    const int control3 = method >= 0x1840u && method < 0x1880u;
+    if ((unit_word || control3) && g.rsx.regs[method >> 2] != arg &&
+        ++s_pipe_tex_revision == 0)
+        pipe_memo_reset();
+}
+
+static void pipe_memo_snapshot_textures(void)
+{
+    if (s_pipe_snap_revision == s_pipe_tex_revision) return;
+    for (u32 i = 0; i < RSX_DSP_NUM_TEXTURES; ++i) {
+        memcpy(s_pipe_tex_snapshot[i], g.rsx.regs + ((0x1A04u + i * 32u) >> 2), 6 * sizeof(u32));
+        s_pipe_tex_snapshot[i][6] = g.rsx.regs[(0x1840u >> 2) + i] & 0xFFF00000u;
+    }
+    s_pipe_snap_revision = s_pipe_tex_revision;
+}
+
+static int pipe_memo_has(const PipeMemoEntry* e, const PipeMemoInputs* in, const u8* fp)
+{
+    return e->pipeline && !memcmp(&e->input, in, sizeof *in) &&
+           (e->tex_revision == s_pipe_tex_revision ||
+            !memcmp(e->tex, s_pipe_tex_snapshot, sizeof e->tex)) &&
+           (!in->fp_size || !memcmp(e->fp, fp, in->fp_size));
+}
+
+static void pipe_memo_save(PipeMemoEntry* e, const PipeMemoInputs* in, const u8* fp,
+                           u32 pipeline, u32 tex_used, int fixed, u64 fp_hash)
+{
+    if (!pipeline || g.fp_constants.count > PIPE_MEMO_CONST_MAX) return;
+    e->input = *in;
+    e->tex_revision = s_pipe_tex_revision;
+    memcpy(e->tex, s_pipe_tex_snapshot, sizeof e->tex);
+    if (in->fp_size) memcpy(e->fp, fp, in->fp_size);
+    e->count = g.fp_constants.count;
+    memcpy(e->constants, g.fp_constants.values, (size_t)e->count * 16u);
+    e->pipeline = pipeline;
+    e->fixed = fixed;
+    e->tex_used = tex_used;
+    e->fp_hash = fp_hash;
+}
+
+static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+                            const rsx_be_render_state* rs,
+                            const eng_program_pair* programs,
+                            const rsx_dsp_texture* tex, u32 cube_mask, u32 vol_mask,
+                            u32 vtex_mask, const rsx_dsp_surface* sf,
+                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
+                            u32* out_tex_used, u64* out_fp_hash)
+{
+    const int mode = pipe_memo_mode();
+    if (!mode || !programs->vp || programs->fp_size > PIPE_MEMO_FP_MAX)
+        return eng_pipeline_resolve(layout, rs, programs, tex, cube_mask, vol_mask, vtex_mask,
+                                    sf, rt_fmt, rt_count, out_fixed, out_tex_used, out_fp_hash);
+
+    PipeMemoInputs in;
+    memset(&in, 0, sizeof in);   /* compared bytewise, padding included */
+    in.vp_hash = programs->vp->hash;
+    in.vp_instr_bytes = programs->vp->bytes;
+    in.vp_branch_used = programs->vp->uses_branch_bits;
+    in.vp_branch = in.vp_branch_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
+    in.fp_size = programs->fp_size;
+    in.fp_ctrl = rsx_dsp_shader_control(&g.rsx);
+    in.gamma_output = rsx_dsp_reg(&g.rsx, 0x1FECu);
+    in.clip = eng_user_clip_key();
+    in.dbz = s_dbz.unit;
+    in.cube = cube_mask;
+    in.volume = vol_mask;
+    in.vtex = vtex_mask;
+    in.aa_x = sf->aa_sx;
+    in.aa_y = sf->aa_sy;
+    in.color_format = sf->color_format;
+    in.rt_fmt = rt_fmt;
+    in.rt_count = rt_count;
+    in.layout = *layout;
+    in.render = *rs;
+    pipe_memo_snapshot_textures();
+
+    const u64 mix = ((uintptr_t)programs->fp >> 4) ^ (in.vp_hash >> 12);
+    PipeMemoEntry* e = &s_pipe_memo[(mix ^ (mix >> 11)) & (PIPE_MEMO_SLOTS - 1)];
+    const int hit = pipe_memo_has(e, &in, programs->fp);
+    if (hit) ++s_pipe_hits;
+    if (hit && mode == 1) {
+        e->tex_revision = s_pipe_tex_revision;
+        g.fp_constants.count = e->count;
+        memcpy(g.fp_constants.values, e->constants, (size_t)e->count * 16u);
+        *out_fixed = e->fixed;
+        *out_tex_used = e->tex_used;
+        *out_fp_hash = e->fp_hash;
+        return e->pipeline;
+    }
+
+    /* The resolve and the entry it leaves see one snapshot of the program,
+     * even while the guest is still writing it. */
+    u8 copy[PIPE_MEMO_FP_MAX];
+    memcpy(copy, programs->fp, in.fp_size);
+    eng_program_pair snapshot = *programs;
+    snapshot.fp = copy;
+    const unsigned long long nonfinite = g_rsx_fp_nonfinite_constants;
+    const u32 pipeline = eng_pipeline_resolve(layout, rs, &snapshot, tex, cube_mask, vol_mask,
+                                              vtex_mask, sf, rt_fmt, rt_count, out_fixed,
+                                              out_tex_used, out_fp_hash);
+    if (hit) {
+        ++s_pipe_checks;
+        if (pipeline != e->pipeline || *out_fixed != e->fixed || *out_tex_used != e->tex_used ||
+            *out_fp_hash != e->fp_hash || g.fp_constants.count != e->count ||
+            memcmp(e->constants, g.fp_constants.values, (size_t)e->count * 16u)) {
+            fprintf(stderr, "[rsx engine] pipeline memo returned pipeline %u, resolve %u\n",
+                    e->pipeline, pipeline);
+            abort();
+        }
+    }
+    if (g_rsx_fp_nonfinite_constants == nonfinite)
+        pipe_memo_save(e, &in, copy, pipeline, *out_tex_used, *out_fixed, *out_fp_hash);
+    return pipeline;
+}
+
+/* ---- texture register cache ----------------------------------------------- */
+/*
+ * Every draw decoded all sixteen texture units' registers for the shader
+ * variant and again for binding. The cache decodes a unit again only after a
+ * write changed one of its SET_TEXTURE_* or CONTROL3 words, and hands the
+ * same decode to both. Texture contents, uploads and feedback copies are
+ * untouched. PS3_RSX_TEX_REGS: 1 (default) on, 0 off, 2 also decodes every
+ * unit on every draw and aborts on a difference.
+ */
+static rsx_dsp_texture s_texreg[RSX_DSP_NUM_TEXTURES];
+static u32 s_texreg_dirty = 0xFFFFu;
+
+static int texreg_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char* e = getenv("PS3_RSX_TEX_REGS");
+        mode = e && *e ? atoi(e) : 1;
+        if (mode < 0 || mode > 2) mode = 1;
+    }
+    return mode;
+}
+
+static void texreg_touch(u32 method, u32 arg)
+{
+    u32 bit = 0;
+    if (method >= 0x1A00u && method < 0x1C00u)
+        bit = 1u << ((method - 0x1A00u) >> 5);
+    else if (method >= 0x1840u && method < 0x1880u)
+        bit = 1u << ((method - 0x1840u) >> 2);
+    if (bit && g.rsx.regs[method >> 2] != arg) s_texreg_dirty |= bit;
+}
+
+/* The decoded units for this draw: the cache, or `scratch` filled afresh
+ * with the cache off. */
+static const rsx_dsp_texture* texreg_get(rsx_dsp_texture scratch[RSX_DSP_NUM_TEXTURES])
+{
+    const int mode = texreg_mode();
+    if (!mode) {
+        for (u32 i = 0; i < RSX_DSP_NUM_TEXTURES; ++i)
+            rsx_dsp_get_texture(&g.rsx, i, &scratch[i]);
+        return scratch;
+    }
+    while (s_texreg_dirty) {
+        const u32 i = (u32)__builtin_ctz(s_texreg_dirty);
+        s_texreg_dirty &= s_texreg_dirty - 1u;
+        rsx_dsp_get_texture(&g.rsx, i, &s_texreg[i]);
+    }
+    if (mode == 2) {
+        for (u32 i = 0; i < RSX_DSP_NUM_TEXTURES; ++i) {
+            rsx_dsp_get_texture(&g.rsx, i, &scratch[i]);
+            if (memcmp(&scratch[i], &s_texreg[i], sizeof scratch[i])) {
+                fprintf(stderr, "[rsx engine] texture register cache differs in unit %u\n", i);
+                abort();
+            }
+        }
+    }
+    return s_texreg;
 }
 
 /* ---- draw accumulation --------------------------------------------------- */
@@ -2972,6 +3224,7 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
 
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot, u32 tex_used,
+                              const rsx_dsp_texture* decoded,
                               u32 textures[RSX_BE_MAX_TEXTURES],
                               rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
 {
@@ -2982,8 +3235,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          * program is skipped: resolving it would cost a cache check, and an
          * aliased surface a store to guest memory, for nothing. */
         if (!((tex_used >> u) & 1u)) continue;
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = decoded[u];
         if (!t.enabled) continue;
         mask |= 1u << u;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
@@ -3350,6 +3602,18 @@ static int eng_poly_offset_on(void)
     return on;
 }
 
+/* PS3_RSX_SPLIT_CONSTANTS=0: join the vertex constant block here even for a
+ * backend that takes it in two parts (bind_vs_constants_split). */
+static int eng_split_constants_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3_RSX_SPLIT_CONSTANTS");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    return on;
+}
+
 /* A draw (or, with rs NULL, a clear) into this target set: close the pass
  * when the set changed, and describe the first draw of a new one. */
 static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
@@ -3528,6 +3792,83 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
                 what, rc[0], rc[1], rc[2], rc[3], w, h);
 }
 
+/* ---- GPU vertex decode ---------------------------------------------------- */
+
+int rsx_draw_engine_vertex_pull_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3_RSX_VERTEX_PULL");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    return on;
+}
+
+/* This group's packet, when dc_pack_triangles admitted it. */
+static rsx_packed_triangles s_packed;
+
+/* Admit a group the backend can decode on the GPU: one indexed triangle list
+ * of 16-bit indices from a single contiguous run of the index array (several
+ * DRAW_INDEX packets may continue one another), and nothing else. The packet
+ * owns its inputs from here on, so the draw is the same whatever the guest
+ * writes to its arrays afterwards. Everything else, and anything the packet
+ * builder declines, takes dc_fetch. */
+static int dc_pack_triangles(u32 prim, const rsx_vertex_layout_plan* layout)
+{
+    if (!g.be->draw_packed_triangles || !rsx_draw_engine_vertex_pull_enabled() ||
+        prim != RSX_PRIMITIVE_TRIANGLES || !dc.n_idx || dc.n_arr ||
+        dc.n_immediate || dc.inl_bytes || !layout->count)
+        return 0;
+    rsx_dsp_index_array ia;
+    rsx_dsp_get_index_array(&g.rsx, &ia);
+    if (ia.is_u32) return 0;
+
+    u32 count = 0;
+    for (u32 b = 0; b < dc.n_idx; b++) {
+        if ((u64)dc.idx[b].first != (u64)dc.idx[0].first + count ||
+            dc.idx[b].count > RSX_PACKED_VERTEX_LIMIT - count)
+            return 0;
+        count += dc.idx[b].count;
+    }
+    const u64 start = (u64)ia.offset + (u64)dc.idx[0].first * 2u;
+    if (count < 3 || start + (u64)count * 2u > 0x100000000ull) return 0;
+    /* The index array's location field is a DMA selector: 0 is local. */
+    const u8* run = eng_fetch_ptr(NULL, ia.location ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL,
+                                  (u32)start, count * 2u);
+    if (!run) return 0;
+
+    rsx_vertex_fetch_plan plan;
+    rsx_vertex_fetch_plan_init(&plan, &g.rsx, layout, eng_fetch_ptr, NULL);
+    const u32 restart = rsx_dsp_restart_index_enabled(&g.rsx, 0)
+        ? rsx_dsp_restart_index(&g.rsx) : UINT32_MAX;
+    return rsx_vertex_packed_triangles_prepare(&s_packed, &plan, run, count,
+                                               rsx_dsp_vertex_data_base_index(&g.rsx),
+                                               restart);
+}
+
+/* Draw the admitted packet: on the GPU when the draw runs guest programs and
+ * the backend takes it, otherwise decoded here from the packet's own bytes. */
+static void eng_draw_packed(const rsx_vertex_layout_plan* layout, int guest_programs)
+{
+    static u32 gpu_logs, cpu_logs;
+    if (guest_programs && g.be->draw_packed_triangles(g.be->user, &s_packed)) {
+        if (PS3_LOG_FIRST(gpu_logs, 1))
+            fprintf(stderr, "[rsx engine] decoding indexed triangle inputs in the vertex "
+                    "shader (PS3_RSX_VERTEX_PULL=0 decodes them on the CPU)\n");
+        return;
+    }
+    if (guest_programs && PS3_LOG_FIRST(cpu_logs, 4))
+        fprintf(stderr, "[rsx engine] backend declined a packed triangle draw; decoding "
+                "it on the CPU\n");
+    const u32 vertices = s_packed.last - s_packed.first + 1u;
+    if (!dc_reserve_verts((u64)vertices * layout->stride) ||
+        !dc_reserve_indices(s_packed.count) ||
+        !rsx_vertex_packed_triangles_decode(&s_packed, layout->stride, dc.verts, g.indices))
+        return;
+    g.be->draw(g.be->user, RSX_TOPOLOGY_TRIANGLES, dc.verts, vertices, layout->stride,
+               g.indices, s_packed.count);
+}
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -3559,12 +3900,15 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const eng_program_pair programs = eng_guest_programs();
     rsx_vertex_layout_plan layout;
     rsx_vertex_layout_plan_init(&layout, programs.vp ? programs.vp->inputs : 0xFFFFu);
-    dc_fetch(&layout, rebuild);
-    if (!dc.n_verts || !dc.fetch_ok) return;
+    const int packed = dc_pack_triangles(prim, &layout);
+    if (!packed) {
+        dc_fetch(&layout, rebuild);
+        if (!dc.n_verts || !dc.fetch_ok) return;
+    }
 
-    int indexed = 0;
-    u32 n_draw = dc.n_source_refs;
-    if (rebuild) {
+    int indexed = packed;
+    u32 n_draw = packed ? s_packed.count : dc.n_source_refs;
+    if (rebuild && !packed) {
         if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
         n_draw = indexed
             ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
@@ -3595,10 +3939,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
     u64 fp_hash = 0;
-    /* Decode each slot once for the shader variant and depth-bounds unit. */
-    rsx_dsp_texture tex[RSX_DSP_NUM_TEXTURES];
-    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++)
-        rsx_dsp_get_texture(&g.rsx, u, &tex[u]);
+    /* Each unit decoded once for the shader variant, the depth-bounds unit
+     * and the binding below. */
+    rsx_dsp_texture tex_scratch[RSX_DSP_NUM_TEXTURES];
+    const rsx_dsp_texture* tex = texreg_get(tex_scratch);
     const u32 cube_mask = eng_cube_mask(tex);
     const u32 vol_mask = eng_volume_mask(tex);
     const u32 enabled_vtex = eng_vtex_mask();
@@ -3625,7 +3969,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * whatever an earlier draw left there, is not resolved. */
     const u32 dbz_bit = s_dbz.unit ? 1u << (s_dbz.unit - 1u) : 0u;
     u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used & ~dbz_bit,
-                                      textures, samplers);
+                                      tex, textures, samplers);
     if (tex_mask == ENG_INVALID) return;
     if (dbz_bit && (tex_used & dbz_bit)) {
         textures[s_dbz.unit - 1u] = s_dbz.copy;
@@ -3635,7 +3979,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 vtex_mask = sink_bind_vertex_textures(enabled_vtex, vtextures,
                                                     vsamplers);
 
-    if (indexed) {
+    if (indexed && !packed) {
         if (!dc_reserve_indices(n_draw)) return;
         rsx_draw_engine_write_topology_indices(
             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
@@ -3661,8 +4005,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
-    memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
-    memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    const int split_vs = g.be->bind_vs_constants_split && eng_split_constants_on();
+    if (!split_vs) {
+        memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
+        memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    }
 
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
@@ -3706,7 +4053,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
-    g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+    if (split_vs)
+        g.be->bind_vs_constants_split(g.be->user, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u,
+                                      xf, sizeof xf);
+    else
+        g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
@@ -3757,9 +4108,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
                              sf.depth_format == 1u ? 16u : 24u);
     }
 
-    const u32 uploaded = indexed ? dc.n_verts : n_draw;
-    g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
-               indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    if (packed) {
+        eng_draw_packed(&layout, !pipeline_is_fixed);
+    } else {
+        const u32 uploaded = indexed ? dc.n_verts : n_draw;
+        g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+                   indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    }
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
@@ -3980,6 +4335,9 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.inline_array     = sink_inline_array;
     sink.immediate_vertex = sink_immediate_vertex;
     sink.flip             = sink_flip;
+    /* Fresh registers: nothing memoised or decoded from the last session. */
+    pipe_memo_reset();
+    s_texreg_dirty = 0xFFFFu;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
     /* Display buffers the title registered before the backend came up. */
@@ -4029,7 +4387,20 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    pipe_memo_touch(m, arg);
+    texreg_touch(m, arg);
     rsx_dispatch_method(&g.rsx, m, arg);
+}
+
+int rsx_draw_engine_upload_run(u32 method, const u8* words, u32 count)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3_RSX_UPLOAD_RUN");
+        /* RSX_CONST_LOG logs constant uploads word by word in the dispatcher. */
+        on = !(e && *e && atoi(e) == 0) && !getenv("RSX_CONST_LOG");
+    }
+    return on && g.ready && rsx_dispatch_upload_run(&g.rsx, method, words, count);
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,

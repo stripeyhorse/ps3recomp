@@ -160,6 +160,14 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
 
+/* A whole incrementing packet of 4..32 big-endian words into the transform
+ * program window (0x0B80) or the transform constant window (0x1F00), applied
+ * at once with exactly the effect of rsx_dispatch_method on each word in
+ * turn. Returns 0, having changed nothing, for any other packet or one that
+ * reaches past the program or constant store; dispatch that one word by
+ * word. */
+int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, const u8* words, u32 count);
+
 /* ---- decoded state getters -------------------------------------------- */
 
 static inline u32 rsx_dsp_reg(const rsx_dispatch* rsx, u32 method)

@@ -306,6 +306,25 @@ typedef struct rsx_draw_backend {
     /* Optional independent references for backends with two-sided stencil.
      * With two-sided stencil off both arguments carry the front reference. */
     void (*set_stencil_refs)(void* user, u32 front, u32 back);
+
+    /* Optional GPU vertex decode, for a draw through guest programs: the
+     * packed indexed triangle list of rsx_vertex_compact.h, drawn with the
+     * bound pipeline's paired vertex-pull program, which pipeline_create
+     * built from rsx_vertex_pull_shader when
+     * rsx_draw_engine_vertex_pull_enabled() said so. The packet is valid
+     * only during the call; the backend keeps its own copy until the GPU is
+     * done with it. Return 0 to decline (no paired program, no room) and the
+     * engine decodes the same packet on the CPU and calls draw. NULL: every
+     * draw is decoded on the CPU. */
+    int  (*draw_packed_triangles)(void* user, const rsx_packed_triangles* packet);
+
+    /* Optional bind_vs_constants for the block in two parts, `base` and
+     * `tail` straight after it -- the transform constants and the viewport
+     * epilogue -- so the engine need not join them into a copy of its own
+     * first. The program sees one contiguous block either way. NULL, or
+     * PS3_RSX_SPLIT_CONSTANTS=0: the engine joins them. */
+    void (*bind_vs_constants_split)(void* user, const void* base, u32 base_bytes,
+                                    const void* tail, u32 tail_bytes);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -326,6 +345,16 @@ void rsx_draw_engine_set_default(int on);
  * NULL restores the toolkit's cellGcm mapping. */
 void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user);
 
+/* Hand ordinary indexed triangle lists to a backend's draw_packed_triangles
+ * for decoding in the vertex shader. PS3_RSX_VERTEX_PULL=0 keeps every draw
+ * on the CPU decode, and a backend that pairs pipelines skips building the
+ * vertex-pull programs. Read once. */
+int  rsx_draw_engine_vertex_pull_enabled(void);
+
+/* Pipeline memo hits since init, and how many of them PS3_RSX_PIPE_MEMO=2
+ * resolved again to check. */
+void rsx_draw_engine_pipeline_memo_counts(u32* hits, u32* checks);
+
 int  rsx_draw_engine_init(u32 width, u32 height);
 /* True on the render owner while prebuilding the optional shader recipe map. */
 int  rsx_draw_engine_preparing_shaders(void);
@@ -336,6 +365,13 @@ void rsx_draw_engine_shutdown(void);
  * SPU-built command lists bind NV4097 to another subchannel would otherwise
  * write its state into the wrong register bank. */
 void rsx_draw_engine_method(u32 method, u32 arg);
+
+/* A whole transform program or constant upload packet (subchannel bits off)
+ * of `count` big-endian words at `words`, as rsx_dispatch_upload_run applies
+ * it. Returns 0 when it did nothing -- the engine is down, the packet is not
+ * one it takes, or PS3_RSX_UPLOAD_RUN=0 -- and the caller feeds the words
+ * to rsx_draw_engine_method one by one. */
+int  rsx_draw_engine_upload_run(u32 method, const u8* words, u32 count);
 
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */

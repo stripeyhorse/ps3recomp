@@ -324,6 +324,45 @@ static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
     }
 }
 
+int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, const u8* words, u32 count)
+{
+    if (!words || (method & 3u) || count < 4 || count > 32) return 0;
+    const u32 last = method + (count - 1u) * 4u;
+    u32* out;
+    u32 load_after = 0;
+    const int program = method >= M_VP_UPLOAD_INST && last < M_VP_UPLOAD_INST + 32 * 4;
+    if (program) {
+        /* Consecutive lanes from the load pointer, which moves on after each
+         * completed vec4. */
+        const u32 load = rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+        const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3u;
+        if (load >= RSX_DSP_VP_INSTR || (u64)load * 4u + lane + count > RSX_DSP_VP_WORDS)
+            return 0;
+        out = rsx->vp + (size_t)load * 4u + lane;
+        load_after = load + ((lane + count) >> 2);
+    } else if (method >= M_VP_UPLOAD_CONST && last < M_VP_UPLOAD_CONST + 32 * 4) {
+        /* Consecutive words from the constant pointer, which stays put. */
+        const u32 load = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+        const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
+        if (load >= RSX_DSP_NUM_CONSTANTS ||
+            (u64)load * 4u + word + count > RSX_DSP_NUM_CONSTANTS * 4u)
+            return 0;
+        out = &rsx->constants[0][0] + (size_t)load * 4u + word;
+    } else {
+        return 0;
+    }
+    const u32 idx = method >> 2;
+    for (u32 i = 0; i < count; i++) {
+        const u8* p = words + (size_t)i * 4u;
+        const u32 w = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+        out[i] = w;
+        rsx->regs[idx + i] = w;
+        rsx->seen[idx + i]++;
+    }
+    if (program) rsx->regs[M_VP_UPLOAD_FROM_ID >> 2] = load_after;
+    return 1;
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;

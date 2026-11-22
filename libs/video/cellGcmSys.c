@@ -315,9 +315,6 @@ static CellGcmSecondVHandler s_second_v_handler = NULL;
 /* Flip timing */
 static u64 s_last_flip_time = 0;
 
-/* VBlank counter (incremented on each flip as approximation) */
-static u32 s_vblank_count = 0;
-
 /* IO map reservation tracking */
 static u32 s_io_map_reserved = 0;  /* bytes reserved for IO mapping */
 
@@ -348,6 +345,21 @@ static atomic_uint s_user_command = 0;
 static _Atomic(u64) s_user_pending = 0;
 #define GCM_USER_PENDING_STORE(value) atomic_store(&s_user_pending, (value))
 #define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
+#endif
+
+/* VBlank counter. The vblank ticker (its own thread under the default
+ * PS3_VBLANK_TIMER in a port), the guest's cellGcmGetVBlankCount and the
+ * callback pump each touch it from their own thread. */
+#ifdef _WIN32
+static volatile LONG s_vblank_count = 0;
+#define GCM_VBLANK_BUMP()  ((u32)InterlockedIncrement(&s_vblank_count) - 1u)  /* old value */
+#define GCM_VBLANK_READ()  ((u32)InterlockedCompareExchange(&s_vblank_count, 0, 0))
+#define GCM_VBLANK_RESET() InterlockedExchange(&s_vblank_count, 0)
+#else
+static atomic_uint s_vblank_count = 0;
+#define GCM_VBLANK_BUMP()  ((u32)atomic_fetch_add(&s_vblank_count, 1u))
+#define GCM_VBLANK_READ()  ((u32)atomic_load(&s_vblank_count))
+#define GCM_VBLANK_RESET() atomic_store(&s_vblank_count, 0u)
 #endif
 
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
@@ -595,7 +607,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
-    s_vblank_count = 0;
+    GCM_VBLANK_RESET();
     s_io_map_reserved = 0;
     s_default_fifo_mode = 0;
     s_graphics_handler = NULL;
@@ -851,7 +863,7 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
 
 void cellGcm_request_tick(void)
 {
-    s_vblank_count++;
+    GCM_VBLANK_BUMP();
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
      * actually consumed up to `put`.
      *
@@ -975,10 +987,10 @@ void ppu_gcm_pump(void)
       if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
                if ((calls % 20000) == 0)
                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
-                           calls, nv, nf, s_vblank_count, 10); } }
+                           calls, nv, nf, GCM_VBLANK_READ(), 10); } }
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
-        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
+        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)GCM_VBLANK_READ(),
                            0, 0, 0, 0, 0, 0, 0);
     }
     if (p & 2) {
@@ -1008,7 +1020,7 @@ void ppu_gcm_pump(void)
 
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+void cellGcmTickVBlank(void) { GCM_VBLANK_BUMP(); GCM_PENDING_SET(1); }
 /* Only deliver a flip completion when a flip is actually outstanding.
  *
  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
@@ -2008,11 +2020,98 @@ void* cellGcm_fifo_kick_event(void)
  * starved guest still paid the full tick. Waiting here instead costs nothing
  * when no one kicks (the timeout is the old sleep) and drains immediately when
  * someone does. */
+/* PUT wake. The guest appends commands by storing PUT, which by itself wakes
+ * nothing: with the FIFO dry the present thread slept out its whole idle wait
+ * before it saw a frame's next commands, about 5 ms a publication. A
+ * coherency watch on the control line sets the kick event when PUT changes
+ * while that thread waits, and a change that landed after the walker last
+ * read PUT skips the wait. GET, REF and a PUT rewritten with the same value
+ * leave the event alone, and the walker keeps its fence and command order.
+ * PS3_GCM_PUT_WAKE=0: wait out the timeout as before. */
+typedef struct {
+    spu_coh_watch watch;
+    HANDLE event;
+    u32 address;
+    u32 latest;               /* PUT as the watch last saw it (lockline lock) */
+    int waiting;              /* the present thread is waiting (lockline lock) */
+    _Atomic(u32) read;        /* PUT as the walker last read it */
+} GcmPutWake;
+
+/* Runs under the lockline lock for every store to the control line. */
+static void gcm_put_wake_notify(void* opaque)
+{
+    GcmPutWake* wake = (GcmPutWake*)opaque;
+    const u32 put = vm_read32(wake->address);
+    if (put == wake->latest) return;
+    wake->latest = put;
+    if (wake->waiting) {
+        wake->waiting = 0;        /* one wake for a burst of publications */
+        SetEvent(wake->event);
+    }
+}
+
+static void gcm_put_wake_init(GcmPutWake* wake, u32 address, HANDLE event)
+{
+    spu_lockline_lock();
+    wake->event = event;
+    wake->address = address;
+    wake->latest = vm_read32(address);
+    atomic_store_explicit(&wake->read, wake->latest, memory_order_relaxed);
+    spu_coh_watch_add(&wake->watch, address, gcm_put_wake_notify, wake);
+    spu_lockline_unlock();
+}
+
+/* Before waiting: nonzero when PUT has moved since the walker read it, and
+ * the wait should be skipped; otherwise the next change sets the event. */
+static int gcm_put_wake_arm(GcmPutWake* wake)
+{
+    spu_lockline_lock();
+    const int ready =
+        wake->latest != atomic_load_explicit(&wake->read, memory_order_relaxed);
+    wake->waiting = !ready;
+    spu_lockline_unlock();
+    return ready;
+}
+
+static void gcm_put_wake_disarm(GcmPutWake* wake)
+{
+    spu_lockline_lock();
+    wake->waiting = 0;
+    spu_lockline_unlock();
+}
+
+/* The walker, after reading PUT. */
+static void gcm_put_wake_read(GcmPutWake* wake, u32 put)
+{
+    atomic_store_explicit(&wake->read, put, memory_order_relaxed);
+}
+
+static GcmPutWake s_put_wake;
+static atomic_int s_put_wake_active;
+
+static int gcm_put_wake_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3_GCM_PUT_WAKE"); on = !(e && *e == '0'); }
+    return on;
+}
+
 void cellGcm_fifo_kick_wait(unsigned ms)
 {
     static int on = -1;
     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+    if (ev && gcm_put_wake_on() && vm_base && s_gcm_context_ea) {
+        /* Installed by this, the only thread that waits on it, once there is
+         * a control line to watch. */
+        if (!atomic_load_explicit(&s_put_wake_active, memory_order_relaxed)) {
+            gcm_put_wake_init(&s_put_wake, GCM_CONTROL_GUEST_ADDR, ev);
+            atomic_store_explicit(&s_put_wake_active, 1, memory_order_release);
+        }
+        if (!gcm_put_wake_arm(&s_put_wake)) WaitForSingleObject(ev, ms);
+        gcm_put_wake_disarm(&s_put_wake);
+        return;
+    }
     if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
 }
@@ -2367,6 +2466,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * then runs off the end of the previous frame's bytes until it meets a
      * word that is not a command, and parks there forever. */
     atomic_thread_fence(memory_order_acquire);
+    if (atomic_load_explicit(&s_put_wake_active, memory_order_acquire))
+        gcm_put_wake_read(&s_put_wake, put);
 
     /* GCM_CTXDBG=1: which context the title is actually driving. Ours is written
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
@@ -2798,6 +2899,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
                 const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
                 if (dea) {
+                    /* A transform program or constant packet: nothing in
+                     * gcm_3d_method acts on those windows, so with the
+                     * legacy mirror off the engine takes it whole. */
+                    if (draw_engine && !legacy_state_live && type == 0 &&
+                        rsx_draw_engine_upload_run(method, vm_base + dea, count)) {
+                        s_fifo_getoff += 4 + count * 4;
+                        continue;
+                    }
                     if (!draw_engine && type == 0 &&
                         rsx_process_vp_run(&s_state, method, vm_base + dea, count)) {
                         s_fifo_getoff += 4 + count * 4;
@@ -4416,7 +4525,7 @@ void cellGcmTerminate(void)
     s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
-    s_vblank_count = 0;
+    GCM_VBLANK_RESET();
     s_io_map_reserved = 0;
     s_default_fifo_mode = 0;
     GCM_USER_STORE(0);
@@ -4494,7 +4603,7 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
 u32 cellGcmGetVBlankCount(void)
 {
     /* Approximate: increment each time queried (games use this for timing) */
-    return s_vblank_count++;
+    return GCM_VBLANK_BUMP();
 }
 
 /* Return tile info for a given index */

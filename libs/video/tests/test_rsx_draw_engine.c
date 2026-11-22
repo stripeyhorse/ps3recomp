@@ -102,6 +102,8 @@ typedef struct {
     int n_depth_readback;
     u32 color_w, color_h;         /* size of the last colour surface created */
     float vp_xf[8];               /* viewport epilogue after the VS constants */
+    u8 vs_block[(RSX_DSP_NUM_CONSTANTS + 2) * 16u];   /* the last block, joined */
+    int n_vs_split;               /* blocks that came in two parts */
 } StubState;
 
 static StubState stub;
@@ -203,6 +205,18 @@ static void stub_bind_vs(void* u, const void* d, u32 n)
     (void)u;
     if (d && n >= RSX_DSP_NUM_CONSTANTS * 16u + sizeof stub.vp_xf)
         memcpy(stub.vp_xf, (const u8*)d + RSX_DSP_NUM_CONSTANTS * 16u, sizeof stub.vp_xf);
+    if (d && n == sizeof stub.vs_block) memcpy(stub.vs_block, d, n);
+}
+/* The block in two parts, as a backend staging it directly would take it:
+ * joined here, it must be the block bind_vs_constants would have seen. */
+static void stub_bind_vs_split(void* u, const void* base, u32 n, const void* tail, u32 tail_n)
+{
+    u8 joined[sizeof stub.vs_block];
+    if (n + tail_n != sizeof joined) { printf("[FAIL] split block of %u + %u bytes\n", n, tail_n); return; }
+    memcpy(joined, base, n);
+    memcpy(joined + n, tail, tail_n);
+    stub.n_vs_split++;
+    stub_bind_vs(u, joined, sizeof joined);
 }
 static void stub_bind_ps(void* u, const void* d, u32 n) { (void)u; (void)d; (void)n; }
 
@@ -355,6 +369,7 @@ static const rsx_draw_backend g_stub_backend = {
     .bind_targets = stub_bind_targets,
     .bind_pipeline = stub_bind_pipeline,
     .bind_vs_constants = stub_bind_vs,
+    .bind_vs_constants_split = stub_bind_vs_split,
     .bind_ps_constants = stub_bind_ps,
     .bind_textures = stub_bind_textures,
     .bind_vertex_textures = stub_bind_vtextures,
@@ -1673,6 +1688,224 @@ static void test_indexed_runs(void)
                  "16-bit restart off when the sentinel is wider than 16 bits");
 }
 
+/* ---- 6c. packed triangle lists (GPU vertex decode) ----------------------- */
+/*
+ * A backend offering draw_packed_triangles gets ordinary indexed triangle
+ * lists undecoded. Whatever it does with them, the vertices a draw sees must
+ * be the ones the CPU fetch produces, after the guest has rewritten its
+ * arrays, and every other shape must still take the CPU fetch.
+ */
+#define PT_VTX    0x00012000u   /* float3 position + UB4 colour, 32-byte stride */
+#define PT_HALF   0x00014000u   /* half2 texcoord, 4-byte stride */
+#define PT_FP     0x00015000u
+#define PT_BASE   0x000FFFFDu   /* wraps: index i reads element i - 3 */
+#define PT_SLOT_BYTES 48u       /* three layout slots */
+
+static rsx_packed_triangles g_packet;
+static int g_packed_calls, g_packed_accept;
+
+static int stub_draw_packed(void* u, const rsx_packed_triangles* packet)
+{
+    (void)u;
+    g_packed_calls++;
+    if (!g_packed_accept) return 0;
+    g_packet = *packet;
+    return 1;
+}
+
+static void packed_arrays(void)
+{
+    for (u32 v = 0; v < 16; v++) {
+        u8* p = vm_base + PT_VTX + v * 32u;
+        for (u32 c = 0; c < 3; c++) {
+            const float f = (float)v * 0.25f + (float)c - 1.0f;
+            u32 w; memcpy(&w, &f, 4); put_be(p + c * 4u, w, 4);
+        }
+        for (u32 c = 0; c < 4; c++) p[12 + c] = (u8)(v * 37u + c * 61u);
+        put_be(vm_base + PT_HALF + v * 4u, 0x3C00u + v * 0x111u, 2);   /* halves */
+        put_be(vm_base + PT_HALF + v * 4u + 2u, 0x8000u | (v * 3u), 2); /* -0 and denormals */
+    }
+    m(M_VTXFMT + 0 * 4, 2u | (3u << 4) | (32u << 8));                 /* float3 */
+    m(M_VTXBUF_OFFSET + 0 * 4, 0x80000000u | PT_VTX);
+    m(M_VTXFMT + 3 * 4, 4u | (4u << 4) | (32u << 8));                 /* UB4, interleaved */
+    m(M_VTXBUF_OFFSET + 3 * 4, 0x80000000u | (PT_VTX + 12u));
+    m(M_VTXFMT + 8 * 4, 3u | (2u << 4) | (4u << 8));                  /* half2 */
+    m(M_VTXBUF_OFFSET + 8 * 4, 0x80000000u | PT_HALF);
+    m(0x173C, PT_BASE);                                               /* VERTEX_DATA_BASE_INDEX */
+}
+
+/* MOV o0 = v0, o1 = v3, o7 = v8: a guest program reading three inputs. */
+static void packed_programs(void)
+{
+    u8 vp[48];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
+    rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 0);
+    rsx_test_vp_mov_out(vp + 32, 8, RSX_TEST_VP_SWZ_IDENT, 7, 1);
+    m(0x1E9C, 0);
+    for (u32 i = 0; i < 12; i++) { u32 w; memcpy(&w, vp + i * 4, 4); m(0xB80 + i * 4, w); }
+    m(0x1EA0, 0);
+    rsx_test_fp_mov_r0_col0(vm_base + PT_FP, RSX_TEST_FP_SWZ_IDENT);
+    m(0x08E4, PT_FP | 2u);
+    m(0x1D60, 0x40u);
+}
+
+static const u32 pt_tris[] = { 8, 4, 12, 12, 4, 6, 14, 3, 8, 8, 8, 5 };   /* duplicates */
+#define PT_N (sizeof pt_tris / sizeof pt_tris[0])
+
+/* One DRAW_INDEX of the list, or two continuing packets when `split`. */
+static void packed_draw(int split, u32 gap)
+{
+    for (u32 i = 0; i < PT_N; i++) put_be(vm_base + IDX_OFFSET + i * 2u, pt_tris[i], 2);
+    for (u32 i = 0; i < gap; i++) put_be(vm_base + IDX_OFFSET + (PT_N + i) * 2u, 3u + i, 2);
+    m(0x181C, IDX_OFFSET);
+    m(0x1820, 1u | (1u << 4));                                        /* main, 16-bit */
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    if (split) {
+        m(0x1824, 0u | (5u << 24));
+        m(0x1824, (6u + gap) | ((PT_N - 6u - 1u) << 24));
+    } else {
+        m(0x1824, 0u | ((PT_N - 1u) << 24));
+    }
+    m(M_BEGIN_END, 0u);
+}
+
+/* The draw the stub saw, one vertex per corner. */
+static void stub_corners(u8 out[PT_N][PT_SLOT_BYTES])
+{
+    for (u32 k = 0; k < PT_N; k++)
+        memcpy(out[k], stub.captured_vertices[stub.draw_indices ? stub.captured_indices[k] : k],
+               PT_SLOT_BYTES);
+}
+
+/* The vertex constant block, joined by the engine or handed over in two
+ * parts (PS3_RSX_SPLIT_CONSTANTS), carries the same bytes. Uploaded as one
+ * packet (rsx_draw_engine_upload_run) or word by word, the same constants. */
+static void test_vertex_constant_block(void)
+{
+    printf("-- vertex constant block\n");
+    engine_up();
+    u8 words[16 * 4];
+    for (u32 i = 0; i < 16; i++) put_be(words + i * 4u, 0x3F800000u + i * 0x1111u, 4);
+    m(0x1EFC, 3);                                           /* TRANSFORM_CONSTANT_LOAD */
+    if (!rsx_draw_engine_upload_run(0x1F00, words, 16))      /* PS3_RSX_UPLOAD_RUN=0 */
+        for (u32 i = 0; i < 16; i++) m(0x1F00 + i * 4u, 0x3F800000u + i * 0x1111u);
+    draw_triangle();
+    int same = 1;
+    for (u32 i = 0; i < 16; i++) {
+        u32 w; memcpy(&w, stub.vs_block + (3u * 4u + i) * 4u, 4);
+        same &= w == 0x3F800000u + i * 0x1111u;
+    }
+    const char* e = getenv("PS3_RSX_SPLIT_CONSTANTS");
+    const int split = !(e && *e == '0');
+    CHECK(stub.n_draw == 1 && same && stub.vp_xf[0] != 0.0f && stub.n_vs_split == (split ? 1 : 0),
+          "the draw's vertex constants c[3..6] and viewport epilogue arrive %s",
+          split ? "in two parts" : "joined");
+    engine_down();
+}
+
+static void test_packed_triangles(void)
+{
+    printf("-- packed triangle lists\n");
+    rsx_draw_backend be = g_stub_backend;
+    be.draw_packed_triangles = stub_draw_packed;
+    u8 cpu[PT_N][PT_SLOT_BYTES], seen[PT_N][PT_SLOT_BYTES];
+    if (!rsx_draw_engine_vertex_pull_enabled()) {
+        engine_up_with(&be);
+        packed_arrays();
+        packed_programs();
+        g_packed_calls = 0; g_packed_accept = 1;
+        packed_draw(0, 0);
+        CHECK(g_packed_calls == 0 && stub.n_draw == 1,
+              "PS3_RSX_VERTEX_PULL=0 keeps an eligible list on the CPU fetch");
+        for (u32 a = 0; a < 16; a++) { m(M_VTXFMT + a * 4, 0); m(M_VTXBUF_OFFSET + a * 4, 0); }
+        m(0x173C, 0);
+        m(0x08E4, 0);
+        engine_down();
+        return;
+    }
+
+    /* The reference: no hook, the CPU fetch. */
+    engine_up();
+    packed_arrays();
+    packed_programs();
+    packed_draw(0, 0);
+    stub_corners(cpu);
+    CHECK(stub.n_draw == 1 && stub.draw_stride == PT_SLOT_BYTES &&
+          (stub.draw_indices ? stub.draw_indices : stub.draw_vertices) == PT_N,
+          "the CPU fetch draws the guest list (%u verts, %u indices, stride %u)",
+          stub.draw_vertices, stub.draw_indices, stub.draw_stride);
+
+    /* Accepted: the packet is the draw, and it decodes to the same corners
+     * after the guest has overwritten every vertex and index. */
+    rsx_draw_engine_set_backend(&be);
+    g_packed_calls = 0; g_packed_accept = 1; stub.n_draw = 0;
+    packed_draw(0, 0);
+    memset(vm_base + PT_VTX, 0xA5, 16 * 32);
+    memset(vm_base + PT_HALF, 0x5A, 16 * 4);
+    memset(vm_base + IDX_OFFSET, 0x33, PT_N * 2);
+    static u8 verts[RSX_PACKED_VERTEX_LIMIT * PT_SLOT_BYTES];
+    static u32 idx[RSX_PACKED_VERTEX_LIMIT];
+    int decoded = g_packed_calls == 1 &&
+        rsx_vertex_packed_triangles_decode(&g_packet, PT_SLOT_BYTES, verts, idx);
+    for (u32 k = 0; decoded && k < PT_N; k++)
+        memcpy(seen[k], verts + idx[k] * PT_SLOT_BYTES, PT_SLOT_BYTES);
+    CHECK(decoded && stub.n_draw == 0 && g_packet.count == PT_N && g_packet.slots == 3 &&
+          g_packet.first == 0 && g_packet.last == 11 && g_packet.base_index == PT_BASE &&
+          !memcmp(seen, cpu, sizeof cpu),
+          "an accepted packet owns its inputs and decodes to the CPU fetch's corners "
+          "(calls %d, draws %d, range %u..%u)", g_packed_calls, stub.n_draw,
+          g_packet.first, g_packet.last);
+
+    /* Declined: the engine decodes the packet itself and draws that. */
+    packed_arrays();
+    g_packed_calls = 0; g_packed_accept = 0; stub.n_draw = 0;
+    packed_draw(0, 0);
+    stub_corners(seen);
+    CHECK(g_packed_calls == 1 && stub.n_draw == 1 && stub.draw_indices == PT_N &&
+          !memcmp(seen, cpu, sizeof cpu),
+          "a declined packet is drawn from the CPU decode of the same bytes");
+
+    /* Continuing DRAW_INDEX packets are one run; a gap is not. */
+    g_packed_calls = 0; g_packed_accept = 1; stub.n_draw = 0;
+    packed_draw(1, 0);
+    CHECK(g_packed_calls == 1 && g_packet.count == PT_N && stub.n_draw == 0,
+          "two continuing index packets make one packet");
+    g_packed_calls = 0; stub.n_draw = 0;
+    packed_draw(1, 2);
+    CHECK(g_packed_calls == 0 && stub.n_draw == 1,
+          "index packets with a gap take the CPU fetch");
+
+    /* A restart sentinel inside the list declines before the backend. */
+    m(0x1DAC, 1u); m(0x1DB0, 12u);
+    g_packed_calls = 0; stub.n_draw = 0;
+    packed_draw(0, 0);
+    CHECK(g_packed_calls == 0 && stub.n_draw == 1,
+          "a list holding the restart sentinel takes the CPU fetch");
+    m(0x1DAC, 0u);
+
+    /* So does a 32-bit index array. */
+    for (u32 i = 0; i < PT_N; i++) put_be(vm_base + IDX_OFFSET + i * 4u, pt_tris[i], 4);
+    m(0x1820, 1u);
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    m(0x1824, 0u | ((PT_N - 1u) << 24));
+    g_packed_calls = 0; stub.n_draw = 0;
+    m(M_BEGIN_END, 0u);
+    CHECK(g_packed_calls == 0 && stub.n_draw == 1, "a 32-bit index list takes the CPU fetch");
+
+    /* The built-in programs are not paired, so their packet is decoded here. */
+    m(0x08E4, 0);
+    g_packed_calls = 0; stub.n_draw = 0;
+    packed_draw(0, 0);
+    CHECK(g_packed_calls == 0 && stub.n_draw == 1 && stub.draw_indices == PT_N,
+          "a draw through the built-in programs is decoded on the CPU");
+
+    for (u32 a = 0; a < 16; a++) { m(M_VTXFMT + a * 4, 0); m(M_VTXBUF_OFFSET + a * 4, 0); }
+    m(0x173C, 0);
+    memset(vm_base + PT_VTX, 0, 0x4000);
+    memset(vm_base + IDX_OFFSET, 0, 64);
+    engine_down();
+}
+
 static unsigned custom_reads;
 static const u8* custom_guest_read(void* user, u32 location, u32 offset, u32 bytes)
 {
@@ -2758,6 +2991,59 @@ static void test_clear_rect(void)
     engine_down();
 }
 
+/* The pipeline memo (PS3_RSX_PIPE_MEMO). A fragment program whose embedded
+ * constant changes in place, at the same address, keeps its pipeline and
+ * binds the new value on every draw; the memo answers only exact repeats,
+ * and never one whose constant had to be sanitised. */
+static u32 g_memo_fp_constant;
+static void memo_ps_constants(void* user, const void* bytes, u32 n)
+{
+    (void)user;
+    if (n >= 32) memcpy(&g_memo_fp_constant, bytes, sizeof g_memo_fp_constant);
+}
+
+static void test_pipeline_memo_constants(void)
+{
+    printf("-- pipeline memo\n");
+    engine_up();
+    rsx_draw_backend be = g_stub_backend;
+    be.bind_ps_constants = memo_ps_constants;
+    rsx_draw_engine_set_backend(&be);
+    u8 vp[16];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
+    m(0x1E9C, 0);
+    for (u32 i = 0; i < 4; ++i) { u32 w; memcpy(&w, vp + i * 4, 4); m(0xB80 + i * 4, w); }
+    m(0x1EA0, 0);
+    u8* program = vm_base + WPOS_FP_OFFSET;
+    /* MOV r0, c[0] with the constant in the next 16 bytes. */
+    rsx_test_fp_instr(program, RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_END, 2u | RSX_TEST_FP_SWZ_IDENT);
+    memset(program + 16, 0, 16);
+    m(0x08E4, WPOS_FP_OFFSET | 2u);
+    m(0x1D60, 0x40u);
+    u32 hits0, checks0, hits, checks;
+    rsx_draw_engine_pipeline_memo_counts(&hits0, &checks0);
+    static const u32 values[] = { 0x3F800000u, 0x3F800000u, 0x40000000u, 0x40000000u,
+                                  0x7FC00000u, 0x7FC00000u };
+    for (u32 i = 0; i < sizeof values / sizeof values[0]; ++i) {
+        rsx_test_fp_put_word(program + 16, values[i]);
+        draw_triangle();
+        const u32 expected = i < 4 ? values[i] : 0;   /* NaN is sanitised to 0 */
+        CHECK(stub.n_draw == (int)i + 1 && stub.n_pipeline_create == 1 &&
+              g_memo_fp_constant == expected,
+              "a constant rewritten in place binds its new value on the same pipeline (draw %u)", i);
+    }
+    rsx_draw_engine_pipeline_memo_counts(&hits, &checks);
+    const char* e = getenv("PS3_RSX_PIPE_MEMO");
+    const int mode = e && *e ? atoi(e) : 1;
+    CHECK(hits - hits0 == (mode ? 2u : 0u) && checks - checks0 == (mode == 2 ? 2u : 0u),
+          "exact repeats of finite data hit the memo and NaNs resolve (%u hits, %u checked)",
+          hits - hits0, checks - checks0);
+    m(0x08E4, 0);
+    memset(program, 0, 32);
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -2782,6 +3068,8 @@ int main(void)
     test_restart_expansion();
     test_indexed_runs();
     test_indexed_draws();
+    test_packed_triangles();
+    test_vertex_constant_block();
     test_scissor();
     test_readback();
     test_custom_guest_mapping();
@@ -2797,6 +3085,7 @@ int main(void)
     test_antialiased_surface();
     test_surface_reuse_antialias();
     test_antialiased_wpos();
+    test_pipeline_memo_constants();
     test_depth_read_as_color();
     test_depth_snapshot_release();
     test_depth_read_as_argb_on_gpu();

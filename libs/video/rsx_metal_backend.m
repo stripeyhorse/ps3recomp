@@ -2665,6 +2665,9 @@ static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
 
 typedef struct {
     id<MTLRenderPipelineState> pso;
+    /* The same state with the vertex program reading a packed triangle
+     * packet (eng_draw_packed_triangles); nil when it could not be built. */
+    id<MTLRenderPipelineState> pull_pso;
     id<MTLDepthStencilState>   ds;
     MTLCullMode cull;
     MTLWinding  winding;
@@ -2704,6 +2707,9 @@ typedef struct {
     MTLPrimitiveType topology;
     u32 vb_off, stride, vertex_count;
     u32 ib_off, index_count;
+    /* vb_off is a packet for pull_pso, bound at ENG_PULL_BUFFER, and the
+     * indices are 16-bit. */
+    u32 packed_input;
     u32 vs_cb_off, vs_cb_bytes;
     u32 ps_cb_off, ps_cb_bytes;
     u32 tex[RSX_BE_MAX_TEXTURES];
@@ -3358,6 +3364,7 @@ static void eng_shutdown(void* user)
     for (u32 i = 0; i < s_eng_obj_count; i++) s_eng_obj[i] = nil;
     for (u32 i = 0; i < s_eng_pipe_count; i++) {
         s_eng_pipe[i].pso = nil;
+        s_eng_pipe[i].pull_pso = nil;
         s_eng_pipe[i].ds = nil;
     }
     for (u32 i = 0; i < s_eng_func_count; i++) s_eng_func[i].fn = nil;
@@ -3695,6 +3702,13 @@ static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
 
 /* ---- pipelines ----------------------------------------------------------- */
 
+/* rsx_vertex_pull_hlsl's ByteAddressBuffer, register t28, as spirv-cross
+ * places it. */
+#define ENG_PULL_BUFFER     28u
+#define ENG_PULL_BUFFER_MSL "[[buffer(28)]]"
+/* A guest vertex program (up to 256 KB) with the decoder in front of it. */
+static char s_eng_pull_hlsl[512 * 1024];
+
 static id<MTLFunction> eng_function(const char* hlsl, int stage,
                                     const char* what)
 {
@@ -3710,6 +3724,11 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     if (rsx_hlsl_to_msl(hlsl, stage, s_msl, sizeof s_msl, s_log, sizeof s_log) != 0) {
         fprintf(stderr, "[rsx engine/metal] %s %016llx: %s\n", what,
                 (unsigned long long)hash, s_log);
+    } else if (!strcmp(what, "pull") && !strstr(s_msl, ENG_PULL_BUFFER_MSL)) {
+        /* The encoder binds the packet at that index; a program that reads
+         * it from anywhere else would draw another draw's data. */
+        fprintf(stderr, "[rsx engine/metal] pull %016llx: packet is not at %s\n",
+                (unsigned long long)hash, ENG_PULL_BUFFER_MSL);
     } else {
         snprintf(name, sizeof name, "%s_%016llx.msl", what, (unsigned long long)hash);
         dump_shader(name, s_msl);
@@ -3820,6 +3839,25 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
         return 0;
     }
 
+    /* The packed-triangle twin: the same descriptor, the vertex program
+     * rewritten to decode its inputs from the packet, and no vertex
+     * descriptor. Without one this pipeline's packed draws are declined and
+     * the engine decodes them on the CPU. */
+    id<MTLRenderPipelineState> pull_pso = nil;
+    if (rsx_draw_engine_vertex_pull_enabled() &&
+        rsx_vertex_pull_shader(vs_hlsl, layout, s_eng_pull_hlsl, sizeof s_eng_pull_hlsl)) {
+        id<MTLFunction> pull_vs = eng_function(s_eng_pull_hlsl, RSX_SHADER_STAGE_VERTEX, "pull");
+        if (pull_vs) {
+            pd.vertexFunction = pull_vs;
+            pd.vertexDescriptor = nil;
+            err = nil;
+            pull_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            if (!pull_pso)
+                fprintf(stderr, "[rsx engine/metal] vertex-pull pipeline state failed: %s\n",
+                        [[err localizedDescription] UTF8String]);
+        }
+    }
+
     /* Depth and stencil are pipeline state in D3D12 and an encoder object in
      * Metal, so the engine's render state splits here rather than upstream. */
     MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
@@ -3854,6 +3892,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
 
     const u32 slot = s_eng_pipe_count++;
     s_eng_pipe[slot].pso = pso;
+    s_eng_pipe[slot].pull_pso = pull_pso;
     s_eng_pipe[slot].ds  = ds;
     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
      * as in the D3D12 engine); FRONT_FACE CW=0x0900 CCW=0x0901. */
@@ -3875,6 +3914,7 @@ static void eng_pipeline_release(void* user, u32 pipeline)
     (void)user;
     if (pipeline && pipeline <= s_eng_pipe_count) {
         s_eng_pipe[pipeline - 1].pso = nil;
+        s_eng_pipe[pipeline - 1].pull_pso = nil;
         s_eng_pipe[pipeline - 1].ds  = nil;
     }
 }
@@ -3975,33 +4015,56 @@ static void eng_bind_pipeline(void* user, u32 pipeline)
 typedef struct { u32 off, bytes, epoch; } EngStagedBlock;
 static EngStagedBlock s_eng_last_vs_cb, s_eng_last_ps_cb;
 
-static int eng_stage_block(EngStagedBlock* last, const void* data, u32 bytes, u32* out_off)
+/* One block staged from `data` followed directly by `tail` (tail_bytes may
+ * be 0): the shader reads them as one contiguous block. */
+static int eng_stage_block(EngStagedBlock* last, const void* data, u32 bytes,
+                           const void* tail, u32 tail_bytes, u32* out_off)
 {
     static int dedupe = -1;
     if (dedupe < 0) { const char* e = getenv("PS3RECOMP_METAL_CB_DEDUPE"); dedupe = !(e && *e == '0'); }
-    if (dedupe && bytes && last->epoch == s_eng_stage_epoch && last->bytes == bytes &&
-        last->off + bytes <= s_eng_stage_used && s_eng_stage &&
-        memcmp(s_eng_stage + last->off, data, bytes) == 0) {
+    const u32 total = bytes + tail_bytes;
+    if (dedupe && total && last->epoch == s_eng_stage_epoch && last->bytes == total &&
+        last->off + total <= s_eng_stage_used && s_eng_stage &&
+        memcmp(s_eng_stage + last->off, data, bytes) == 0 &&
+        (!tail_bytes || memcmp(s_eng_stage + last->off + bytes, tail, tail_bytes) == 0)) {
         *out_off = last->off;
         return 1;
     }
+    if (!total) { *out_off = 0; return 1; }
     /* The reserve below can commit and restart the arena: read the epoch after. */
-    if (!eng_stage_copy(data, bytes, out_off)) { last->epoch = 0; return 0; }
-    last->off = *out_off; last->bytes = bytes; last->epoch = s_eng_stage_epoch;
+    if (!eng_stage_reserve(total, out_off)) { last->epoch = 0; return 0; }
+    memcpy(s_eng_stage + *out_off, data, bytes);
+    if (tail_bytes) memcpy(s_eng_stage + *out_off + bytes, tail, tail_bytes);
+    last->off = *out_off; last->bytes = total; last->epoch = s_eng_stage_epoch;
     return 1;
 }
 
 static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
-    if (!eng_stage_block(&s_eng_last_vs_cb, data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
+    if (!eng_stage_block(&s_eng_last_vs_cb, data, bytes, NULL, 0, &s_eng_pending.vs_cb_off))
+        bytes = 0;
+    s_eng_pending.vs_cb_bytes = bytes;
+}
+
+/* The transform constants and the viewport epilogue, staged straight into the
+ * arena with no joined copy in between. */
+static void eng_bind_vs_constants_split(void* user, const void* base, u32 base_bytes,
+                                        const void* tail, u32 tail_bytes)
+{
+    (void)user;
+    u32 bytes = base_bytes + tail_bytes;
+    if (!eng_stage_block(&s_eng_last_vs_cb, base, base_bytes, tail, tail_bytes,
+                         &s_eng_pending.vs_cb_off))
+        bytes = 0;
     s_eng_pending.vs_cb_bytes = bytes;
 }
 
 static void eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
-    if (!eng_stage_block(&s_eng_last_ps_cb, data, bytes, &s_eng_pending.ps_cb_off)) bytes = 0;
+    if (!eng_stage_block(&s_eng_last_ps_cb, data, bytes, NULL, 0, &s_eng_pending.ps_cb_off))
+        bytes = 0;
     s_eng_pending.ps_cb_bytes = bytes;
 }
 
@@ -4162,14 +4225,48 @@ static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags,
 
 /* ---- replay -------------------------------------------------------------- */
 
+/* A packed triangle list (rsx_vertex_compact.h) for the bound pipeline's
+ * vertex-pull twin: one staging block holding the packet and its 16-bit
+ * indices, alive until the command buffer completes like any other staged
+ * draw. Declined without a twin, without a record, or when the block would
+ * not fit this arena: making room would submit the arena under the
+ * constants this draw already staged. */
+static int eng_draw_packed_triangles(void* user, const rsx_packed_triangles* packet)
+{
+    (void)user;
+    const u32 pipeline = s_eng_pending.pipeline;
+    if (!pipeline || pipeline > s_eng_pipe_count || !s_eng_pipe[pipeline - 1].pull_pso ||
+        s_eng_rec_count >= ENG_MAX_RECORDS)
+        return 0;
+    u32 index_offset, offset;
+    const u32 bytes = rsx_vertex_packed_triangles_size(packet, &index_offset);
+    const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
+    if ((u64)start + bytes > ENG_STAGE_MAX || !eng_stage_reserve(bytes, &offset)) return 0;
+    rsx_vertex_packed_triangles_write(packet, s_eng_stage + offset);
+
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    *r = s_eng_pending;
+    r->kind         = ENG_REC_DRAW;
+    r->topology     = MTLPrimitiveTypeTriangle;
+    r->vb_off       = offset;
+    r->stride       = 0;
+    r->vertex_count = 0;
+    r->ib_off       = offset + index_offset;
+    r->index_count  = packet->count;
+    r->packed_input = 1;
+    return 1;
+}
+
 static const EngRecord* eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                                         const EngRecord* previous, id<MTLBuffer> stage)
 {
     if (!r->pipeline || r->pipeline > s_eng_pipe_count) { s_eng_encoding_failed = 1; return previous; }
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
-    if (!p->pso) { s_eng_encoding_failed = 1; return previous; }
-    if (!previous || r->pipeline != previous->pipeline) {
-        [enc setRenderPipelineState:p->pso];
+    id<MTLRenderPipelineState> pso = r->packed_input ? p->pull_pso : p->pso;
+    if (!pso) { s_eng_encoding_failed = 1; return previous; }
+    if (!previous || r->pipeline != previous->pipeline ||
+        r->packed_input != previous->packed_input) {
+        [enc setRenderPipelineState:pso];
         [enc setDepthStencilState:p->ds];
         [enc setCullMode:p->cull];
         [enc setFrontFacingWinding:p->winding];
@@ -4186,8 +4283,9 @@ static const EngRecord* eng_encode_draw(id<MTLRenderCommandEncoder> enc, const E
     }
     if (r->sc[2] && r->sc[3])
         [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
-    if (!previous || r->vb_off != previous->vb_off)
-        [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
+    if (!previous || r->vb_off != previous->vb_off || r->packed_input != previous->packed_input)
+        [enc setVertexBuffer:stage offset:r->vb_off
+                     atIndex:r->packed_input ? ENG_PULL_BUFFER : MTL_VB_INDEX];
     if (r->vs_cb_bytes && (!previous || !previous->vs_cb_bytes || r->vs_cb_off != previous->vs_cb_off))
         [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
     if (r->ps_cb_bytes && (!previous || !previous->ps_cb_bytes || r->ps_cb_off != previous->ps_cb_off))
@@ -4219,7 +4317,7 @@ static const EngRecord* eng_encode_draw(id<MTLRenderCommandEncoder> enc, const E
     if (r->index_count)
         [enc drawIndexedPrimitives:r->topology
                         indexCount:r->index_count
-                         indexType:MTLIndexTypeUInt32
+                         indexType:r->packed_input ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
                        indexBuffer:stage
                  indexBufferOffset:r->ib_off];
     else
@@ -5331,6 +5429,7 @@ static const rsx_draw_backend s_engine_backend = {
     .bind_targets         = eng_bind_targets,
     .bind_pipeline        = eng_bind_pipeline,
     .bind_vs_constants    = eng_bind_vs_constants,
+    .bind_vs_constants_split = eng_bind_vs_constants_split,
     .bind_ps_constants    = eng_bind_ps_constants,
     .bind_textures        = eng_bind_textures,
     .bind_vertex_textures = eng_bind_vertex_textures,
@@ -5339,6 +5438,7 @@ static const rsx_draw_backend s_engine_backend = {
     .set_stencil_refs     = eng_set_stencil_refs,
     .set_depth_bias       = eng_set_depth_bias,
     .draw                 = eng_draw,
+    .draw_packed_triangles = eng_draw_packed_triangles,
     .clear_color          = eng_clear_color,
     .clear_depth_stencil  = eng_clear_depth_stencil,
     .clear_color_rect     = eng_clear_color_rect,

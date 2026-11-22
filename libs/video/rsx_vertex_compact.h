@@ -154,6 +154,85 @@ int rsx_vertex_topology_plan(
 int rsx_vertex_decode_element(
     u32 type, u32 size, const u8* source, float out[4]);
 
+/* ---- packed indexed triangles ------------------------------------------ */
+/*
+ * An ordinary indexed triangle list (16-bit indices, per-vertex attributes,
+ * no restart sentinel in the run) can reach the GPU undecoded: the guest's
+ * big-endian attribute bytes and the indices in host order, decoded in the
+ * vertex shader by the same rules as rsx_vertex_decode_element. The packet
+ * owns copies of everything it needs, so it stays valid after the guest
+ * rewrites its arrays. Anything else keeps the CPU fetch path.
+ */
+#define RSX_PACKED_VERTEX_LIMIT 4096u            /* indices, and vertex range */
+#define RSX_PACKED_BYTES_LIMIT  (128u * 1024u)   /* owned attribute bytes     */
+
+/* One layout slot. type 0 means the slot reads `defaults` (raw float bits).
+ * The layout is the packet's wire format: eight 32-bit words a slot. */
+typedef struct rsx_packed_attribute {
+    u32 offset;         /* into data, of the element at `first`            */
+    u32 stride;
+    u32 type;           /* RSX_VTX_TYPE_*, 0 = default value              */
+    u32 size;           /* components                                      */
+    u32 defaults[4];
+} rsx_packed_attribute;
+
+typedef struct rsx_packed_triangles {
+    u32 first, last;    /* effective (base-applied, 20-bit) vertex range   */
+    u32 base_index;
+    u32 count;          /* indices, a nonzero multiple of three            */
+    u32 slots;          /* layout slots, in rsx_vertex_layout_plan order   */
+    u32 bytes;          /* used bytes of data                              */
+    rsx_packed_attribute attributes[RSX_DSP_NUM_VERTEX_ATTR];
+    u16 indices[RSX_PACKED_VERTEX_LIMIT];   /* host order, base not applied */
+    u8 data[RSX_PACKED_BYTES_LIMIT];
+} rsx_packed_triangles;
+
+/* Convert `count` big-endian 16-bit indices to host order in `owned` and
+ * return the effective vertex range ((index + base) & 0xFFFFF) through
+ * first/last. Returns 0, with `owned` partly written, when an index equals
+ * `restart` (pass UINT32_MAX when restart is off). Vectorised on AArch64. */
+int rsx_vertex_index_span_u16(
+    const u8* source, u16* owned, u32 count, u32 base, u32 restart,
+    u32* first, u32* last);
+
+/* Fill `out` for an indexed triangle draw of `count` indices read from
+ * `index_run`, against a plan from rsx_vertex_fetch_plan_init (not
+ * prepared; this prepares its own copy). Returns 0 -- leaving the CPU path
+ * to draw it -- for a restart sentinel, a count that is not whole
+ * triangles or exceeds the limits, an inline stream, a non-plain
+ * frequency, a format the shader decoder does not have, or an attribute
+ * span that is not contiguously mapped. */
+int rsx_vertex_packed_triangles_prepare(
+    rsx_packed_triangles* out, const rsx_vertex_fetch_plan* plan,
+    const u8* index_run, u32 count, u32 base_index, u32 restart_index);
+
+/* CPU decode of a prepared packet, for a backend that declines it: the
+ * vertex range first..last as compact vertices `stride` apart (16 bytes a
+ * slot, rsx_vertex_layout_plan's layout), and `count` 32-bit indices into
+ * them. Same values as rsx_vertex_fetch_many over the same references. */
+int rsx_vertex_packed_triangles_decode(
+    const rsx_packed_triangles* packet, u32 stride, u8* vertices,
+    u32* indices);
+
+/* The packet as the shader reads it, one contiguous block: a 16-byte header
+ * {first, base_index, data offset, slots}, the slots' attributes, the data
+ * padded to four bytes, then the 16-bit indices at *index_offset. Returns
+ * the block's size; _write fills exactly that many bytes. */
+u32 rsx_vertex_packed_triangles_size(
+    const rsx_packed_triangles* packet, u32* index_offset);
+void rsx_vertex_packed_triangles_write(
+    const rsx_packed_triangles* packet, u8* dst);
+
+/* The HLSL decoder for that block (a ByteAddressBuffer at t28), and the
+ * guest vertex program rewritten to call it: `main` takes SV_VertexID,
+ * the original index, and builds the VSInput the translated program reads
+ * from the packet. Returns 0 if `vs_hlsl` lacks the expected entry point or
+ * the result does not fit. */
+extern const char rsx_vertex_pull_hlsl[];
+int rsx_vertex_pull_shader(
+    const char* vs_hlsl, const rsx_vertex_layout_plan* layout,
+    char* out, size_t capacity);
+
 #ifdef __cplusplus
 }
 #endif

@@ -3,8 +3,15 @@
 #include "rsx_vertex_formats.h"
 
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__aarch64__) && defined(__ARM_NEON) && \
+    (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#include <arm_neon.h>
+#define RSX_PACKED_INDEX_NEON 1
+#endif
 
 static float rsx_compact_be_f32(const u8* p)
 {
@@ -567,4 +574,283 @@ int rsx_vertex_topology_plan(
         *indexed = 0;
         return 0;
     }
+}
+
+/* ---- packed indexed triangles ------------------------------------------ */
+
+_Static_assert(sizeof(rsx_packed_attribute) == 32,
+               "the shader reads eight words a slot");
+
+int rsx_vertex_index_span_u16(
+    const u8* source, u16* owned, u32 count, u32 base, u32 restart,
+    u32* first, u32* last)
+{
+    u32 low = UINT16_MAX, high = 0, i = 0;
+#if RSX_PACKED_INDEX_NEON
+    /* Eight indices a step: byte-swap, store, and keep the running extrema
+     * and a sticky sentinel match. The sentinel compare is meaningful only
+     * for a restart value a 16-bit index can hold. */
+    uint16x8_t minimum = vdupq_n_u16(UINT16_MAX);
+    uint16x8_t maximum = vdupq_n_u16(0);
+    uint16x8_t markers = vdupq_n_u16(0);
+    const uint16x8_t sentinel = vdupq_n_u16((uint16_t)restart);
+    for (; i + 8 <= count; i += 8) {
+        const uint16x8_t values =
+            vreinterpretq_u16_u8(vrev16q_u8(vld1q_u8(source + 2u * i)));
+        vst1q_u16(owned + i, values);
+        minimum = vminq_u16(minimum, values);
+        maximum = vmaxq_u16(maximum, values);
+        markers = vorrq_u16(markers, vceqq_u16(sentinel, values));
+    }
+    if (restart <= UINT16_MAX && vmaxvq_u16(markers)) return 0;
+    low = vminvq_u16(minimum);
+    high = vmaxvq_u16(maximum);
+#endif
+    for (; i < count; ++i) {
+        const u16 index = (u16)((source[2u * i] << 8) | source[2u * i + 1u]);
+        if (index == restart) return 0;
+        owned[i] = index;
+        if (index < low) low = index;
+        if (index > high) high = index;
+    }
+    const u32 mask = 0xFFFFFu;
+    base &= mask;
+    *first = (base + low) & mask;
+    *last = (base + high) & mask;
+    if (*first > *last) {
+        /* The based range crosses the 20-bit wrap, so the raw extrema no
+         * longer bound it: take the exact ones from the owned copy. */
+        *first = UINT32_MAX;
+        *last = 0;
+        for (i = 0; i < count; ++i) {
+            const u32 effective = (base + owned[i]) & mask;
+            if (effective < *first) *first = effective;
+            if (effective > *last) *last = effective;
+        }
+    }
+    return 1;
+}
+
+typedef struct { uintptr_t start, end; u32 slot; } rsx_packed_span;
+
+int rsx_vertex_packed_triangles_prepare(
+    rsx_packed_triangles* out, const rsx_vertex_fetch_plan* plan,
+    const u8* index_run, u32 count, u32 base_index, u32 restart_index)
+{
+    if (!out || !plan || !index_run || count < 3 || count % 3 ||
+        count > RSX_PACKED_VERTEX_LIMIT || plan->inline_data ||
+        !plan->guest_ptr || !plan->layout.count)
+        return 0;
+    for (u32 slot = 0; slot < plan->layout.count; ++slot) {
+        const u32 attr = plan->layout.attrs[slot];
+        const rsx_dsp_vertex_attr* desc = &plan->attr[attr].desc;
+        if (!desc->type || !desc->size) continue;
+        if (desc->type > RSX_VTX_TYPE_UINT8 || desc->size > 4 ||
+            !rsx_vertex_freq_plain(desc->frequency,
+                                   (plan->divider_mask >> attr) & 1u))
+            return 0;
+    }
+
+    u32 first, last;
+    if (!rsx_vertex_index_span_u16(index_run, out->indices, count, base_index,
+                                   restart_index, &first, &last) ||
+        last - first >= RSX_PACKED_VERTEX_LIMIT)
+        return 0;
+
+    /* Map each attribute over the draw's whole vertex range, exactly as the
+     * CPU fetch would for these references. */
+    const rsx_vertex_ref bounds[2] = {{first, 0}, {last, 0}};
+    rsx_vertex_fetch_plan stable = *plan;
+    rsx_vertex_fetch_plan_prepare(&stable, bounds, 2);
+
+    /* Own the mapped spans, merging the ones that overlap (interleaved
+     * attributes share one array), in ascending address order. */
+    rsx_packed_span spans[RSX_DSP_NUM_VERTEX_ATTR];
+    u32 used = 0;
+    for (u32 slot = 0; slot < stable.layout.count; ++slot) {
+        rsx_packed_attribute* a = &out->attributes[slot];
+        const rsx_vertex_fetch_attr* fetch = &stable.attr[stable.layout.attrs[slot]];
+        memset(a, 0, sizeof(*a));
+        memcpy(a->defaults, fetch->default_value, sizeof(a->defaults));
+        if (!fetch->desc.type || !fetch->desc.size) continue;
+        if (!fetch->stable_base || !fetch->elem_size ||
+            fetch->stable_first != first || fetch->stable_last != last)
+            return 0;
+        const uintptr_t start = (uintptr_t)fetch->stable_base;
+        const u64 size = (u64)(last - first) * fetch->stride + fetch->elem_size;
+        if (size > RSX_PACKED_BYTES_LIMIT || size > UINTPTR_MAX - start)
+            return 0;
+        a->stride = fetch->stride;
+        a->type = fetch->desc.type;
+        a->size = fetch->desc.size;
+        u32 pos = used++;
+        for (; pos > 0 && spans[pos - 1].start > start; --pos)
+            spans[pos] = spans[pos - 1];
+        spans[pos] = (rsx_packed_span){start, start + (uintptr_t)size, slot};
+    }
+    u32 bytes = 0;
+    for (u32 head = 0; head < used;) {
+        const uintptr_t start = spans[head].start;
+        uintptr_t end = spans[head].end;
+        u32 next = head + 1;
+        for (; next < used && spans[next].start < end; ++next)
+            if (spans[next].end > end) end = spans[next].end;
+        if (end - start > sizeof(out->data) - bytes) return 0;
+        memcpy(out->data + bytes, (const void*)start, (size_t)(end - start));
+        for (; head < next; ++head)
+            out->attributes[spans[head].slot].offset =
+                bytes + (u32)(spans[head].start - start);
+        bytes += (u32)(end - start);
+    }
+
+    out->first = first;
+    out->last = last;
+    out->base_index = base_index & 0xFFFFFu;
+    out->count = count;
+    out->slots = stable.layout.count;
+    out->bytes = bytes;
+    return 1;
+}
+
+int rsx_vertex_packed_triangles_decode(
+    const rsx_packed_triangles* packet, u32 stride, u8* vertices,
+    u32* indices)
+{
+    const u32 elements = packet->last - packet->first + 1u;
+    for (u32 element = 0; element < elements; ++element) {
+        u8* vertex = vertices + (size_t)element * stride;
+        for (u32 slot = 0; slot < packet->slots; ++slot) {
+            const rsx_packed_attribute* a = &packet->attributes[slot];
+            float value[4];
+            if (!a->type)
+                memcpy(value, a->defaults, sizeof(value));
+            else if (!rsx_vertex_decode_element(
+                         a->type, a->size,
+                         packet->data + a->offset + (size_t)element * a->stride,
+                         value))
+                return 0;
+            memcpy(vertex + 16u * slot, value, sizeof(value));
+        }
+    }
+    for (u32 i = 0; i < packet->count; ++i)
+        indices[i] = ((packet->indices[i] + packet->base_index) & 0xFFFFFu) -
+                     packet->first;
+    return 1;
+}
+
+u32 rsx_vertex_packed_triangles_size(
+    const rsx_packed_triangles* packet, u32* index_offset)
+{
+    const u32 data = 16u + packet->slots * (u32)sizeof(rsx_packed_attribute);
+    *index_offset = data + ((packet->bytes + 3u) & ~3u);
+    return *index_offset + packet->count * (u32)sizeof(u16);
+}
+
+void rsx_vertex_packed_triangles_write(
+    const rsx_packed_triangles* packet, u8* dst)
+{
+    u32 index_offset;
+    rsx_vertex_packed_triangles_size(packet, &index_offset);
+    const u32 data = 16u + packet->slots * (u32)sizeof(rsx_packed_attribute);
+    const u32 header[4] = {packet->first, packet->base_index, data, packet->slots};
+    memcpy(dst, header, sizeof(header));
+    memcpy(dst + sizeof(header), packet->attributes,
+           packet->slots * sizeof(rsx_packed_attribute));
+    memcpy(dst + data, packet->data, packet->bytes);
+    /* The padding keeps the last data byte inside an aligned shader load. */
+    memset(dst + data + packet->bytes, 0, index_offset - data - packet->bytes);
+    memcpy(dst + index_offset, packet->indices, packet->count * sizeof(u16));
+}
+
+/* Reads the block rsx_vertex_packed_triangles_write lays out. Each component
+ * follows rsx_vertex_decode_element bit for bit (the guest programs compile
+ * with safe math): big-endian bytes, half denormals to signed zero, NaN
+ * payloads kept, and the same divisions. */
+const char rsx_vertex_pull_hlsl[] =
+    "ByteAddressBuffer rsx_pull_packet : register(t28);\n"
+    "\n"
+    "uint rsx_pull_byte(uint offset)\n"
+    "{\n"
+    "    return (rsx_pull_packet.Load(offset & ~3u) >> ((offset & 3u) * 8u)) & 255u;\n"
+    "}\n"
+    "\n"
+    "uint rsx_pull_be16(uint offset)\n"
+    "{\n"
+    "    return (rsx_pull_byte(offset) << 8) | rsx_pull_byte(offset + 1u);\n"
+    "}\n"
+    "\n"
+    "uint rsx_pull_be32(uint offset)\n"
+    "{\n"
+    "    return (rsx_pull_be16(offset) << 16) | rsx_pull_be16(offset + 2u);\n"
+    "}\n"
+    "\n"
+    "uint rsx_pull_half(uint word)\n"
+    "{\n"
+    "    uint sign = (word >> 15) << 31;\n"
+    "    uint exp = (word >> 10) & 31u;\n"
+    "    uint fraction = (word & 1023u) << 13;\n"
+    "    if (exp == 0u) return sign;\n"
+    "    if (exp == 31u) return sign | 0x7f800000u | fraction;\n"
+    "    return sign | ((exp + 112u) << 23) | fraction;\n"
+    "}\n"
+    "\n"
+    "float4 rsx_pull_attribute(uint index, uint slot)\n"
+    "{\n"
+    "    uint desc = 16u + 32u * slot;\n"
+    "    uint4 format = rsx_pull_packet.Load4(desc);\n"
+    "    uint type = format.z;\n"
+    "    if (type == 0u) return asfloat(rsx_pull_packet.Load4(desc + 16u));\n"
+    "    uint4 header = rsx_pull_packet.Load4(0u);\n"
+    "    uint element = ((index + header.y) & 0xfffffu) - header.x;\n"
+    "    uint source = header.z + format.x + format.y * element;\n"
+    "    if (type == 6u) {\n"
+    "        uint word = rsx_pull_be32(source);\n"
+    "        int x = asint(word << 21) >> 21;\n"
+    "        int y = asint(word << 10) >> 21;\n"
+    "        int z = asint(word) >> 22;\n"
+    "        return float4(float(x) / 1023.0, float(y) / 1023.0, float(z) / 511.0, 1.0);\n"
+    "    }\n"
+    "    uint4 result = uint4(0u, 0u, 0u, 0x3f800000u);\n"
+    "    for (uint c = 0u; c < format.w; c++) {\n"
+    "        switch (type) {\n"
+    "        case 1u: result[c] = asuint(float(asint(rsx_pull_be16(source + 2u * c) << 16) >> 16) / 32767.0); break;\n"
+    "        case 2u: result[c] = rsx_pull_be32(source + 4u * c); break;\n"
+    "        case 3u: result[c] = rsx_pull_half(rsx_pull_be16(source + 2u * c)); break;\n"
+    "        case 4u: result[c] = asuint(float(rsx_pull_byte(source + c)) / 255.0); break;\n"
+    "        case 5u: result[c] = asuint(float(asint(rsx_pull_be16(source + 2u * c) << 16) >> 16)); break;\n"
+    "        case 7u: result[c] = asuint(float(rsx_pull_byte(source + c))); break;\n"
+    "        }\n"
+    "    }\n"
+    "    return asfloat(result);\n"
+    "}\n";
+
+int rsx_vertex_pull_shader(
+    const char* vs_hlsl, const rsx_vertex_layout_plan* layout,
+    char* out, size_t capacity)
+{
+    static const char entry[] = "VSOutput main(VSInput input) {\n";
+    const char* start = vs_hlsl ? strstr(vs_hlsl, entry) : NULL;
+    /* A program with no attribute inputs reads SV_VertexID through VSInput,
+     * which the rewritten entry point would leave unset. */
+    if (!start || !layout || !layout->count ||
+        layout->count > RSX_DSP_NUM_VERTEX_ATTR || strstr(vs_hlsl, "SV_VertexID"))
+        return 0;
+    int length = snprintf(out, capacity,
+                          "%s\n%.*sVSOutput main(uint vertex_id:SV_VertexID) {\n"
+                          "    VSInput input;\n",
+                          rsx_vertex_pull_hlsl, (int)(start - vs_hlsl), vs_hlsl);
+    if (length < 0 || (size_t)length >= capacity) return 0;
+    size_t used = (size_t)length;
+    for (u32 slot = 0; slot < layout->count; ++slot) {
+        length = snprintf(out + used, capacity - used,
+                          "    input.a%u = rsx_pull_attribute(vertex_id, %uu);\n",
+                          layout->attrs[slot], slot);
+        if (length < 0 || (size_t)length >= capacity - used) return 0;
+        used += (size_t)length;
+    }
+    const char* body = start + sizeof(entry) - 1;
+    const size_t bytes = strlen(body) + 1;
+    if (bytes > capacity - used) return 0;
+    memcpy(out + used, body, bytes);
+    return 1;
 }
