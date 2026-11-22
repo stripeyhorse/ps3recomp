@@ -57,6 +57,9 @@ u32 rsx_null_backend_readback_center(void);
  * always 0 here, this backend has no shader path. Mirrors the Metal hook so
  * the host harness can name one entry point per backend. */
 u32 rsx_null_backend_guest_draws(void);
+
+/* Full texture decodes since start-up (PS3_NULLSW_LAZY_TEX). */
+u32 rsx_null_backend_texture_decodes(void);
 #endif
 
 /* The live draw engine binds to this window and takes over presentation. */

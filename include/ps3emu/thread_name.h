@@ -3,10 +3,11 @@
  * "audio mix", ...), so a debugger, a profiler or a per-thread CPU table can
  * tell the guest's PPU and SPU threads and the runtime's own threads apart.
  *
- * Windows only for now: SetThreadDescription (Windows 10 1607 and later) is
- * looked up at run time, so older systems just skip it. Elsewhere it does
- * nothing; pthread_setname_np needs _GNU_SOURCE on glibc before the first
- * pthread.h, which a header included this late cannot promise.
+ * Windows: SetThreadDescription (Windows 10 1607 and later) is looked up at
+ * run time, so older systems just skip it. macOS: pthread_setname_np. Linux:
+ * prctl(PR_SET_NAME), since pthread_setname_np needs _GNU_SOURCE on glibc
+ * before the first pthread.h, which a header included this late cannot
+ * promise. Elsewhere it does nothing.
  */
 #ifndef PS3EMU_THREAD_NAME_H
 #define PS3EMU_THREAD_NAME_H
@@ -54,6 +55,21 @@ static inline void ps3_thread_name(const char* fmt, ...)
     vsnprintf(s, sizeof s, fmt, ap);
     va_end(ap);
     pthread_setname_np(s);
+}
+#elif defined(__linux__)
+/* Linux: prctl names the calling thread without _GNU_SOURCE. The kernel keeps
+ * 15 bytes; /proc/<pid>/task/<tid>/comm and top -H show it. */
+#include <sys/prctl.h>
+#include <stdarg.h>
+#include <stdio.h>
+static inline void ps3_thread_name(const char* fmt, ...)
+{
+    char s[64];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s, sizeof s, fmt, ap);
+    va_end(ap);
+    prctl(PR_SET_NAME, s, 0, 0, 0);
 }
 #else
 static inline void ps3_thread_name(const char* fmt, ...) { (void)fmt; }

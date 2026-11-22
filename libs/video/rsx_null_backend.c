@@ -382,6 +382,10 @@ typedef struct {
     u8*  tex;               /* decoded RGBA rows, tex_pitch * tex_h  */
     u32  tex_w, tex_h, tex_pitch;
     int  tex_ready;
+    /* PS3_NULLSW_LAZY_TEX: the binding waiting for its first sampling draw. */
+    int  tex_pending;
+    u32  pend_ea, pend_fmt, pend_w, pend_h;
+    u32  tex_decodes;       /* full decodes done, for the fixture */
 } NullSoftState;
 
 static NullSoftState s_soft;
@@ -450,39 +454,18 @@ static u32 colour_of(const float c[4])
             (u32)(b * 255.0f + 0.5f);
 }
 
-/* Decode the bound guest texture once, through the same rsx_texture_layout /
- * rsx_texture_decode the D3D12 backend uses. Only unit 0 is kept: this exists
- * to check that path produces the right pixels, not to be a texture cache. */
-static void nullsw_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
+/* Decode a guest texture through the same rsx_texture_layout /
+ * rsx_texture_decode the D3D12 backend uses. */
+static void nullsw_decode(u32 ea, u32 fmt, u32 w, u32 h)
 {
-    (void)ud;
-    if (unit != 0 || !t) return;
-
-    /* CONTROL0 bit 31 is the unit enable. A disabled unit unbinds. */
-    if (!(t->control0 & 0x80000000u) || !t->offset) { s_soft.tex_ready = 0; return; }
-
-    u32 w = (t->image_rect >> 16) & 0xFFFFu;
-    u32 h =  t->image_rect        & 0xFFFFu;
-    if (!w || !h || w > 4096u || h > 4096u) { s_soft.tex_ready = 0; return; }
-
-    /* SET_TEXTURE_FORMAT as a title writes it: bits [1:0] are the location
-     * (1 = local, 2 = main), [15:8] the format byte with its LN/UN flags.
-     * The offset is a plain RSX offset. This used to read the format byte
-     * from the low bits and a location flag from bit 31 of the offset --
-     * a convention only this backend and the host harness shared; the
-     * D3D12 backend, which has met real titles, decodes the register. */
-    u32 ea = cellGcmResolveLocated((t->format & 3u) == 1u, t->offset);
-    if (!vm_base || ea == 0xFFFFFFFFu) { s_soft.tex_ready = 0; return; }
-    const u32 fmt = (t->format >> 8) & 0xFFu;
-
     rsx_tex_layout tl;
     rsx_texture_layout(fmt, w, h, &tl);
-    if (tl.compressed) { s_soft.tex_ready = 0; return; }   /* no BC decode here */
 
     u32 pitch = w * 4u;
     u8* buf = (u8*)realloc(s_soft.tex, (size_t)pitch * h);
     if (!buf) { s_soft.tex_ready = 0; return; }
     s_soft.tex = buf;
+    s_soft.tex_decodes++;
 
     if (tl.fmt == RSX_TEXFMT_R8G8B8A8) {
         rsx_texture_decode(buf, pitch, vm_base + ea, w, h, &tl,
@@ -508,6 +491,71 @@ static void nullsw_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
 
     s_soft.tex_w = w; s_soft.tex_h = h; s_soft.tex_pitch = pitch;
     s_soft.tex_ready = 1;
+}
+
+/* PS3_NULLSW_LAZY_TEX (default 1): a bind only records the texture; the
+ * first draw that samples it decodes it. Decoding at every bind made this
+ * probe the slowest part of a Linux game run: a frame binds hundreds of
+ * textures, up to 4096x4096 each, and decoded every texel of each one on the
+ * FIFO walker's thread -- while this backend draws nothing for indexed draws
+ * and so samples almost none of them. Pain's Crash Course ran at 3-5 FPS
+ * headless, the walker 99% inside this decode and the game waiting on fences
+ * behind it. Decoding at the draw also reads the texels when the RSX does,
+ * after any command between the bind and the draw has written them.
+ * =0 decodes at the bind, as before. */
+static int nullsw_lazy_tex(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3_NULLSW_LAZY_TEX"); on = !(e && *e == '0'); }
+    return on;
+}
+
+/* Whether unit 0 has a texture to sample, decoding a pending binding now. */
+static int nullsw_tex_ready(void)
+{
+    if (s_soft.tex_pending) {
+        s_soft.tex_pending = 0;
+        nullsw_decode(s_soft.pend_ea, s_soft.pend_fmt, s_soft.pend_w, s_soft.pend_h);
+    }
+    return s_soft.tex_ready;
+}
+
+/* Only unit 0 is kept: this exists to check the shared texture path produces
+ * the right pixels, not to be a texture cache. */
+static void nullsw_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
+{
+    (void)ud;
+    if (unit != 0 || !t) return;
+    s_soft.tex_pending = 0;   /* a new binding replaces any pending one */
+
+    /* CONTROL0 bit 31 is the unit enable. A disabled unit unbinds. */
+    if (!(t->control0 & 0x80000000u) || !t->offset) { s_soft.tex_ready = 0; return; }
+
+    u32 w = (t->image_rect >> 16) & 0xFFFFu;
+    u32 h =  t->image_rect        & 0xFFFFu;
+    if (!w || !h || w > 4096u || h > 4096u) { s_soft.tex_ready = 0; return; }
+
+    /* SET_TEXTURE_FORMAT as a title writes it: bits [1:0] are the location
+     * (1 = local, 2 = main), [15:8] the format byte with its LN/UN flags.
+     * The offset is a plain RSX offset. This used to read the format byte
+     * from the low bits and a location flag from bit 31 of the offset --
+     * a convention only this backend and the host harness shared; the
+     * D3D12 backend, which has met real titles, decodes the register. */
+    u32 ea = cellGcmResolveLocated((t->format & 3u) == 1u, t->offset);
+    if (!vm_base || ea == 0xFFFFFFFFu) { s_soft.tex_ready = 0; return; }
+    const u32 fmt = (t->format >> 8) & 0xFFu;
+
+    rsx_tex_layout tl;
+    rsx_texture_layout(fmt, w, h, &tl);
+    if (tl.compressed) { s_soft.tex_ready = 0; return; }   /* no BC decode here */
+
+    if (nullsw_lazy_tex()) {
+        s_soft.tex_ready = 0;
+        s_soft.tex_pending = 1;
+        s_soft.pend_ea = ea; s_soft.pend_fmt = fmt; s_soft.pend_w = w; s_soft.pend_h = h;
+        return;
+    }
+    nullsw_decode(ea, fmt, w, h);
 }
 
 /* Nearest-neighbour point sample, wrapping. No filtering, no mip levels, no
@@ -594,20 +642,33 @@ static void fill_triangle(const float a[4], const float b[4], const float c[4],
     }
 }
 
+/* PS3_NULLSW_RASTER=0 (opt-in; default 1 draws): skip rasterising, for
+ * headless game runs where nothing reads the pixels. With textures decoded
+ * lazily, filling the non-indexed draws (full-screen passes, HUD, particles)
+ * at 1280x720 is what remains of this backend's cost on the FIFO walker. The
+ * command stream, fences and flips are untouched; the framebuffer only holds
+ * clears. Not for the host probe, which checks drawn pixels. */
+static int nullsw_raster(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3_NULLSW_RASTER"); on = !(e && *e == '0'); }
+    return on;
+}
+
 /* Map sequence position -> guest vertex index, expanding the primitives the
  * hardware has and a triangle list does not. Returns the triangle count and
  * writes 3 indices per triangle through `emit`. */
 static void draw_prim(u32 prim, u32 first, u32 count)
 {
     const rsx_state* st = s_soft.state;
-    if (!st || !s_soft.fb || count < 3) return;
+    if (!st || !s_soft.fb || count < 3 || !nullsw_raster()) return;
 
     /* Position is attribute 0 and diffuse colour attribute 3 -- the same slots
      * the D3D12 and Metal fallback paths assume. */
     /* Texture coordinates are attribute 8 (texcoord0), the slot the D3D12 and
      * Metal fetch paths also read. A draw is textured when a texture is bound
      * AND that attribute is actually supplied. */
-    const int textured = s_soft.tex_ready && st->vertex_attribs[8].enabled;
+    const int textured = st->vertex_attribs[8].enabled && nullsw_tex_ready();
 
     #define TRI(i0, i1, i2) do {                                        \
         float p0[4], p1[4], p2[4], col[4], uv[3][4];                    \
@@ -712,6 +773,7 @@ void rsx_null_backend_shutdown(void)
     free(s_soft.depth); s_soft.depth = NULL;
     free(s_soft.tex);   s_soft.tex   = NULL;
     s_soft.tex_ready = 0;
+    s_soft.tex_pending = 0;
 }
 
 /* Headless has no event queue and no window to close. */
@@ -731,5 +793,8 @@ u32 rsx_null_backend_readback_center(void)
 }
 
 u32 rsx_null_backend_guest_draws(void) { return 0; }
+
+/* Full texture decodes so far (PS3_NULLSW_LAZY_TEX fixture). */
+u32 rsx_null_backend_texture_decodes(void) { return s_soft.tex_decodes; }
 
 #endif /* _WIN32 */

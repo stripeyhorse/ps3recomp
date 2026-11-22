@@ -1703,7 +1703,36 @@ int cellGcm_take_flip_pending_synced(void)
  * instead starved wrap recycles and wedged the backend -- don't.) */
 #define GCM_REF_QLEN 4096
 static u32 s_ref_q[GCM_REF_QLEN];
-static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consumer: the ticker */
+/* One producer (the walker, under the FIFO lock) and consumers serialised by
+ * s_ref_pub_lock (the walker's end of pass and every guest thread polling ref).
+ * The tail is stored with release after the slot and loaded with acquire
+ * before the slot is read; the head likewise after a slot has been read and
+ * before it is reused. Both were plain volatile, which orders the two indices
+ * against each other but not the slot: GCC stored the new tail before the
+ * value, so a poll on another core between the two published a slot that was
+ * never written -- 0 for the first 4096 fences of a run, a fence 4096 old
+ * after that -- and lost the one the title was waiting for. Pain then waited
+ * for it for good: put == get, ref == 0, flips stopped (the intermittent
+ * boot/menu hang, likelier the busier the machine). */
+#ifdef _WIN32
+static volatile LONG s_ref_qhead = 0, s_ref_qtail = 0;
+#define GCM_REFQ_LOAD(x)        ((u32)InterlockedCompareExchange(&(x), 0, 0))
+#define GCM_REFQ_STORE(x, v)    InterlockedExchange(&(x), (LONG)(v))
+#else
+static _Atomic(u32) s_ref_qhead = 0, s_ref_qtail = 0;
+#define GCM_REFQ_LOAD(x)        atomic_load_explicit(&(x), memory_order_acquire)
+#define GCM_REFQ_STORE(x, v)    atomic_store_explicit(&(x), (v), memory_order_release)
+#endif
+/* The head is stored by consumers only, under s_ref_pub_lock; the tail by the
+ * walker only. */
+#define GCM_REFQ_TAIL_LOAD()    GCM_REFQ_LOAD(s_ref_qtail)
+#define GCM_REFQ_HEAD_LOAD()    GCM_REFQ_LOAD(s_ref_qhead)
+/* Serializes fence publication between the present ticker and every guest
+ * thread poll-reading the ref register (REFPOLL default-on made this path
+ * multi-threaded; the SPSC queue head raced and publication order broke --
+ * boot froze with all threads parked on fences that were never published in
+ * order). TryAcquire: a contended poll just reads the current ref. */
+static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
 
 /* A JUMP/CALL whose target has no IO mapping must not be taken. Taking one
  * teleports the walker into unmapped space, where it can never reach `put`
@@ -1944,14 +1973,19 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
       if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
-    u32 t = s_ref_qtail;
-    if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
-        s_ref_qhead++;
+    const u32 t = GCM_REFQ_TAIL_LOAD();      /* only this thread stores it */
+    if (t - GCM_REFQ_HEAD_LOAD() >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
+        /* The head belongs to the consumers; move it under their lock so a
+         * publication in progress cannot step it back. */
+        AcquireSRWLockExclusive(&s_ref_pub_lock);
+        const u32 h = GCM_REFQ_HEAD_LOAD();
+        if (t - h >= GCM_REF_QLEN) GCM_REFQ_STORE(s_ref_qhead, h + 1);
+        ReleaseSRWLockExclusive(&s_ref_pub_lock);
         static int _o = 0;
         if (PS3_LOG_FIRST(_o, 4)) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
-    s_ref_qtail = t + 1;
+    GCM_REFQ_STORE(s_ref_qtail, t + 1);       /* publishes the slot */
 }
 
 /* Global fence-publication counter: lets the lwmutex convoy trace correlate a
@@ -1971,8 +2005,8 @@ unsigned long long ps3_qpc_us(void)
 
 static void gcm_ref_publish_one(void)
 {
-    u32 h = s_ref_qhead;
-    if (h == s_ref_qtail) return;
+    const u32 h = GCM_REFQ_HEAD_LOAD();
+    if (h == GCM_REFQ_TAIL_LOAD()) return;   /* acquire: the slot below is written */
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
     /* stderr, deliberately: [DRAIN] uses printf and stdout is block-buffered
      * when redirected, so its interleaving with an stderr probe is not a
@@ -1981,7 +2015,7 @@ static void gcm_ref_publish_one(void)
       if (_rd) { static unsigned long _n = 0; if (++_n <= 24)
         fprintf(stderr, "[refpub] t=%lluus #%lu wrote 0x%08X -> readback 0x%08X\n", ps3_qpc_us(), _n,
                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
-    s_ref_qhead = h + 1;
+    GCM_REFQ_STORE(s_ref_qhead, h + 1);       /* release: the slot is free */
     g_gcm_ref_pub_count++;
 }
 
@@ -2117,13 +2151,6 @@ void cellGcm_fifo_kick_wait(unsigned ms)
 }
 
 
-/* Serializes fence publication between the present ticker and every guest
- * thread poll-reading the ref register (REFPOLL default-on made this path
- * multi-threaded; the SPSC queue head raced and publication order broke --
- * boot froze with all threads parked on fences that were never published in
- * order). TryAcquire: a contended poll just reads the current ref. */
-static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
-
 void cellGcm_ref_on_poll(void)
 {
     /* Pace: leave each published value observable for >= ~200us of spins
@@ -2140,7 +2167,7 @@ void cellGcm_ref_on_poll(void)
     if (now.QuadPart - s_last_pub >= min_gap) {
         gcm_ref_publish_one();
         s_last_pub = now.QuadPart;
-        dry = (s_ref_qhead == s_ref_qtail);
+        dry = (GCM_REFQ_HEAD_LOAD() == GCM_REFQ_TAIL_LOAD());
     }
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
     if (dry && s_gcm_kick_ev)

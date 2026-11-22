@@ -1,5 +1,6 @@
 /* gcc -std=gnu17 -I include -I libs/video -fsanitize=thread
- *   libs/video/tests/test_gcm_vblank_count.c -pthread
+ *   libs/video/tests/test_gcm_vblank_count.c libs/video/tests/gcm_fixture_stubs.c
+ *   runtime/platform/win32_compat.c -pthread -ffunction-sections -Wl,--gc-sections
  *   -o /tmp/test_gcm_vblank_count && /tmp/test_gcm_vblank_count
  *
  * The vblank count is advanced by a ticker thread of its own (the port's

@@ -617,6 +617,38 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_rsx_upload_run PRIVATE include libs/video)
     add_test(NAME rsx_upload_run COMMAND test_rsx_upload_run)
 
+    # The headless software backend decodes a texture at the first draw that
+    # samples it (PS3_NULLSW_LAZY_TEX), not at every bind; both modes.
+    if(NOT WIN32)
+        add_executable(test_nullsw_lazy_texture
+            libs/video/tests/test_nullsw_lazy_texture.c
+            libs/video/rsx_vertex_fetch.c
+            libs/video/rsx_texture_layout.c)
+        target_include_directories(test_nullsw_lazy_texture PRIVATE include libs/video)
+        target_link_libraries(test_nullsw_lazy_texture PRIVATE m)
+        target_compile_options(test_nullsw_lazy_texture PRIVATE -UNDEBUG)
+        add_test(NAME nullsw_lazy_texture COMMAND test_nullsw_lazy_texture)
+        add_test(NAME nullsw_lazy_texture_off COMMAND test_nullsw_lazy_texture)
+        set_tests_properties(nullsw_lazy_texture_off PROPERTIES ENVIRONMENT "PS3_NULLSW_LAZY_TEX=0")
+
+        # The SET_REFERENCE queue between the FIFO walker and the threads that
+        # publish ref: every fence seen once, in order, never an unwritten slot.
+        add_executable(test_gcm_ref_queue
+            libs/video/tests/test_gcm_ref_queue.c
+            libs/video/tests/gcm_fixture_stubs.c
+            runtime/platform/win32_compat.c)
+        target_include_directories(test_gcm_ref_queue PRIVATE include libs/video)
+        target_link_libraries(test_gcm_ref_queue PRIVATE pthread)
+        target_compile_options(test_gcm_ref_queue PRIVATE -UNDEBUG -ffunction-sections)
+        if(APPLE)
+            target_link_options(test_gcm_ref_queue PRIVATE -Wl,-dead_strip)
+        else()
+            target_link_options(test_gcm_ref_queue PRIVATE -Wl,--gc-sections)
+        endif()
+        add_test(NAME gcm_ref_queue COMMAND test_gcm_ref_queue)
+        set_tests_properties(gcm_ref_queue PROPERTIES TIMEOUT 120)
+    endif()
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

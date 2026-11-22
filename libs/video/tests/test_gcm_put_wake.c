@@ -1,6 +1,7 @@
 /* gcc -std=gnu17 -I include -I libs/video -fsanitize=address,undefined -pthread
  *   -ffunction-sections -Wl,--gc-sections   (-Wl,-dead_strip on macOS)
- *   libs/video/tests/test_gcm_put_wake.c runtime/spu/spu_coherency.c
+ *   libs/video/tests/test_gcm_put_wake.c libs/video/tests/gcm_fixture_stubs.c
+ *   runtime/spu/spu_coherency.c
  *   runtime/platform/win32_compat.c -o /tmp/test_gcm_put_wake
  *
  * The FIFO PUT wake (PS3_GCM_PUT_WAKE) with the real PPU store path, the
