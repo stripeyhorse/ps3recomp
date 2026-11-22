@@ -1832,6 +1832,17 @@ typedef struct {
  * the real workload; the overflow is now loud (see spu_register_function). */
 #define SPU_FN_REGISTRY_MAX 262144
 static spu_reg_entry s_registry[SPU_FN_REGISTRY_MAX];
+/* Moves on every registration that can change what the indirect-branch
+ * resolver answers (functions, stack-reset entries, taskset task tables,
+ * overlay sources). The per-context target cache (PS3_SPU_IB_FAST) records
+ * the epoch its entries were made under and drops them all when it moves.
+ * Released after the registration it announces is complete. */
+uint32_t g_spu_ib_epoch = 1;
+static void spu_ib_epoch_bump(void)
+{
+    uint32_t e = __atomic_load_n(&g_spu_ib_epoch, __ATOMIC_RELAXED) + 1;
+    __atomic_store_n(&g_spu_ib_epoch, e ? e : 1, __ATOMIC_RELEASE);  /* 0 is a fresh context's */
+}
 static uint32_t s_registry_count = 0;
 
 /* Accessor for the sampling profiler in ppu_loader.cpp. Its address->function
@@ -1910,6 +1921,7 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     /* Published after the entry is linked: the dispatch cache keys its entries
      * by this count, so a lookup that sees the new count also finds the entry. */
     __atomic_store_n(&s_registry_count, i + 1, __ATOMIC_RELEASE);
+    spu_ib_epoch_bump();
 }
 
 /* Report a CROSS-IMAGE match: the registry served a function some other image
@@ -2097,7 +2109,22 @@ static int spu_dcache_mode(void)   /* 0 off, 1 on, 2 shadow */
     }
     return m;
 }
-static void spu_dcache_residency_changed(spu_context* ctx) { ctx->dcache_residency++; }
+static void spu_ibc_invalidate(spu_context* ctx);
+/* A resident code slot changed its mapping (span, owner, source) or was
+ * dropped: every remembered answer of this context may be wrong now. */
+static void spu_dcache_residency_changed(spu_context* ctx)
+{
+    ctx->dcache_residency++;
+    spu_ibc_invalidate(ctx);
+}
+/* A slot keeps its mapping but its code was streamed in again, so it is
+ * pending re-verification. The target cache keeps its entries: one answered
+ * by this slot is not used while the slot is pending (spu_ibc_find), and a
+ * failed verification drops them all (spu_overlay_resident_verified). */
+static void spu_dcache_residency_pending(spu_context* ctx)
+{
+    ctx->dcache_residency++;
+}
 static void spu_dcache_shadow_stats(void)
 {
     const unsigned long long n = __atomic_load_n(&s_dcache_hits, __ATOMIC_RELAXED) +
@@ -2108,10 +2135,13 @@ static void spu_dcache_shadow_stats(void)
                 __atomic_load_n(&s_dcache_misses, __ATOMIC_RELAXED),
                 __atomic_load_n(&s_dcache_shadow_bad, __ATOMIC_RELAXED));
 }
-spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+/* As spu_lifted_lookup, and *reloc_out says whether the answer was
+ * relocatable code (it then also set ctx->reloc_delta). */
+static spu_lifted_fn spu_lifted_lookup_r(const spu_context* ctx, uint32_t lsa, int* reloc_out)
 {
     const int mode = spu_dcache_mode();
-    if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa, NULL);
+    *reloc_out = 0;
+    if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa, reloc_out);
     spu_context* c = (spu_context*)ctx;
     uint32_t id = c->dcache_id;
     if (!id) {
@@ -2126,6 +2156,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         e->residency == c->dcache_residency && e->image == c->image_id &&
         e->ovl == c->resident_ovl && e->task == c->resident_task) {
         if (e->reloc) c->reloc_delta = e->reloc_delta;
+        *reloc_out = e->reloc;
         if (mode == 2) {
             __atomic_fetch_add(&s_dcache_hits, 1, __ATOMIC_RELAXED);
             const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa, NULL);
@@ -2135,6 +2166,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
                             "cached=%p full=%p\n", c->image_id, c->resident_ovl, c->resident_task,
                             lsa, (void*)e->fn, (void*)full);
                 e->fn = NULL;
+                *reloc_out = 0;   /* not recomputed: keep it out of the target cache */
                 return full;
             }
             spu_dcache_shadow_stats();
@@ -2155,7 +2187,13 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         e->ovl = c->resident_ovl; e->task = c->resident_task;
         e->reloc = reloc; e->reloc_delta = c->reloc_delta;
     }
+    *reloc_out = reloc;
     return fn;
+}
+spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+{
+    int reloc;
+    return spu_lifted_lookup_r(ctx, lsa, &reloc);
 }
 
 /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
@@ -2223,6 +2261,7 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
         s_ovl_src[s_ovl_src_count].has_sig = 0;
         s_ovl_src[s_ovl_src_count].canon = 0;
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
+        spu_ib_epoch_bump();
     }
 }
 
@@ -2257,6 +2296,7 @@ void spu_overlay_register_region_reloc(uint32_t content_ea, uint32_t span, uint3
  * transfer. Any later GET into the span resets the slot to pending (contiguous
  * continuation) or clears it (anything else), see spu_overlay_note_get. */
 enum { SPU_OVERLAY_PENDING = 1, SPU_OVERLAY_VERIFIED, SPU_OVERLAY_REJECTED };
+typedef char spu_ibc_pending_matches[SPU_IBC_SLOT_PENDING == SPU_OVERLAY_PENDING ? 1 : -1];
 #define SPU_OVERLAY_CODE_SEGMENTS 8u
 int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     uint32_t span, int image_id, const spu_overlay_code_segment* code, unsigned count)
@@ -2295,6 +2335,9 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
         for (unsigned i = 0; match && i < o->code_count; ++i)
             match = !memcmp(ctx->ls + o->code[i].lsa, o->code[i].bytes, o->code[i].size);
         *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
+        /* Answers the target cache kept through the reload (verified ones)
+         * no longer hold once the span is rejected. */
+        if (!match) spu_ibc_invalidate(ctx);
     }
     return *state == SPU_OVERLAY_VERIFIED;
 }
@@ -2321,6 +2364,7 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
         s_stack_reset[n].image_id = image_id;
         g_spu_stack_reset_hint[((entry & SPU_LS_MASK) >> 2) & 1023u] = 1;
         __atomic_store_n(&g_spu_stack_reset_count, n + 1, __ATOMIC_RELEASE);
+        spu_ib_epoch_bump();
     }
 }
 
@@ -2363,12 +2407,15 @@ static void spu_check_stack_reset_scan(spu_context* ctx, void (*fn)(spu_context*
 #define SPU_TASK_ENTRY_MAX 16
 static struct { uint32_t entry; int image_id; } s_task_entry[SPU_TASK_ENTRY_MAX];
 static int s_task_entry_count = 0;
+int g_spu_ib_tasks;   /* spu_context.h: any task entry or ELF registered */
 void spu_taskset_register_task_entry(uint32_t entry, int image_id)
 {
     if (s_task_entry_count < SPU_TASK_ENTRY_MAX) {
         s_task_entry[s_task_entry_count].entry = entry & SPU_LS_MASK;
         s_task_entry[s_task_entry_count].image_id = image_id;
-        s_task_entry_count++;
+        __atomic_store_n(&s_task_entry_count, s_task_entry_count + 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_spu_ib_tasks, 1, __ATOMIC_RELEASE);
+        spu_ib_epoch_bump();
     }
 }
 static int spu_taskset_task_image(uint32_t entry)
@@ -2387,7 +2434,10 @@ void spu_taskset_register_task_elf(uint32_t elf_ea, int image_id, int policy_ima
     if (s_task_elf_count < SPU_TASK_ENTRY_MAX) {
         s_task_elf[s_task_elf_count].elf_ea = elf_ea & ~7u;
         s_task_elf[s_task_elf_count].image_id = image_id;
-        s_task_elf[s_task_elf_count++].policy_image_id = policy_image_id;
+        s_task_elf[s_task_elf_count].policy_image_id = policy_image_id;
+        __atomic_store_n(&s_task_elf_count, s_task_elf_count + 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_spu_ib_tasks, 1, __ATOMIC_RELEASE);
+        spu_ib_epoch_bump();
     }
 }
 static int spu_taskset_resident_image(const spu_context* ctx)
@@ -2403,7 +2453,7 @@ static int spu_taskset_resident_image(const spu_context* ctx)
 }
 /* Lowest LS address of the shared task-code region: the taskset tasks all lift
  * at LS 0x3000 (below it is the SPURS kernel/policy/context, 0x290..0x2FFF). */
-#define SPU_TASKSET_TASK_LO 0x3000u
+/* SPU_TASKSET_TASK_LO (spu_context.h): 0x3000. */
 
 /* Content-signature variant: FMOD COPIES codec overlays to the heap before
  * streaming them into the swap slot, so the source EA is unknowable ahead of
@@ -2417,6 +2467,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].has_sig = 1;
         atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
+        spu_ib_epoch_bump();
     }
 }
 
@@ -2488,7 +2539,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 spu_dcache_residency_changed(ctx);
             } else if (ctx->resident_code[slot].verify_state) {
                 ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
-                spu_dcache_residency_changed(ctx);
+                spu_dcache_residency_pending(ctx);
             }
         }
     }
@@ -2514,6 +2565,16 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa &&
                         !(o->canon && ctx->resident_code[slot].image_id == o->image_id))
                         continue;
+                    /* The same code streamed again to the same place only
+                     * needs re-verifying (or nothing, unverified). */
+                    const int same = ctx->resident_code[slot].image_id == o->image_id &&
+                        ctx->resident_code[slot].lsa == lsa &&
+                        ctx->resident_code[slot].size == o->span &&
+                        ctx->resident_code[slot].source_ea == ea &&
+                        ctx->resident_code[slot].source_index == i &&
+                        ctx->resident_code[slot].canon == o->canon &&
+                        ctx->resident_code[slot].verify_state != SPU_OVERLAY_REJECTED &&
+                        (ctx->resident_code[slot].verify_state != 0) == (o->code != NULL);
                     ctx->resident_code[slot].lsa = lsa;
                     ctx->resident_code[slot].size = o->span;
                     ctx->resident_code[slot].source_ea = ea;
@@ -2521,7 +2582,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
                     ctx->resident_code[slot].source_index = i;
                     ctx->resident_code[slot].canon = o->canon;
-                    spu_dcache_residency_changed(ctx);
+                    if (same) spu_dcache_residency_pending(ctx);
+                    else spu_dcache_residency_changed(ctx);
                     return;
                 }
                 fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
@@ -2954,7 +3016,191 @@ static int spu_smc_microstep(spu_context* ctx)
     return 0;
 }
 
-void spu_indirect_branch(spu_context* ctx)
+/* ---- Indirect-branch target cache (PS3_SPU_IB_FAST, default on) ----------
+ * Every lifted `bi rN` that is not a matched return, every jump table and
+ * every computed call lands in spu_indirect_branch. In PAIN's ICE mesh lanes
+ * that is ~250 branches per job and 2,000 jobs a frame, and the full
+ * resolver below cost about a sixth of each lane: a dozen diagnostic gates,
+ * the taskset scan, the thread-local dispatch cache (a call per access on
+ * Darwin) and its eight-field key, then the stack-reset check.
+ *
+ * The resolver's answer for an ordinary branch is a pure function of
+ *  - the target pc,
+ *  - the context's image, resident overlay and (updated) resident task,
+ *  - the resident code slots, including their verification state, and
+ *  - the global registrations: functions, stack-reset entries, task tables;
+ * and its only side effects on such a branch are the resident-task update
+ * and, for relocatable code, ctx->reloc_delta. So each context keeps a small
+ * direct-mapped table of answers (spu_context.ibc). An entry carries the
+ * first three as its key, plus ctx->ibc_gen, which moves whenever a resident
+ * code slot changes (spu_dcache_residency_changed) and whenever the global
+ * registration epoch (g_spu_ib_epoch) moves past the one this context synced
+ * to. A hit repeats the side effects and tail-calls the function.
+ *
+ * What must still reach the resolver is excluded by construction:
+ *  - answers are remembered only when they came straight from the ownership
+ *    lookup with no intercept and no fallback (spu_ib_resolve's *plain);
+ *  - never for LS 0, the two policy kernel-service addresses, the taskset
+ *    syscall address, the job-return address, a registered stack-reset
+ *    entry, or the resolver-only image -- a hit can never happen there;
+ *  - a possible interrupt return (irq_saved with interrupts enabled), and a
+ *    task adoption the resolver may unwind for, are checked on every probe;
+ *  - with any resolver diagnostic armed in the environment (or the old
+ *    dispatch cache turned off or shadowed) the table is not used at all.
+ * Misses are not remembered: an unlifted target takes the resolver every
+ * time, as before.
+ *
+ * PS3_SPU_IB_FAST=0 restores the old path exactly. PS3_SPU_IB_FAST=shadow
+ * runs the full resolver on every hit as well, compares the function, the
+ * relocation delta and every context field the resolver could have changed,
+ * counts mismatches and executes the resolver's answer. */
+#if defined(_MSC_VER)
+#  define SPU_IB_NOINLINE __declspec(noinline)
+#  define SPU_IB_INLINE   static __forceinline
+#else
+#  define SPU_IB_NOINLINE __attribute__((noinline))
+#  define SPU_IB_INLINE   static inline __attribute__((always_inline))
+#endif
+#if defined(__clang__)
+#  define SPU_IB_TAILCALL(call) __attribute__((musttail)) return call
+#else
+#  define SPU_IB_TAILCALL(call) do { call; return; } while (0)
+#endif
+#define SPU_IBC_ENTRIES (sizeof(((spu_context*)0)->ibc) / sizeof(((spu_context*)0)->ibc[0]))
+
+int g_spu_ib_fast = -1;                  /* -1 unread, 0 off, 1 on, 2 shadow */
+static unsigned long long s_ibf_hits, s_ibf_misses, s_ibf_inserts, s_ibf_bad, s_ibf_escapes;
+/* Shadow mode: why a probe missed. */
+enum { IBM_IRQ, IBM_EPOCH, IBM_TASK, IBM_EMPTY, IBM_OTHER_PC, IBM_GEN, IBM_KEY, IBM_PENDING, IBM_N };
+static unsigned long long s_ibf_why[IBM_N];
+
+static void spu_ib_shadow_report(void)
+{
+    fprintf(stderr, "[spu-ibfast] shadow hits=%llu misses=%llu inserts=%llu mismatches=%llu escapes=%llu\n",
+            __atomic_load_n(&s_ibf_hits, __ATOMIC_RELAXED),
+            __atomic_load_n(&s_ibf_misses, __ATOMIC_RELAXED),
+            __atomic_load_n(&s_ibf_inserts, __ATOMIC_RELAXED),
+            __atomic_load_n(&s_ibf_bad, __ATOMIC_RELAXED),
+            __atomic_load_n(&s_ibf_escapes, __ATOMIC_RELAXED));
+    fprintf(stderr, "[spu-ibfast] shadow misses: irq-return=%llu epoch=%llu task-adopt=%llu "
+            "empty=%llu other-pc=%llu stale-gen=%llu image/ovl/task=%llu pending-slot=%llu\n",
+            s_ibf_why[IBM_IRQ], s_ibf_why[IBM_EPOCH], s_ibf_why[IBM_TASK], s_ibf_why[IBM_EMPTY],
+            s_ibf_why[IBM_OTHER_PC], s_ibf_why[IBM_GEN], s_ibf_why[IBM_KEY], s_ibf_why[IBM_PENDING]);
+    fflush(stderr);
+}
+
+/* Counters for fixtures (shadow mode only counts): hits, misses, inserts,
+ * mismatches, escapes. Returns the mode. */
+int spu_ib_fast_stats(unsigned long long out[5])
+{
+    if (out) {
+        out[0] = __atomic_load_n(&s_ibf_hits, __ATOMIC_RELAXED);
+        out[1] = __atomic_load_n(&s_ibf_misses, __ATOMIC_RELAXED);
+        out[2] = __atomic_load_n(&s_ibf_inserts, __ATOMIC_RELAXED);
+        out[3] = __atomic_load_n(&s_ibf_bad, __ATOMIC_RELAXED);
+        out[4] = __atomic_load_n(&s_ibf_escapes, __ATOMIC_RELAXED);
+    }
+    return __atomic_load_n(&g_spu_ib_fast, __ATOMIC_RELAXED);
+}
+
+SPU_IB_NOINLINE void spu_ib_fast_init(void)
+{
+    const char* e = getenv("PS3_SPU_IB_FAST");
+    int m = (!e || !*e) ? 1 : (!strcmp(e, "0") || !strcmp(e, "off")) ? 0
+          : !strcmp(e, "shadow") ? 2 : 1;
+    /* The resolver's own diagnostics watch every branch; keep them whole. */
+    static const char* const diag[] = {
+        "SPU_IBCOV", "SPU_POLLTRACE", "YDKJ_POLTRACE", "SPU_JOBTRACE",
+        "LBP_HLE_JOBDONE", "SPU_JOBEXEC", "YDKJ_CRI_CHAIN",
+    };
+    const char* why = m ? NULL : "PS3_SPU_IB_FAST=0";
+    for (unsigned i = 0; m && i < sizeof diag / sizeof diag[0]; i++)
+        if (getenv(diag[i])) { m = 0; why = diag[i]; }
+    if (m && spu_dcache_mode() != 1) { m = 0; why = "SPU_DISPATCH_CACHE"; }
+    /* Several SPU threads can get here first at once; one reports. */
+    int unread = -1;
+    if (!__atomic_compare_exchange_n(&g_spu_ib_fast, &unread, m, 0, __ATOMIC_RELAXED,
+                                     __ATOMIC_RELAXED))
+        return;
+    if (!m) fprintf(stderr, "[spu] indirect-branch target cache off (%s)\n", why);
+    if (m == 2) {
+        fprintf(stderr, "[spu-ibfast] shadow mode: every hit is re-resolved and compared\n");
+        atexit(spu_ib_shadow_report);
+    }
+}
+
+
+/* Drop every entry of this context (resident code changed, or the epoch). */
+static void spu_ibc_invalidate(spu_context* ctx)
+{
+    if (++ctx->ibc_gen == 0) {      /* wrapped: no old entry may match again */
+        memset(ctx->ibc, 0, sizeof ctx->ibc);
+        ctx->ibc_gen = 1;
+    }
+}
+
+/* The task part of the probe (spu_ibc_find, spu_context.h) once any taskset
+ * task is registered: the resolver's resident-task update, in its order.
+ * Returns 0 where the resolver may adopt a task and unwind. */
+int spu_ibc_task(const spu_context* ctx, uint32_t pc, int* task)
+{
+    int ti = __atomic_load_n(&s_task_elf_count, __ATOMIC_ACQUIRE) ? spu_taskset_resident_image(ctx) : 0;
+    if (ti && !*task) return 0;
+    if (!ti && !*task) ti = spu_taskset_task_image(pc);
+    if (ti) *task = ti;
+    return 1;
+}
+
+static int spu_ib_is_stack_reset_pc(uint32_t pc)
+{
+    const unsigned n = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < n; ++i)
+        if (s_stack_reset[i].entry == pc) return 1;
+    return 0;
+}
+
+/* Remember the resolver's plain answer for the branch it just resolved. `ep`
+ * is the epoch read before the resolve began. */
+static void spu_ibc_insert(spu_context* ctx, spu_fn fn, uint32_t ep, int has_reloc)
+{
+    const uint32_t pc = ctx->pc;
+    if (!pc || pc == SPURS_PM_EXIT_TO_KERNEL_LS || pc == SPURS_PM_SELECT_WORKLOAD_LS ||
+        pc == SPURS_TASKSET_PM_SYSCALL_LS || pc == SPU_JOB_RETURN_LS ||
+        ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID || spu_ib_is_stack_reset_pc(pc))
+        return;
+    if (ctx->ibc_epoch != ep) {
+        spu_ibc_invalidate(ctx);
+        ctx->ibc_epoch = ep;
+    }
+    /* A registration during the resolve: the next probe resyncs instead. */
+    if (__atomic_load_n(&g_spu_ib_epoch, __ATOMIC_ACQUIRE) != ep) return;
+    spu_ibc_entry* e = &ctx->ibc[spu_ibc_index(pc)];
+    e->fn = fn;
+    e->pc = pc;
+    e->gen = ctx->ibc_gen;
+    e->image = ctx->image_id;
+    e->ovl = ctx->resident_ovl;
+    e->task = ctx->resident_task;
+    e->has_reloc = has_reloc ? 1u : 0u;
+    e->reloc_delta = ctx->reloc_delta;
+    /* The slot whose span holds pc, as spu_lifted_lookup_full chose it. */
+    e->slot = SPU_IBC_NO_SLOT;
+    for (unsigned slot = 0; slot < 4; ++slot)
+        if (ctx->resident_code[slot].image_id && pc >= ctx->resident_code[slot].lsa &&
+            pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+            e->slot = (uint8_t)slot;
+            break;
+        }
+    if (__atomic_load_n(&g_spu_ib_fast, __ATOMIC_RELAXED) == 2)
+        __atomic_fetch_add(&s_ibf_inserts, 1, __ATOMIC_RELAXED);
+}
+
+/* The full resolver: every intercept, diagnostic and fallback of an indirect
+ * branch. Returns the lifted function to tail-call (the caller runs the
+ * stack-reset check first), or NULL when the branch was handled here. *plain
+ * is set when the answer came straight from the ownership lookup with none
+ * of the fallbacks, which is the only kind the target cache may remember. */
+SPU_IB_INLINE spu_fn spu_ib_resolve(spu_context* ctx, int* plain)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
@@ -2994,7 +3240,7 @@ void spu_indirect_branch(spu_context* ctx)
                             n, ctx->gpr[3]._u32[0], g_spurs_pm_polls); } }
             ctx->status = SPU_STATUS_STOPPED_BY_STOP;
             spu_halt(ctx);
-            return;
+            return NULL;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
             /* cellSpursModulePoll: report "no contention — keep running".
@@ -3020,7 +3266,7 @@ void spu_indirect_branch(spu_context* ctx)
                                   ((uint32_t)ctx->ls[0x1C6] << 8) | ctx->ls[0x1C7];
               if (sp) memcpy(ctx->ls + 0x100, vm_base + sp, 0x80); }
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
-            return;
+            return NULL;
         }
     }
     /* Synthetic HLE tasks have no resident taskset policy at 0xA70. Real
@@ -3045,7 +3291,7 @@ void spu_indirect_branch(spu_context* ctx)
             (ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS)) {
             spu_spurs_taskset_syscall(ctx);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
-            return;
+            return NULL;
         }
     }
     /* YDKJ_CRI_R4: the taskset policy entry (LS 0xA00, image 23) writes r4 into
@@ -3132,7 +3378,9 @@ void spu_indirect_branch(spu_context* ctx)
         if (ti) ctx->resident_task = ti;
     }
     /* Use the same ownership order as the interpreter's rejoin probe. */
-    spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
+    int fn_reloc;
+    spu_fn fn = (spu_fn)spu_lifted_lookup_r(ctx, ctx->pc, &fn_reloc);
+    const int fn_plain = fn ? 1 | (fn_reloc ? 2 : 0) : 0;
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
@@ -3145,7 +3393,7 @@ void spu_indirect_branch(spu_context* ctx)
             fprintf(stderr, "[spurs-job] img=%d returned to the job manager \n",
                     ctx->image_id);
         spu_halt(ctx);
-        return;
+        return NULL;
     }
     /* Branch into high LS with no lifted code there.
      *
@@ -3189,7 +3437,7 @@ void spu_indirect_branch(spu_context* ctx)
                     fprintf(stderr, "[spu] img=%d exit: synthesised stop 0x%04X at LS 0x%05X\n",
                             ctx->image_id, ctx->stop_code, p0);
                 spu_halt(ctx);
-                return;
+                return NULL;
             }
         }
     }
@@ -3242,10 +3490,10 @@ void spu_indirect_branch(spu_context* ctx)
                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
                           "(runtime-loaded code)\n", ctx->image_id, p);
               spu_interp_run(ctx, p);
-              return;
+              return NULL;
           } }
         spu_halt(ctx);
-        return;
+        return NULL;
     }
     /* WWS job-code overlay match: the PM (image 2) streams a job module into the
      * code buffer (base = LS[0x1320]) and branches to base+entryOffset. Its 16-byte
@@ -3319,7 +3567,7 @@ void spu_indirect_branch(spu_context* ctx)
                     bs[0],bs[1],bs[2],bs[3], bs[4],bs[5],bs[6],bs[7],
                     bs[8],bs[9],bs[10],bs[11], bs[12],bs[13],bs[14],bs[15]);
         }
-        return;   /* enclosing SPU_DRAIN bracket resumes the dispatcher */
+        return NULL;   /* enclosing SPU_DRAIN bracket resumes the dispatcher */
     }
     /* JOB-BODY EXECUTION probe: the WWS job manager enters a staged job via
      * `bie pJobCode` (changeloadtorunjob.spu), an INDIRECT branch to
@@ -3420,18 +3668,9 @@ void spu_indirect_branch(spu_context* ctx)
                   s_dumped = 1; } } }
     }
     if (fn) {
-        spu_check_stack_reset(ctx, fn);
-        /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
-         * Bink decoder's per-command dispatch does) must not grow the host
-         * stack -- a plain call here leaked a resolver+callee frame per
-         * iteration and blew the thread stack ~4k iterations into the first
-         * really-decoding movie frame (silent 0x80000001 death). */
-#if defined(__clang__)
-        __attribute__((musttail)) return fn(ctx);
-#else
-        fn(ctx);
-        return;
-#endif
+        /* The caller runs the stack-reset check and tail-calls fn. */
+        *plain = fn_plain;
+        return fn;
     }
     /* wwsjob JOB-CODE entry probe: the PM stages each job's code into a
      * buffer above its static image (0x3700..) and branches into it. No lift
@@ -3455,7 +3694,7 @@ void spu_indirect_branch(spu_context* ctx)
                     "resuming PM at link 0x%05X\n", ctx->gpr[0]._u32[0] & SPU_LS_MASK);
         ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
         spu_indirect_branch(ctx);      /* re-dispatch at the rewritten pc */
-        return;
+        return NULL;
     }
 
     /* A SPURS *job* that branches back to LS 0 has RETURNED TO THE JOB MANAGER.
@@ -3478,7 +3717,7 @@ void spu_indirect_branch(spu_context* ctx)
             fprintf(stderr, "[spurs-job] img=%d returned to the job manager "
                     "(branch to LS 0) -- job complete\n", ctx->image_id);
         spu_halt(ctx);
-        return;
+        return NULL;
     }
     if (ctx->image_id == 2 &&
         ((ctx->pc >= 0x3700 && ctx->pc < 0x3FE80) ||
@@ -3515,7 +3754,7 @@ void spu_indirect_branch(spu_context* ctx)
      * image and calls it). Interpret the live LS bytes; on success the next
      * branch re-enters lifted code via the trampoline. */
     if (spu_smc_microstep(ctx))
-        return;
+        return NULL;
     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
      * image (the FMOD mixer's overlay calls) exhaust it and silently hide
      * every other image's misses -- LBP's loading jobs skipped their command
@@ -3585,6 +3824,125 @@ void spu_indirect_branch(spu_context* ctx)
             ctx->ls[0x2d4ec],ctx->ls[0x2d4ed],ctx->ls[0x2d4ee],ctx->ls[0x2d4ef]); }
     } }
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
+    return NULL;
+}
+
+/* Two copies of the resolver are compiled: this one for the cache's slow
+ * path and shadow checks, and spu_ib_old below, which is the dispatcher of
+ * PS3_SPU_IB_FAST=0 in its original shape (resolve, stack-reset check, tail
+ * call, all in one frame), so the A/B baseline pays no extra call. */
+static SPU_IB_NOINLINE spu_fn spu_ib_resolve_call(spu_context* ctx, int* plain)
+{
+    return spu_ib_resolve(ctx, plain);
+}
+
+static SPU_IB_NOINLINE void spu_ib_old(spu_context* ctx)
+{
+    int plain;
+    spu_fn fn = spu_ib_resolve(ctx, &plain);
+    if (!fn) return;
+    spu_check_stack_reset(ctx, fn);
+    SPU_IB_TAILCALL(fn(ctx));
+}
+
+/* Shadow mode: the target cache's answer for this branch against the full
+ * resolver's, run from the same state. Returns what the resolver returned. */
+static SPU_IB_NOINLINE spu_fn spu_ib_shadow(spu_context* ctx, int* plain)
+{
+    if (ctx->ibc_shadow_inflight) {
+        /* The previous compared resolve never came back (it halted or
+         * unwound): the cache answered a branch the resolver did not take. */
+        ctx->ibc_shadow_inflight = 0;
+        if (__atomic_fetch_add(&s_ibf_escapes, 1, __ATOMIC_RELAXED) < 16)
+            fprintf(stderr, "[spu-ibfast] shadow escape: a cached branch's resolve did not return\n");
+    }
+    int task = 0;
+    const spu_ibc_entry* e = spu_ibc_find(ctx, ctx->pc, &task);
+    if (!e) {
+        /* Same tests as spu_ibc_find, in its order, to say which failed. */
+        const uint32_t pc = ctx->pc;
+        const spu_ibc_entry* x = &ctx->ibc[spu_ibc_index(pc)];
+        int why, t = ctx->resident_task;
+        if (ctx->irq_saved && ctx->int_enable &&
+            (pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK)) why = IBM_IRQ;
+        else if (ctx->ibc_epoch != __atomic_load_n(&g_spu_ib_epoch, __ATOMIC_ACQUIRE)) why = IBM_EPOCH;
+        else if (pc >= SPU_TASKSET_TASK_LO && g_spu_ib_tasks && !spu_ibc_task(ctx, pc, &t)) why = IBM_TASK;
+        else if (!x->fn) why = IBM_EMPTY;
+        else if (x->pc != pc) why = IBM_OTHER_PC;
+        else if (x->gen != ctx->ibc_gen) why = IBM_GEN;
+        else if (x->image != ctx->image_id || x->ovl != ctx->resident_ovl || x->task != t) why = IBM_KEY;
+        else why = IBM_PENDING;
+        __atomic_fetch_add(&s_ibf_why[why], 1, __ATOMIC_RELAXED);
+        unsigned long long n = __atomic_add_fetch(&s_ibf_misses, 1, __ATOMIC_RELAXED);
+        if ((n & ((1ull << 22) - 1)) == 0) spu_ib_shadow_report();
+        return spu_ib_resolve_call(ctx, plain);
+    }
+    const spu_fn want = e->fn;
+    const int32_t want_reloc = e->has_reloc ? e->reloc_delta : ctx->reloc_delta;
+    const uint32_t pc = ctx->pc, status = ctx->status, srr0 = ctx->srr0, ie = ctx->int_enable;
+    const uint32_t depth = ctx->host_depth, r3 = ctx->gpr[3]._u32[0];
+    const int img = ctx->image_id, ovl = ctx->resident_ovl, irq = ctx->irq_saved;
+    /* What the stack-reset check after a resolve would do (spu_ib_slow). */
+    const int reset = spu_stack_reset_needed(ctx) && spu_ib_is_stack_reset_pc(pc);
+    ctx->ibc_shadow_inflight = 1;
+    const spu_fn got = spu_ib_resolve_call(ctx, plain);
+    ctx->ibc_shadow_inflight = 0;
+    const int bad = got != want || !(*plain & 1) || ctx->pc != pc || ctx->resident_task != task ||
+                    ctx->reloc_delta != want_reloc || ctx->image_id != img ||
+                    ctx->resident_ovl != ovl || ctx->status != status || ctx->srr0 != srr0 ||
+                    ctx->int_enable != ie || ctx->irq_saved != irq || ctx->host_depth != depth ||
+                    ctx->gpr[3]._u32[0] != r3 || reset;
+    if (bad) {
+        if (__atomic_fetch_add(&s_ibf_bad, 1, __ATOMIC_RELAXED) < 16)
+            fprintf(stderr, "[spu-ibfast] shadow MISMATCH img=%d ovl=%d task=%d pc=0x%05X "
+                    "cached=%p/%d full=%p/%d plain=%d reset=%d\n", img, ovl, task, pc,
+                    (void*)want, (int)want_reloc, (void*)got, (int)ctx->reloc_delta, *plain, reset);
+        *plain = 0;   /* do not re-insert it */
+    }
+    unsigned long long n = __atomic_add_fetch(&s_ibf_hits, 1, __ATOMIC_RELAXED);
+    if ((n & ((1ull << 22) - 1)) == 0) spu_ib_shadow_report();
+    return got;
+}
+
+/* Everything that is not a cache hit: the full resolver, then the cache fill,
+ * the stack-reset check and the tail call the resolver used to make itself. */
+static SPU_IB_NOINLINE void spu_ib_slow(spu_context* ctx)
+{
+    int mode = __atomic_load_n(&g_spu_ib_fast, __ATOMIC_RELAXED);
+    if (mode < 0) {
+        spu_ib_fast_init();
+        mode = __atomic_load_n(&g_spu_ib_fast, __ATOMIC_RELAXED);
+    }
+    const uint32_t ep = __atomic_load_n(&g_spu_ib_epoch, __ATOMIC_ACQUIRE);
+    int plain = 0;
+    if (!mode) SPU_IB_TAILCALL(spu_ib_old(ctx));
+    spu_fn fn = mode == 2 ? spu_ib_shadow(ctx, &plain) : spu_ib_resolve_call(ctx, &plain);
+    if (!fn) return;
+    if (mode && (plain & 1)) spu_ibc_insert(ctx, fn, ep, plain & 2);
+    spu_check_stack_reset(ctx, fn);
+    /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
+     * Bink decoder's per-command dispatch does) must not grow the host
+     * stack -- a plain call here leaked a resolver+callee frame per
+     * iteration and blew the thread stack ~4k iterations into the first
+     * really-decoding movie frame (silent 0x80000001 death). */
+    SPU_IB_TAILCALL(fn(ctx));
+}
+
+void spu_indirect_branch(spu_context* ctx)
+{
+    /* The SPU ignores the target's two low bits and everything above the
+     * 256 KB local store (see spu_ib_resolve). */
+    ctx->pc &= SPU_LS_MASK & ~3u;
+    if (__builtin_expect(__atomic_load_n(&g_spu_ib_fast, __ATOMIC_RELAXED) == 1, 1)) {
+        int task;
+        const spu_ibc_entry* e = spu_ibc_find(ctx, ctx->pc, &task);
+        if (__builtin_expect(e != NULL, 1)) {
+            ctx->resident_task = task;
+            if (e->has_reloc) ctx->reloc_delta = e->reloc_delta;
+            SPU_IB_TAILCALL(e->fn(ctx));
+        }
+    }
+    SPU_IB_TAILCALL(spu_ib_slow(ctx));
 }
 
 /* ===========================================================================

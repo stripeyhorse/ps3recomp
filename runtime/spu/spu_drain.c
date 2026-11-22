@@ -78,16 +78,28 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 #define SPU_DRAIN_COLD __attribute__((noinline, cold))
 #define SPU_DRAIN_INLINE static inline __attribute__((always_inline))
 #endif
+#if defined(_MSC_VER)
+#define SPU_DRAIN_NOINLINE __declspec(noinline)
+#else
+#define SPU_DRAIN_NOINLINE __attribute__((noinline))
+#endif
 static SPU_DRAIN_COLD void spu_task_launch_slow(spu_context* ctx);
 
-/* Any of the step diagnostics below armed by the environment. */
-static int spu_task_launch_diagnostics(void)
+/* Any of the step diagnostics below armed by the environment. Read on every
+ * drain step: the cached answer is tested inline, only the first read is a
+ * call. */
+static int s_launch_diag = -1;
+static SPU_DRAIN_COLD int spu_task_launch_diagnostics_init(void)
 {
-    static int s_on = -1;
-    if (s_on < 0)
-        s_on = getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
-               getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN");
-    return s_on;
+    int on = getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
+             getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN");
+    __atomic_store_n(&s_launch_diag, on, __ATOMIC_RELAXED);
+    return on;
+}
+SPU_DRAIN_INLINE int spu_task_launch_diagnostics(void)
+{
+    int on = __atomic_load_n(&s_launch_diag, __ATOMIC_RELAXED);
+    return __builtin_expect(on < 0, 0) ? spu_task_launch_diagnostics_init() : on;
 }
 
 /* A drain may resolve the history TLS address once for its owning frame.
@@ -538,9 +550,56 @@ typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
 
+/* The drain's ordinary steps (PS3_SPU_IB_FAST, on by default): the same
+ * per-step work as the loop in spu_drain_call below, in the same order, in a
+ * function with no setjmp in it. A function that calls setjmp keeps its
+ * locals in memory across every call it makes, so the loop there reloaded the
+ * context pointer and its own state from the stack around each step. This one
+ * returns to spu_drain_call for everything else: the return point reached
+ * (SPU_DRAIN_STEPS_RETURN), the trampoline empty (..._EMPTY), or an interrupt
+ * pending before *take_fn runs (..._IRQ), which spu_drain_call takes in the
+ * frame its iret unwinds to. */
+enum { SPU_DRAIN_STEPS_EMPTY, SPU_DRAIN_STEPS_RETURN, SPU_DRAIN_STEPS_IRQ };
+static SPU_DRAIN_NOINLINE int spu_drain_steps(spu_context* ctx, uint32_t return_pc,
+    spu_recent_history* recent, void (**const tramp)(spu_context*),
+    void (**take_fn)(spu_context*))
+{
+    const uint32_t ret = return_pc & SPU_LS_MASK;
+    void (*fn)(spu_context*);
+    while ((fn = *tramp) != 0) {
+        if (fn == spu_indirect_branch && (ctx->pc & SPU_LS_MASK) == ret) {
+            *tramp = 0;
+            return SPU_DRAIN_STEPS_RETURN;
+        }
+        *tramp = 0;
+        ctx->drain_ret_pc = ret;   /* re-set: a nested drain changed it */
+        spu_drain_hop_inline(ctx, fn, recent);
+        if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+            *take_fn = fn;
+            return SPU_DRAIN_STEPS_IRQ;
+        }
+        if (fn == spu_indirect_branch && g_spu_ib_fast == 1) {
+            /* spu_indirect_branch's cache hit, made here (not in shadow mode,
+             * where spu_indirect_branch checks every hit): the step then
+             * calls the target itself instead of through the dispatcher. */
+            ctx->pc &= SPU_LS_MASK & ~3u;
+            int task;
+            const spu_ibc_entry* e = spu_ibc_find(ctx, ctx->pc, &task);
+            if (e) {
+                ctx->resident_task = task;
+                if (e->has_reloc) ctx->reloc_delta = e->reloc_delta;
+                fn = e->fn;
+            }
+        }
+        fn(ctx);
+    }
+    return SPU_DRAIN_STEPS_EMPTY;
+}
+
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
     if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
+    if (__builtin_expect(g_spu_ib_fast < 0, 0)) spu_ib_fast_init();
     spu_depth_guard_check(ctx);
     /* On the way out, the enclosing drain's return pc is the innermost one
      * again. It used to be 0 until that drain's next step re-set it, and with
@@ -563,8 +622,42 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
     void (**const tramp)(spu_context*) = &g_spu_trampoline_fn;
 
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = outer_ret_pc; } while (0)
+    const int steps_fn = g_spu_ib_fast > 0;   /* =0: the loop below, as before */
     for (;;) {
-        while (*tramp) {
+        if (steps_fn) {
+            void (*fn)(spu_context*) = 0;
+            const int r = spu_drain_steps(ctx, return_pc, recent, tramp, &fn);
+            if (r == SPU_DRAIN_STEPS_RETURN) {
+                SPU_DRAIN_POP_IRQ();
+                return;
+            }
+            if (r == SPU_DRAIN_STEPS_IRQ) {
+                /* Exactly the interrupt step of the loop below. */
+                void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
+                if (!ctx->int_enable) {
+                    if (ctx->irq_frame != &f) {
+                        f.prev = (spu_irq_frame*)ctx->irq_frame;
+                        f.depth = ctx->host_depth;
+                        f.image_id = ctx->image_id;
+                        ctx->irq_frame = &f;
+                    }
+                    if (SPU_SETJMP(f.env) == 0) {
+                        extern void spu_jmp_no_unwind(void*);   /* spu_channels.c */
+                        spu_jmp_no_unwind(f.env);
+                        vf(ctx);
+                    } else {
+                        ctx->host_depth = f.depth;
+                        ctx->image_id = f.image_id;
+                        *tramp = spu_indirect_branch;
+                        SPU_DRAIN_POP_IRQ();
+                    }
+                    continue;
+                }
+                fn(ctx);
+                continue;
+            }
+        }
+        while (!steps_fn && *tramp) {
             if (*tramp == spu_indirect_branch &&
                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
                 *tramp = 0;

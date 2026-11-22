@@ -179,6 +179,23 @@ typedef struct spu_channel {
 /* ---------------------------------------------------------------------------
  * SPU execution context
  * -----------------------------------------------------------------------*/
+/* One remembered indirect-branch resolution (spu_context.ibc). File scope so
+ * C and C++ name the same type. */
+struct spu_context;
+typedef struct spu_ibc_entry {
+    void (*fn)(struct spu_context*);
+    uint32_t pc, gen;
+    int32_t image, ovl, task;
+    int32_t reloc_delta;            /* valid when has_reloc */
+    uint8_t has_reloc;
+    /* The resident_code slot that answered, or SPU_IBC_NO_SLOT. A pending
+     * slot (code streamed in again, not yet re-verified) sends its entries
+     * back to the resolver, which verifies it; see spu_ibc_find. */
+    uint8_t slot;
+} spu_ibc_entry;
+#define SPU_IBC_NO_SLOT 0xFFu
+#define SPU_IBC_SLOT_PENDING 1   /* SPU_OVERLAY_PENDING (spu_channels.c) */
+
 typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
@@ -320,6 +337,7 @@ typedef struct spu_context {
      * resolutions of this context. */
     uint32_t dcache_id, dcache_residency;
 
+
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
      * for co-resident tasks. A taskset may hold several tasks that all lift at the
      * SAME LS base (the shared task-code region at LS 0x3000+), so an LS address
@@ -441,6 +459,19 @@ typedef struct spu_context {
      * costs one registry lookup and is never trusted. Written and read only
      * by the context's executing thread. */
     uint32_t mfc_slot_hint;
+
+    /* Indirect-branch target cache (PS3_SPU_IB_FAST, spu_channels.c), last so
+     * the fields above keep their places. Lives
+     * in the context, not in thread-local storage: on Darwin every TLS access
+     * is a call. An entry holds one resolution, keyed by its target, the
+     * context's image, overlay and task, and ibc_gen. ibc_gen moves whenever
+     * the resident code slots change (with dcache_residency) and whenever the
+     * global registration epoch moves past ibc_epoch, so a stale entry can
+     * never match. spu_context_init's memset leaves ibc_epoch at 0, which no
+     * epoch equals, so a fresh context starts with nothing cached. */
+    uint32_t ibc_gen, ibc_epoch;
+    uint32_t ibc_shadow_inflight;   /* shadow mode: a full resolve has not returned */
+    spu_ibc_entry ibc[512];
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own
@@ -957,6 +988,52 @@ void spu_irqwait_diag(spu_context* ctx);
 
 /* Drain a translated call up to its explicit architectural return PC. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc);
+/* PS3_SPU_IB_FAST (spu_channels.c): the per-context indirect-branch target
+ * cache and the drain's setjmp-free step loop. -1 until spu_ib_fast_init
+ * reads the environment, then 0 (off: the old path exactly), 1 (on) or 2
+ * (shadow: every cache hit is checked against the full resolver). */
+extern int g_spu_ib_fast;
+void spu_ib_fast_init(void);
+/* The cache probe, shared by spu_indirect_branch and the drain's step loop.
+ * Returns the entry that answers a branch to `pc` (already masked to a word
+ * in local store) or NULL; changes nothing. *task_out is the resident task
+ * the resolver would leave (spu_ib_resolve's order). See spu_channels.c. */
+extern uint32_t g_spu_ib_epoch;   /* moves with every resolver-relevant registration */
+extern int g_spu_ib_tasks;        /* any taskset task entry or ELF registered */
+int spu_ibc_task(const spu_context* ctx, uint32_t pc, int* task);
+#define SPU_TASKSET_TASK_LO 0x3000u   /* lowest LS address of the taskset task-code region */
+static inline unsigned spu_ibc_index(uint32_t pc)
+{
+    /* Fibonacci hash of the word address: lifted entries are not uniformly
+     * spaced, and a plain low-bits index collided often (shadow mode counts). */
+    enum { BITS = 9 };   /* log2 of the entry count */
+    typedef char ibc_size_check[(sizeof(((spu_context*)0)->ibc) /
+                                 sizeof(((spu_context*)0)->ibc[0])) == (1u << BITS) ? 1 : -1];
+    (void)sizeof(ibc_size_check);
+    return ((pc >> 2) * 0x9E3779B1u) >> (32 - BITS);
+}
+static inline const spu_ibc_entry* spu_ibc_find(const spu_context* ctx, uint32_t pc,
+                                                       int* task_out)
+{
+    /* An interrupt return: spu_irq_regs_maybe_restore acts exactly here. */
+    if (ctx->irq_saved && ctx->int_enable &&
+        (pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK)) return 0;
+    if (ctx->ibc_epoch != __atomic_load_n(&g_spu_ib_epoch, __ATOMIC_ACQUIRE)) return 0;
+    int task = ctx->resident_task;
+    if (pc < SPU_TASKSET_TASK_LO) task = 0;
+    else if (__atomic_load_n(&g_spu_ib_tasks, __ATOMIC_ACQUIRE) && !spu_ibc_task(ctx, pc, &task))
+        return 0;   /* the resolver may adopt a task and unwind */
+    const spu_ibc_entry* e = &ctx->ibc[spu_ibc_index(pc)];
+    if (((e->pc ^ pc) | (e->gen ^ ctx->ibc_gen) |
+         (uint32_t)(e->image ^ ctx->image_id) | (uint32_t)(e->ovl ^ ctx->resident_ovl) |
+         (uint32_t)(e->task ^ task)) != 0)
+        return 0;
+    if (e->slot != SPU_IBC_NO_SLOT &&
+        ctx->resident_code[e->slot].verify_state == SPU_IBC_SLOT_PENDING)
+        return 0;   /* the resolver re-verifies the reloaded code first */
+    *task_out = task;
+    return e;
+}
 /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
  *
  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
