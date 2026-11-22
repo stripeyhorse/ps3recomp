@@ -2049,6 +2049,21 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     return 0;
 }
 
+/* PS3_SPURS_LANES_OF_2=<n> (experiment): run a two-SPU instance's work on n
+ * host lanes instead of two. n=1 serialises it, which measured PAIN's ICE
+ * Mesh frame at 82 ms against 49 ms on two lanes: about 65 ms of mesh work a
+ * frame that does divide between lanes. n=3 or 4 lets host threads beyond the
+ * guest's SPU count take jobs from the same lists; the guest still sees two
+ * SPUs, and an extra lane uses the priority row of the guest lane it shadows
+ * (sn % nspus). Unset, every instance runs exactly its own SPU count. */
+static u32 spurs_host_lanes(const struct SpursInst* si)
+{
+    static int lanes_of_2 = -1;
+    if (lanes_of_2 < 0) { const char* e = getenv("PS3_SPURS_LANES_OF_2"); lanes_of_2 = e ? atoi(e) : 0; }
+    if (si->nspus != 2 || lanes_of_2 <= 0) return si->nspus;
+    return (u32)lanes_of_2 > 6u ? 6u : (u32)lanes_of_2;
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
@@ -2078,7 +2093,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         AcquireSRWLockExclusive(&s_workload_registry_lock);
         if (!kick_pass) si->pass_no++;
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
-        for (u32 sn = 0; sn < si->nspus; sn++) {
+        const u32 admit = spurs_host_lanes(si);
+        for (u32 sn = 0; sn < admit; sn++) {
             struct SpursPmSlot* slot = &si->slots[sn];
             if (slot->busy) continue;
             const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
@@ -2089,7 +2105,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                     vm_read8(ea + wkl_state_off(wid)) != 2 ||
                     !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
                     continue;
-                if (!vm_read8(ea + wkl_info_off(wid) + 0x18 + sn))
+                if (!vm_read8(ea + wkl_info_off(wid) + 0x18 + sn % si->nspus))
                     continue; /* priority zero makes this physical lane ineligible */
                 u32 maxcont = wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2);
                 if (!maxcont || si->active[wid] >= maxcont) continue;
@@ -2142,7 +2158,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
       g_spu_line_commit_hook = spurs_commit_hook; }
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
-    for (u32 sn = 0; sn < si->nspus; sn++) {
+    for (u32 sn = 0; sn < spurs_host_lanes(si); sn++) {
         struct SpursPmSlot* slot = &si->slots[sn];
         memset(slot, 0, sizeof(*slot));
         slot->instance = si; slot->spu_num = sn;
@@ -2156,7 +2172,7 @@ failed:
     AcquireSRWLockExclusive(&si->lock);
     si->stopping = 1; WakeAllConditionVariable(&si->wake);
     ReleaseSRWLockExclusive(&si->lock);
-    for (u32 sn = 0; sn < si->nspus; sn++) {
+    for (u32 sn = 0; sn < spurs_host_lanes(si); sn++) {
         HANDLE h = si->slots[sn].thread;
         if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
     }
@@ -2176,7 +2192,7 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
     si->stopping = 1; WakeAllConditionVariable(&si->wake);
     ReleaseSRWLockExclusive(&si->lock);
     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
-    for (u32 sn = 0; sn < si->nspus; sn++) {
+    for (u32 sn = 0; sn < spurs_host_lanes(si); sn++) {
         HANDLE h = si->slots[sn].thread;
         if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
     }
