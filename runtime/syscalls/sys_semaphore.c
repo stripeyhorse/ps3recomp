@@ -356,6 +356,116 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
 void* ppu_gcm_wait_pump(void (**pump)(void));
 void* ppu_gcm_wait_pump_absent(void (**pump)(void)) { *pump = NULL; return NULL; }
 #pragma comment(linker, "/alternatename:ppu_gcm_wait_pump=ppu_gcm_wait_pump_absent")
+#else
+/* The same on POSIX (PS3_GCM_WAIT_PUMP, default on). A wait that blocks parks
+ * here; cellGcmSys.c kicks (sys_semaphore_pump.h) when it posts a vblank,
+ * flip completion or user command, and one parked waiter wakes, runs the GCM
+ * callback pump it registered (ppu_gcm_pump) on its own thread and waits again. PAIN's main
+ * thread waits on a semaphore its own vblank handler posts: without this the
+ * handler ran at some other guest thread's next HLE call, about a millisecond
+ * late on average and up to a whole vblank. Without GCM nothing registers a
+ * pump and a wait never parks.
+ *
+ * Lock order: the semaphore table lock, the park list lock, a semaphore's
+ * mutex. A waiter registers and unregisters with neither of the others held,
+ * and stays counted in `waiters` while it pumps, so a destroy still sees it
+ * (EBUSY). The kick takes the table lock and skips a destroyed semaphore, so
+ * it never touches a mutex a destroy has torn down. */
+#include <pthread.h>
+#include <stdatomic.h>
+#include "sys_semaphore_pump.h"   /* the pump GCM registers, the kick it calls */
+PS3_SEM_PUMP_GLUE_DEFINE;
+static void sem_pump(void)
+{
+    const ps3_sem_pump_fn f = atomic_load(&g_ps3_sem_pump_glue.pump);
+    if (f) f();
+}
+static int sem_pump_pending(void)
+{
+    const ps3_sem_pending_fn f = atomic_load(&g_ps3_sem_pump_glue.pending);
+    return f ? f() : 0;
+}
+
+typedef struct sem_parked {
+    sys_semaphore_info* s;
+    int kicked;                     /* under s->mtx */
+    struct sem_parked* next;        /* under s_park_lock */
+} sem_parked;
+static pthread_mutex_t s_park_lock = PTHREAD_MUTEX_INITIALIZER;
+static sem_parked* s_parked;
+static atomic_int s_parked_count;
+static _Thread_local sem_parked s_park_self;
+static _Thread_local int s_park_active;
+
+static int sem_wait_pump_on(void)
+{
+    static atomic_int v;            /* 0 = not read yet, else 1 + the setting */
+    int c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (!c) {
+        const char* e = getenv("PS3_GCM_WAIT_PUMP");
+        c = 1 + !(e && *e == '0');
+        atomic_store_explicit(&v, c, memory_order_relaxed);
+    }
+    return c == 2 && atomic_load(&g_ps3_sem_pump_glue.pump) != NULL;
+}
+
+/* Wake one parked waiter to pump. The GCM side calls it, through the glue,
+ * from its tick threads. */
+static void sem_kick_pump(void)
+{
+    /* Sequentially consistent with the waiter's registration and its look at
+     * the pending work: either this sees the waiter or the waiter sees the
+     * work (the registered pending check). */
+    if (!atomic_load(&s_parked_count)) return;
+    sem_table_lock();
+    pthread_mutex_lock(&s_park_lock);
+    sem_parked* w = s_parked;
+    if (w && w->next) {             /* rotate: the next kick picks another */
+        sem_parked* last = w;
+        while (last->next) last = last->next;
+        s_parked = w->next;
+        w->next = NULL;
+        last->next = w;
+    }
+    if (w && w->s->active) {
+        pthread_mutex_lock(&w->s->mtx);
+        w->kicked = 1;
+        pthread_cond_broadcast(&w->s->cv);
+        pthread_mutex_unlock(&w->s->mtx);
+        atomic_fetch_add_explicit(&g_ps3_sem_pump_glue.kicks, 1u, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&s_park_lock);
+    sem_table_unlock();
+}
+
+
+/* Without s->mtx held. 0: not parked (off, or a wait nested in a pump);
+ * 1: parked; 2: parked with work already pending: pump before waiting. */
+static int sem_park(sys_semaphore_info* s)
+{
+    if (s_park_active || !sem_wait_pump_on()) return 0;
+    if (!atomic_load(&g_ps3_sem_pump_glue.kick)) atomic_store(&g_ps3_sem_pump_glue.kick, sem_kick_pump);
+    s_park_active = 1;
+    s_park_self.s = s;
+    s_park_self.kicked = 0;
+    pthread_mutex_lock(&s_park_lock);
+    s_park_self.next = s_parked;
+    s_parked = &s_park_self;
+    pthread_mutex_unlock(&s_park_lock);
+    atomic_fetch_add(&s_parked_count, 1);
+    return sem_pump_pending() ? 2 : 1;
+}
+
+/* Without s->mtx held. */
+static void sem_unpark(void)
+{
+    atomic_fetch_sub(&s_parked_count, 1);
+    pthread_mutex_lock(&s_park_lock);
+    for (sem_parked** at = &s_parked; *at; at = &(*at)->next)
+        if (*at == &s_park_self) { *at = s_park_self.next; break; }
+    pthread_mutex_unlock(&s_park_lock);
+    s_park_active = 0;
+}
 #endif
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
@@ -456,14 +566,25 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 #else
     pthread_mutex_lock(&s->mtx);
 
-    if (timeout_us == 0) {
-        while (s->value <= 0) {
-            s->waiters++;
-            pthread_cond_wait(&s->cv, &s->mtx);
-            s->waiters--;
-        }
-    } else {
-        struct timespec ts;
+    /* A wait that blocks parks for the GCM pump (PS3_GCM_WAIT_PUMP, above),
+     * so a vblank, flip or user command that arrives while every guest
+     * thread is blocked is delivered at once, by this thread, as the Windows
+     * path does with its pump event. Parking happens without the semaphore's
+     * mutex held (lock order). */
+    int parked = 0;
+    if (s->value <= 0 && sem_wait_pump_on()) {
+        /* Counted as a waiter across the gap, as it is in cond_wait: a
+         * destroy meanwhile must still see it blocked (EBUSY). */
+        s->waiters++;
+        pthread_mutex_unlock(&s->mtx);
+        parked = sem_park(s);
+        if (parked == 2) sem_pump();
+        pthread_mutex_lock(&s->mtx);
+        s->waiters--;
+    }
+
+    struct timespec ts;
+    if (timeout_us != 0) {
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec  += (time_t)(timeout_us / 1000000);
         ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
@@ -471,19 +592,31 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        while (s->value <= 0) {
-            s->waiters++;
-            int rc = pthread_cond_timedwait(&s->cv, &s->mtx, &ts);
+    }
+    while (s->value <= 0) {
+        if (parked && s_park_self.kicked) {
+            s_park_self.kicked = 0;
+            s->waiters++;           /* still a waiter while it pumps (destroy) */
+            pthread_mutex_unlock(&s->mtx);
+            sem_pump();
+            pthread_mutex_lock(&s->mtx);
             s->waiters--;
-            if (rc == ETIMEDOUT) {
-                pthread_mutex_unlock(&s->mtx);
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
-            }
+            continue;
+        }
+        s->waiters++;
+        const int rc = timeout_us == 0 ? pthread_cond_wait(&s->cv, &s->mtx)
+                                       : pthread_cond_timedwait(&s->cv, &s->mtx, &ts);
+        s->waiters--;
+        if (rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&s->mtx);
+            if (parked) sem_unpark();
+            return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
     }
 
     s->value--;
     pthread_mutex_unlock(&s->mtx);
+    if (parked) sem_unpark();
 #endif
 
     return CELL_OK;

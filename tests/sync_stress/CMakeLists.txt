@@ -130,6 +130,23 @@ endif()
 add_test(NAME sync_semantics COMMAND test_sync_semantics)
 set_tests_properties(sync_semantics PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
 
+# PS3_GCM_WAIT_PUMP: a blocked sys_semaphore_wait woken by a GCM tick to run
+# the callback pump (POSIX; the fixture supplies the GCM side).
+if(NOT WIN32)
+    add_executable(test_sem_wait_pump
+        test_sem_wait_pump.c test_shims.c
+        "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_sem_wait_pump PRIVATE Threads::Threads)
+    target_include_directories(test_sem_wait_pump PRIVATE
+        "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
+        "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
+    target_compile_options(test_sem_wait_pump PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    add_test(NAME sem_wait_pump COMMAND test_sem_wait_pump)
+    set_tests_properties(sem_wait_pump PROPERTIES LABELS "runtime;sync" TIMEOUT 120)
+endif()
+
 # cellSyncMutex*: CELL_SYNC_ERROR_ALIGN for a mutex that is not 4-byte aligned.
 # Links libs/sync/cellSync.c alone; the SPU lock-line hooks are stubbed.
 add_executable(test_cellsync_mutex

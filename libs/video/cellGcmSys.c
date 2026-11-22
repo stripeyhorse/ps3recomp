@@ -805,6 +805,7 @@ void cellGcmResetFlipStatus(void)
     FLIP_UNLOCK();
 }
 
+static void gcm_flipstat_note(int waiting);   /* the stats line, below */
 /* NID: 0xE315A0B2 */
 u32 cellGcmGetFlipStatus(void)
 {
@@ -820,7 +821,9 @@ u32 cellGcmGetFlipStatus(void)
       if (fd && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
-    return s_flip_status;
+    const u32 status = s_flip_status;
+    gcm_flipstat_note(status == CELL_GCM_FLIP_STATUS_WAITING);
+    return status;
 }
 
 /* Host-side ticks. The game's host driver (e.g. flow main.cpp) calls
@@ -850,12 +853,301 @@ static volatile LONG s_gcm_pumping = 0;
 #else
 #include <stdatomic.h>
 static atomic_int s_gcm_pending = 0;
-#define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
+static void gcm_pump_wake(void);   /* PS3_GCM_WAIT_PUMP, below */
+#define GCM_PENDING_SET(bits)  (atomic_fetch_or(&s_gcm_pending, (bits)), gcm_pump_wake())
 #define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
 static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_TRY_ENTER() (!atomic_flag_test_and_set_explicit(&s_gcm_pumping, memory_order_acquire))
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
+
+/* ---------------------------------------------------------------------------
+ * Counted vblank delivery (PS3_VBLANK_COUNTED, default on).
+ *
+ * On hardware every vblank raises its own interrupt and the guest's handler
+ * runs once per vblank. Here a tick only marks work pending, and a guest
+ * thread delivers it when it next reaches an HLE call or a timer sleep. With
+ * a single pending bit, two ticks between pumps ran the handler once: PAIN's
+ * handler (0x00198A50) adds one to the game's own vblank counter per call and
+ * posts the frame semaphore when that counter reaches two (the frame resets it
+ * when its wait returns), so every coalesced tick added a whole vblank to some
+ * frame and nothing ever won it back.
+ *
+ * Counted: every tick is published in order in a small ring (its vblank count
+ * and host time), and a pump delivers every tick published since the last one
+ * it delivered, oldest first, each with that tick's count. Delivery still
+ * happens only in a guest thread's pump, serialized by the pump guard, as
+ * before. The backlog a pump will replay is bounded (PS3_VBLANK_BACKLOG,
+ * default 8 ticks; 133 ms at 60 Hz): far above any gap between pumps in a
+ * running game, so normal play never drops one, but a guest that stopped
+ * pumping altogether (a debugger, a suspended host, a long blocking load) is
+ * not handed a burst of handler calls on resume. The excess is counted as
+ * dropped. PS3_VBLANK_COUNTED=0 restores the single pending bit.
+ *
+ * Counting alone does not make delivery timely: a tick delivered in the same
+ * burst right behind the one that posted is counted before the woken frame
+ * resets the counter, and is lost to the game as surely as a coalesced one.
+ * What keeps the backlog at one is delivering at the tick, which on POSIX is
+ * PS3_GCM_WAIT_PUMP (below): the blocked frame thread is woken to pump.
+ *
+ * The ring is written by one ticker thread (the port's vblank clock, or its
+ * frame loop). Ticks from two threads at once would still all be delivered;
+ * only the recorded count and time of a tick could then be a neighbour's.
+ * -----------------------------------------------------------------------*/
+#define GCM_VB_RING 64u                  /* > the largest backlog allowed */
+#ifdef _WIN32
+typedef volatile LONG   gcm_a32;
+typedef volatile LONG64 gcm_a64;
+#define GCM_A32_LOAD(x)      ((u32)InterlockedCompareExchange(&(x), 0, 0))
+#define GCM_A32_STORE(x, v)  InterlockedExchange(&(x), (LONG)(v))
+#define GCM_A32_ADD(x, v)    InterlockedExchangeAdd(&(x), (LONG)(v))
+#define GCM_A32_XCHG(x, v)   ((u32)InterlockedExchange(&(x), (LONG)(v)))
+#define GCM_A64_LOAD(x)      ((u64)InterlockedCompareExchange64(&(x), 0, 0))
+#define GCM_A64_STORE(x, v)  InterlockedExchange64(&(x), (LONG64)(v))
+#define GCM_A64_ADD(x, v)    InterlockedExchangeAdd64(&(x), (LONG64)(v))
+#define GCM_A64_XCHG(x, v)   ((u64)InterlockedExchange64(&(x), (LONG64)(v)))
+#define GCM_A32_PUBLISH(x)   InterlockedIncrement(&(x))
+#define GCM_A32_ACQUIRE(x)   GCM_A32_LOAD(x)
+#else
+typedef _Atomic(u32) gcm_a32;
+typedef _Atomic(u64) gcm_a64;
+#define GCM_A32_LOAD(x)      atomic_load_explicit(&(x), memory_order_relaxed)
+#define GCM_A32_STORE(x, v)  atomic_store_explicit(&(x), (v), memory_order_relaxed)
+#define GCM_A32_ADD(x, v)    atomic_fetch_add_explicit(&(x), (v), memory_order_relaxed)
+#define GCM_A32_XCHG(x, v)   atomic_exchange_explicit(&(x), (v), memory_order_relaxed)
+#define GCM_A64_LOAD(x)      atomic_load_explicit(&(x), memory_order_relaxed)
+#define GCM_A64_STORE(x, v)  atomic_store_explicit(&(x), (v), memory_order_relaxed)
+#define GCM_A64_ADD(x, v)    atomic_fetch_add_explicit(&(x), (v), memory_order_relaxed)
+#define GCM_A64_XCHG(x, v)   atomic_exchange_explicit(&(x), (v), memory_order_relaxed)
+#define GCM_A32_PUBLISH(x)   atomic_fetch_add_explicit(&(x), 1u, memory_order_release)
+#define GCM_A32_ACQUIRE(x)   atomic_load_explicit(&(x), memory_order_acquire)
+#endif
+
+static struct { gcm_a64 t_ns; gcm_a32 count; } s_vb_ring[GCM_VB_RING];
+static gcm_a32 s_vb_published;    /* ticks published, ever (monotonic) */
+static u32     s_vb_delivered;    /* ticks delivered or dropped; pump guard only */
+/* Handler changed: 1 << 32 | ticks published when it did. What was owed
+ * then is skipped; ticks after it are the new handler's. */
+static gcm_a64 s_vb_resync;
+/* Counters for the stats line. */
+static gcm_a32 s_vb_callbacks, s_vb_coalesced, s_vb_dropped, s_vb_max_backlog;
+static gcm_a64 s_vb_lat_sum_us, s_vb_lat_max_us;
+static gcm_a32 s_vb_lat_hist[8];  /* <0.25 <0.5 <1 <2 <4 <8 <16 >=16 ms */
+static gcm_a32 s_flip_done_count, s_flipstat_polls, s_flipstat_waiting;
+static gcm_a64 s_flip_lat_sum_us, s_flip_lat_max_us;
+/* Guest flip requests and the spacing between them (the guest's frame
+ * boundary), in 4 ms bins: 0-4, 4-8, ... 60-64, 64+. */
+static gcm_a32 s_flipreq_count, s_flipreq_hist[17];
+static gcm_a64 s_flipreq_last_ns;
+
+/* Startup switches, read once; cached atomically because the pump and the
+ * ticker ask from different threads (0 = not read yet, else 1 + value). */
+static u32 gcm_env_once(gcm_a32* slot, const char* name, u32 (*parse)(const char*))
+{
+    u32 c = GCM_A32_LOAD(*slot);
+    if (!c) { c = 1u + parse(getenv(name)); GCM_A32_STORE(*slot, c); }
+    return c - 1u;
+}
+static u32 gcm_parse_default_on(const char* e) { return !(e && *e == '0'); }
+static u32 gcm_parse_default_off(const char* e) { return e && *e && *e != '0'; }
+static u32 gcm_parse_backlog(const char* e)
+{
+    const int n = e && *e ? atoi(e) : 8;
+    return (u32)(n < 1 ? 1 : n > (int)GCM_VB_RING - 4 ? (int)GCM_VB_RING - 4 : n);
+}
+
+static int gcm_vblank_counted(void)
+{
+    static gcm_a32 v;
+    return (int)gcm_env_once(&v, "PS3_VBLANK_COUNTED", gcm_parse_default_on);
+}
+
+static u32 gcm_vblank_backlog_max(void)
+{
+    static gcm_a32 v;
+    return gcm_env_once(&v, "PS3_VBLANK_BACKLOG", gcm_parse_backlog);
+}
+
+static int gcm_vblank_stats_on(void)
+{
+    static gcm_a32 v;
+    return (int)gcm_env_once(&v, "PS3_VBLANK_STATS", gcm_parse_default_off);
+}
+
+static void gcm_stat_max64(gcm_a64* slot, u64 v)
+{
+    u64 cur = GCM_A64_LOAD(*slot);
+    while (v > cur) {
+#ifdef _WIN32
+        const u64 seen = (u64)InterlockedCompareExchange64(slot, (LONG64)v, (LONG64)cur);
+        if (seen == cur) break;
+        cur = seen;
+#else
+        if (atomic_compare_exchange_weak_explicit(slot, &cur, v, memory_order_relaxed,
+                                                  memory_order_relaxed)) break;
+#endif
+    }
+}
+
+/* One line with everything needed to tell whether the vblank lock held:
+ * ticks published against callbacks delivered, ticks lost to coalescing
+ * (PS3_VBLANK_COUNTED=0) or to the backlog bound, the largest backlog one pump
+ * replayed, and how long a tick waited for its callback. */
+static u32 gcm_park_wakes_read(void);   /* PS3_GCM_WAIT_PUMP, below */
+
+void cellGcm_vblank_stats_line(char* out, size_t size)
+{
+    const u32 pub = GCM_A32_LOAD(s_vb_published), cb = GCM_A32_LOAD(s_vb_callbacks);
+    const u64 lat = GCM_A64_LOAD(s_vb_lat_sum_us), fl = GCM_A64_LOAD(s_flip_lat_sum_us);
+    const u32 fd = GCM_A32_LOAD(s_flip_done_count);
+    u32 h[8];
+    for (int i = 0; i < 8; i++) h[i] = GCM_A32_LOAD(s_vb_lat_hist[i]);
+    char bins[17 * 11 + 1];
+    size_t at = 0;
+    for (int i = 0; i < 17 && at < sizeof bins; i++)
+        at += (size_t)snprintf(bins + at, sizeof bins - at, i ? "/%u" : "%u",
+                               GCM_A32_LOAD(s_flipreq_hist[i]));
+    snprintf(out, size,
+             "[vblank] t=%.3f mode=%s ticks=%u callbacks=%u coalesced=%u dropped=%u max_backlog=%u "
+             "delivery_us mean=%.0f max=%llu hist_ms<.25/.5/1/2/4/8/16/+=%u/%u/%u/%u/%u/%u/%u/%u "
+             "flips_done=%u flip_done_us mean=%.0f max=%llu flipstatus_polls=%u waiting=%u "
+             "flip_requests=%u interval_4ms_bins=%s wait_pump_wakes=%u",
+             (double)get_timestamp_ns() / 1e9, gcm_vblank_counted() ? "counted" : "bit", pub, cb, GCM_A32_LOAD(s_vb_coalesced),
+             GCM_A32_LOAD(s_vb_dropped), GCM_A32_LOAD(s_vb_max_backlog),
+             cb ? (double)lat / cb : 0.0, (unsigned long long)GCM_A64_LOAD(s_vb_lat_max_us),
+             h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+             fd, fd ? (double)fl / fd : 0.0, (unsigned long long)GCM_A64_LOAD(s_flip_lat_max_us),
+             GCM_A32_LOAD(s_flipstat_polls), GCM_A32_LOAD(s_flipstat_waiting),
+             GCM_A32_LOAD(s_flipreq_count), bins, gcm_park_wakes_read());
+}
+
+static void gcm_flipreq_note(u64 now_ns)
+{
+    const u64 last = GCM_A64_XCHG(s_flipreq_last_ns, now_ns);
+    GCM_A32_ADD(s_flipreq_count, 1u);
+    if (!last || now_ns <= last) return;
+    const u64 bin = (now_ns - last) / 4000000u;
+    GCM_A32_ADD(s_flipreq_hist[bin > 16 ? 16 : bin], 1u);
+}
+
+static void gcm_flipstat_note(int waiting)
+{
+    GCM_A32_ADD(s_flipstat_polls, 1u);
+    if (waiting) GCM_A32_ADD(s_flipstat_waiting, 1u);
+}
+
+static void gcm_vblank_stats_print(void)
+{
+    char line[768];
+    cellGcm_vblank_stats_line(line, sizeof line);
+    fprintf(stderr, "%s%c", line, 10);
+}
+
+/* Publish one tick: its count (the vblank count after this tick's increment)
+ * and host time go into the ring BEFORE the published total moves, so a pump
+ * that sees the total also sees the entry. */
+static void gcm_vblank_publish(u32 count_after)
+{
+    const u32 next = GCM_A32_LOAD(s_vb_published) + 1u;
+    const u64 now = get_timestamp_ns();
+    GCM_A64_STORE(s_vb_ring[next % GCM_VB_RING].t_ns, now);
+    GCM_A32_STORE(s_vb_ring[next % GCM_VB_RING].count, count_after);
+    GCM_A32_PUBLISH(s_vb_published);
+    if (gcm_vblank_stats_on()) {
+        static u64 last_print;
+        static int registered;
+        if (!registered) { registered = 1; last_print = now; atexit(gcm_vblank_stats_print); }
+        if (now - last_print >= 10000000000ull) { last_print = now; gcm_vblank_stats_print(); }
+    }
+}
+
+static u32 gcm_vblank_note_latency(u32 tick, u64 now_ns)
+{
+    const u64 t = GCM_A64_LOAD(s_vb_ring[tick % GCM_VB_RING].t_ns);
+    const u64 us = now_ns > t ? (now_ns - t) / 1000u : 0;
+    GCM_A64_ADD(s_vb_lat_sum_us, us);
+    gcm_stat_max64(&s_vb_lat_max_us, us);
+    int b = 0;
+    for (u64 edge = 250; b < 7 && us >= edge; edge *= 2) b++;
+    GCM_A32_ADD(s_vb_lat_hist[b], 1u);
+    return us > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)us;
+}
+
+/* A port's view of each vblank callback as it is delivered, after the guest
+ * handler returned: the handler's descriptor, the tick's vblank count, its
+ * place in this pump's burst (0 = the first tick this pump delivered) and
+ * its age in microseconds. Diagnostics only; a port uses it to read its own
+ * guest state (PAIN: whether the game counted the tick into a frame that was
+ * already over). Called inside the pump guard. */
+typedef void (*cellGcm_vblank_observer_fn)(u32 opd, u32 count, u32 burst_index, u32 age_us);
+#ifdef _WIN32
+static cellGcm_vblank_observer_fn volatile s_vb_observer;
+void cellGcm_set_vblank_observer(cellGcm_vblank_observer_fn fn)
+{
+    InterlockedExchangePointer((PVOID volatile*)&s_vb_observer, (PVOID)fn);
+}
+#define GCM_VB_OBSERVER() ((cellGcm_vblank_observer_fn)s_vb_observer)
+#else
+static _Atomic(cellGcm_vblank_observer_fn) s_vb_observer;
+void cellGcm_set_vblank_observer(cellGcm_vblank_observer_fn fn) { atomic_store(&s_vb_observer, fn); }
+#define GCM_VB_OBSERVER() atomic_load(&s_vb_observer)
+#endif
+
+static void ydkj_restore_handler_opd(u32 opd, u32 code);
+
+/* Under the pump guard: run the guest vblank handler for the ticks owed.
+ * `bit` is the legacy pending bit this pump took. */
+static void gcm_vblank_deliver(int bit)
+{
+    /* The resync point first: it was read from the published total, so the
+     * total read after it is never behind it. */
+    const u64 resync = GCM_A64_XCHG(s_vb_resync, 0u);
+    const u32 published = GCM_A32_ACQUIRE(s_vb_published);
+    u32 done = s_vb_delivered;
+    const int handler = s_vblank_handler_opd && g_ps3_guest_caller;
+    if (resync && (u32)resync - done < 0x80000000u) done = s_vb_delivered = (u32)resync;
+    u32 backlog = published - done;
+    if (!gcm_vblank_counted()) {
+        /* Legacy, exactly as before: the pending bit runs the handler once,
+         * with the current count, however many ticks passed. The rest are
+         * only counted, as coalesced. */
+        s_vb_delivered = published;
+        if (!bit || !handler) return;
+        if (backlog > 1) GCM_A32_ADD(s_vb_coalesced, backlog - 1u);
+        GCM_A32_ADD(s_vb_callbacks, 1u);
+        const u32 age_us = gcm_vblank_note_latency(published, get_timestamp_ns());
+        const cellGcm_vblank_observer_fn observer = GCM_VB_OBSERVER();
+        ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)GCM_VBLANK_READ(), 0, 0, 0, 0, 0, 0, 0);
+        if (observer) observer(s_vblank_handler_opd, GCM_VBLANK_READ(), 0, age_us);
+        return;
+    }
+    /* No handler: what is owed belongs to none. Without this (and the resync
+     * above) a handler set after a stretch with none would be called for
+     * every tick in between, up to the bound. */
+    if (!handler) { s_vb_delivered = published; return; }
+    if (!backlog) return;
+    const u32 cap = gcm_vblank_backlog_max();
+    if (backlog > cap) {
+        GCM_A32_ADD(s_vb_dropped, backlog - cap);
+        done = published - cap;
+        backlog = cap;
+    }
+    if (backlog > GCM_A32_LOAD(s_vb_max_backlog)) GCM_A32_STORE(s_vb_max_backlog, backlog);
+    const u64 now = get_timestamp_ns();
+    const cellGcm_vblank_observer_fn observer = GCM_VB_OBSERVER();
+    const u32 first = done + 1u;
+    while (done != published) {
+        const u32 tick = ++done;
+        s_vb_delivered = done;
+        GCM_A32_ADD(s_vb_callbacks, 1u);
+        const u32 age_us = gcm_vblank_note_latency(tick, now);
+        const u32 count = GCM_A32_LOAD(s_vb_ring[tick % GCM_VB_RING].count);
+        ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)count, 0, 0, 0, 0, 0, 0, 0);
+        if (observer) observer(s_vblank_handler_opd, count, done - first, age_us);
+    }
+}
 
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
@@ -863,7 +1155,7 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
 
 void cellGcm_request_tick(void)
 {
-    GCM_VBLANK_BUMP();
+    gcm_vblank_publish(GCM_VBLANK_BUMP() + 1u);
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
      * actually consumed up to `put`.
      *
@@ -922,7 +1214,47 @@ void* ppu_gcm_wait_pump(void (**pump)(void))
     *pump = ppu_gcm_pump;
     return (void*)s_gcm_pump_ev;
 }
+#else
+/* PS3_GCM_WAIT_PUMP (default on): the POSIX counterpart of the event above.
+ * A guest thread blocked in sys_semaphore_wait is parked there
+ * (sys_semaphore.c), and each tick, flip completion or user command kicks one
+ * parked thread awake to run the pump and go back to waiting. Without it
+ * nobody delivers while the guest's threads are all blocked: PAIN's main
+ * thread sits in a semaphore wait that its own vblank handler posts, so each
+ * frame waited for some other thread's next HLE call (about 1 ms on average,
+ * up to 16 here). On hardware the interrupt runs at the vblank. The two
+ * files meet only through runtime/syscalls/sys_semaphore_pump.h. */
+#include "../../runtime/syscalls/sys_semaphore_pump.h"
+PS3_SEM_PUMP_GLUE_DEFINE;
+void ppu_gcm_pump(void);
+
+/* For a waiter that has just parked: is there work it should pump at once
+ * (posted before it parked, so no kick will come for it)? */
+static int gcm_pump_pending(void)
+{
+    return atomic_load(&s_gcm_pending) != 0 || atomic_load(&s_user_pending) != 0;
+}
+
+static void gcm_pump_wake(void)
+{
+    /* Offer the semaphore code our pump (it reads the switch); pending first,
+     * so a waiter that sees the pump also sees the check. */
+    if (!atomic_load_explicit(&g_ps3_sem_pump_glue.pump, memory_order_acquire)) {
+        atomic_store(&g_ps3_sem_pump_glue.pending, gcm_pump_pending);
+        atomic_store(&g_ps3_sem_pump_glue.pump, ppu_gcm_pump);
+    }
+    const ps3_sem_pump_fn kick = atomic_load(&g_ps3_sem_pump_glue.kick);
+    if (kick) kick();
+}
 #endif
+static u32 gcm_park_wakes_read(void)
+{
+#ifdef _WIN32
+    return 0;
+#else
+    return atomic_load_explicit(&g_ps3_sem_pump_glue.kicks, memory_order_relaxed);
+#endif
+}
 
 /* GCM_HANDLER_THREAD=1: deliver the guest's vblank/flip/user handlers only on a
  * dedicated host thread, as the PS3 does on its GCM interrupt thread. Pumped at
@@ -936,9 +1268,16 @@ void ppu_gcm_pump(void);
 static unsigned long s_gcm_intr_tid = 0;
 static int gcm_handler_thread_on(void)
 {
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("GCM_HANDLER_THREAD"); v = (e && *e && *e != '0') ? 1 : 0; }
-    return v;
+    /* Every pump asks, from any guest thread: cache it atomically (0 = not
+     * read yet, else 1 + the setting). */
+    static gcm_a32 v;
+    u32 c = GCM_A32_LOAD(v);
+    if (!c) {
+        const char* e = getenv("GCM_HANDLER_THREAD");
+        c = 1u + ((e && *e && *e != '0') ? 1u : 0u);
+        GCM_A32_STORE(v, c);
+    }
+    return c == 2u;
 }
 #ifndef _WIN32
 #include <pthread.h>
@@ -985,14 +1324,12 @@ void ppu_gcm_pump(void)
     { static int d = -1; static unsigned nv, nf, calls;
       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
       if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
-               if ((calls % 20000) == 0)
+               if ((calls % 20000) == 0) {
                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
-                           calls, nv, nf, GCM_VBLANK_READ(), 10); } }
-    if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
-        ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
-        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)GCM_VBLANK_READ(),
-                           0, 0, 0, 0, 0, 0, 0);
-    }
+                           calls, nv, nf, GCM_VBLANK_READ(), 10);
+                   gcm_vblank_stats_print();
+               } } }
+    gcm_vblank_deliver((int)(p & 1));
     if (p & 2) {
         /* Delivery waits for a guest thread to reach an HLE call or a timer
          * sleep, so a newer flip may have been requested (status WAITING
@@ -1002,9 +1339,17 @@ void ppu_gcm_pump(void)
          * the flip handler, and hung with get == put on exactly that. Leave
          * the newer flip WAITING for the next tick. */
         FLIP_LOCK();
-        if (s_flip_tick_seq == s_flip_req_seq)
-            s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+        const int done = s_flip_tick_seq == s_flip_req_seq;
+        if (done) s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
         FLIP_UNLOCK();
+        if (done) {
+            /* Request (or status reset) to DONE, for the stats line. */
+            const u64 now = get_timestamp_ns(), req = s_last_flip_time;
+            const u64 us = now > req ? (now - req) / 1000u : 0;
+            GCM_A32_ADD(s_flip_done_count, 1u);
+            GCM_A64_ADD(s_flip_lat_sum_us, us);
+            gcm_stat_max64(&s_flip_lat_max_us, us);
+        }
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -1020,7 +1365,7 @@ void ppu_gcm_pump(void)
 
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
-void cellGcmTickVBlank(void) { GCM_VBLANK_BUMP(); GCM_PENDING_SET(1); }
+void cellGcmTickVBlank(void) { gcm_vblank_publish(GCM_VBLANK_BUMP() + 1u); GCM_PENDING_SET(1); }
 /* Only deliver a flip completion when a flip is actually outstanding.
  *
  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
@@ -3531,6 +3876,18 @@ u32 cellGcm_display_buffer_count(void)
 
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
+    /* PS3_TEST_FLIP_STALL=N,MS (test hook, off unless set): every Nth flip
+     * request holds the requesting guest thread for MS milliseconds first,
+     * which makes that frame late by MS. Used to check that the vblank pacing
+     * catches a late frame up instead of slipping. */
+    { static int every = -1, ms; static unsigned n;
+      if (every < 0) {
+          const char* e = getenv("PS3_TEST_FLIP_STALL");
+          every = 0;
+          if (e && sscanf(e, "%d,%d", &every, &ms) != 2) every = 0;
+          if (every > 0) fprintf(stderr, "[gcm] test hook: every %d flips stall %d ms%c", every, ms, 10);
+      }
+      if (every > 0 && ms > 0 && ++n % (unsigned)every == 0) Sleep((unsigned)ms); }
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
      * fast?" -- the question that matters when a title stops appearing on
@@ -3598,6 +3955,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     s_flip_req_seq++;
     FLIP_UNLOCK();
     s_last_flip_time = get_timestamp_ns();
+    gcm_flipreq_note(s_last_flip_time);
     if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                        ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
 
@@ -3748,6 +4106,8 @@ void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
 void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler)
 {
     printf("[cellGcmSys] SetVBlankHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
+    /* Ticks owed to the previous handler are not replayed into this one. */
+    GCM_A64_STORE(s_vb_resync, (1ull << 32) | GCM_A32_ACQUIRE(s_vb_published));
     s_vblank_handler_opd = (u32)(size_t)handler;
     s_vblank_handler = handler;
     { u32 c = s_vblank_handler_opd ? vm_read32(s_vblank_handler_opd) : 0; if (c) s_vblank_handler_code = c; }
@@ -4783,9 +5143,7 @@ void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
     GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
-#ifdef _WIN32
     gcm_pump_wake();
-#endif
 }
 
 /* Invalidate a tile region (unbind + clear) */
