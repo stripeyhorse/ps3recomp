@@ -108,6 +108,10 @@ static void check_nested_scope(spu_context* ctx)
 
 int main(int argc, char** argv)
 {
+    /* This fixture inspects the address-keyed list and its read lock, which
+     * is the PS3_SPU_MFC_BIND=0 registry (test_spu_mfc_bind.c covers the
+     * bound one). The mode is read at the first MFC lookup. */
+    setenv("PS3_SPU_MFC_BIND", "0", 1);
     setvbuf(stdout, NULL, _IONBF, 0);
     if (cache_existing_main()) return 1;
     cache_fixture_lock = &s_mfc_claim_lock;

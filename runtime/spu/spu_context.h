@@ -433,6 +433,14 @@ typedef struct spu_context {
      * spu_coh_reserve_fast). Written under that lock, read by the context's
      * own thread. */
     int coh_listed;
+
+    /* Index of this context's MFC engine slot in the registry pool
+     * (spu_channels.c, PS3_SPU_MFC_BIND). Only a hint: the fast lookup uses
+     * the slot only while the slot itself names this context as its owner,
+     * and pool memory is never freed, so a stale, copied or zeroed value
+     * costs one registry lookup and is never trusted. Written and read only
+     * by the context's executing thread. */
+    uint32_t mfc_slot_hint;
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own

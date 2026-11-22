@@ -391,9 +391,33 @@ typedef struct spu_mfc_slot {
 static spu_mfc_slot* s_mfc_slots;
 static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
 
+/* Bound registry storage (PS3_SPU_MFC_BIND); see "Bound engine lookup". */
+#define SPU_MFC_CHUNK_SLOTS 64u
+#define SPU_MFC_MAX_CHUNKS  1024u      /* 65,536 simultaneously live contexts */
+#define SPU_MFC_HASH        1024u
+typedef struct spu_mfc_pslot {
+    _Atomic(spu_context*) owner;       /* NULL while free */
+    struct spu_mfc_pslot* link;        /* live: hash chain; free: free list */
+    uint32_t index;
+    mfc_engine mfc;
+} spu_mfc_pslot;
+static _Atomic(spu_mfc_pslot*) s_mfc_chunks[SPU_MFC_MAX_CHUNKS];
+static uint32_t       s_mfc_nchunks;              /* writer lock */
+static spu_mfc_pslot* s_mfc_free;                 /* writer lock */
+static spu_mfc_pslot* s_mfc_hash[SPU_MFC_HASH];   /* writer lock; readers hold shared */
+static uint32_t       s_mfc_bound_live;           /* writer lock */
+
 /* SPU_PCSAMPLE=<secs>: every <secs>, print image and pc of every context
  * holding an MFC slot -- i.e. every live SPU that has done DMA. Answers
  * "which SPU task never returned, and where is it" without a debugger. */
+static void spu_pcsample_print(int i, const spu_context* c)
+{
+    fprintf(stderr, "[pcsample] slot=%d img=%d spu=0x%X pc=0x%05X lr=0x%05X"
+                    " r3=0x%08X r81=0x%08X r84=0x%X r13=0x%08X r14=0x%08X\n",
+            i, c->image_id, c->spu_id, (unsigned)(c->pc & SPU_LS_MASK),
+            (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK), c->gpr[3]._u32[0],
+            c->gpr[81]._u32[0], c->gpr[84]._u32[0], c->gpr[13]._u32[0], c->gpr[14]._u32[0]);
+}
 static DWORD WINAPI spu_pcsample_thread(LPVOID p)
 {
     const DWORD ms = (DWORD)(uintptr_t)p;
@@ -403,12 +427,13 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
         AcquireSRWLockShared(&s_mfc_claim_lock);
         for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next, i++) {
             spu_context* c = slot->ctx;
-            if (c) fprintf(stderr, "[pcsample] slot=%d img=%d spu=0x%X pc=0x%05X lr=0x%05X"
-                                   " r3=0x%08X r81=0x%08X r84=0x%X r13=0x%08X r14=0x%08X\n",
-                           i, c->image_id, c->spu_id, (unsigned)(c->pc & SPU_LS_MASK),
-                           (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK), c->gpr[3]._u32[0],
-                           c->gpr[81]._u32[0], c->gpr[84]._u32[0], c->gpr[13]._u32[0], c->gpr[14]._u32[0]);
+            if (c) spu_pcsample_print(i, c);
         }
+        for (uint32_t b = 0; b < SPU_MFC_HASH; b++)
+            for (spu_mfc_pslot* s = s_mfc_hash[b]; s; s = s->link, i++) {
+                spu_context* c = atomic_load_explicit(&s->owner, memory_order_relaxed);
+                if (c) spu_pcsample_print(i, c);
+            }
         ReleaseSRWLockShared(&s_mfc_claim_lock);
         fflush(stderr);
     }
@@ -492,7 +517,7 @@ static void spu_mfc_cache_invalidate(void)
         atomic_store_explicit(&s_mfc_cache_generation, generation + 1, memory_order_release);
 }
 
-static mfc_engine* mfc_for(spu_context* ctx)
+static mfc_engine* mfc_for_legacy(spu_context* ctx)
 {
     int mode = spu_mfc_cache_mode();
     int cache_enabled = mode == MFC_CACHE_GLOBAL ||
@@ -507,7 +532,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
      * SPU_PCSAMPLE unset `started` never became 1, so every access paid a
      * getenv: a tenth of all samples in a Twisted Metal profile. */
     { static volatile LONG checked = 0;
-      if (!checked && !InterlockedExchange(&checked, 1)) {
+      if (!__atomic_load_n(&checked, __ATOMIC_RELAXED) && !InterlockedExchange(&checked, 1)) {
           const char* e = getenv("SPU_PCSAMPLE");
           if (e) CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
       } }
@@ -546,9 +571,8 @@ static mfc_engine* mfc_for(spu_context* ctx)
     return &slot->mfc;
 }
 
-void spu_mfc_release(spu_context* ctx)
+static void spu_mfc_release_legacy(spu_context* ctx)
 {
-    if (!ctx) return;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (spu_mfc_slot** link = &s_mfc_slots; *link; link = &(*link)->next) {
         if ((*link)->ctx != ctx) continue;
@@ -563,7 +587,7 @@ void spu_mfc_release(spu_context* ctx)
 
 /* Exit safety net for contexts unwound off a departing thread's stack.
  * Pointer comparisons suffice: the abandoned context need not be readable. */
-void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
+static void spu_mfc_forget_range_legacy(uintptr_t lo, uintptr_t hi)
 {
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (spu_mfc_slot** link = &s_mfc_slots; *link;) {
@@ -575,6 +599,177 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
             free(slot);
         } else {
             link = &slot->next;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+}
+
+/* ===========================================================================
+ * Bound engine lookup (PS3_SPU_MFC_BIND, default 1; =0 is the list above).
+ *
+ * The legacy lookup takes the registry read lock and walks every live engine
+ * on each MFC channel access: an atomic read-modify-write on one cache line
+ * shared by every SPU host thread, several times per DMA. This keeps the same
+ * ownership model and makes the established lookup two loads and a compare.
+ *
+ * Owner. The registry owns every engine. Engines live in slots of a pool
+ * that is only ever grown, never returned to the allocator (type-stable
+ * memory). A slot belongs to a context exactly while slot->owner == ctx, and
+ * at most one slot names a given context: claims look the context up in the
+ * hash index under the writer lock before taking a free slot.
+ *
+ * Release. spu_mfc_release(ctx), or spu_mfc_forget_range covering ctx, clears
+ * slot->owner under the writer lock and puts the slot on the free list. The
+ * next claim, by any context, re-initialises the engine. Neither reads the
+ * context, so abandoned or unreadable context memory is fine, as before.
+ *
+ * Why a stale handle is never used. ctx->mfc_slot_hint is an index, written by
+ * the executing thread after a claim or lookup, and trusted for nothing: the
+ * fast path masks it into the pool, and returns that slot's engine only if the
+ * slot's owner is ctx right now. The owner field is what the registry lookup
+ * itself would match, so the fast path returns exactly the engine the locked
+ * lookup would. A hint left by an earlier lifetime at the same address, by a
+ * context reset (spu_context_init zeroes it), by a struct copy of another
+ * context, by a released or reassigned slot, or by uninitialised memory either
+ * names this context's live slot or fails the owner test and takes the locked
+ * lookup, which rewrites it. The pool is never freed, so reading a stale
+ * slot's owner is always a valid access.
+ *
+ * Precondition, unchanged from the legacy registry: only the context's single
+ * executing thread looks its engine up, and a release happens before the next
+ * execution of a context at that address (owner acquire/release orders the
+ * engine's initialisation for a context that moves between host threads).
+ * ===========================================================================*/
+/* Read once: 0 unread, 1 legacy list, 2 bound. Its own line: every MFC
+ * channel access reads it, and nothing writes near it. */
+static struct { _Alignas(64) atomic_int mode; char pad[64 - sizeof(atomic_int)]; } s_mfc_bind;
+static int spu_mfc_bind_init(void)
+{
+    const char* e = getenv("PS3_SPU_MFC_BIND");
+    int mode = (e && e[0] == '0' && !e[1]) ? 1 : 2;
+    int expected = 0;
+    atomic_compare_exchange_strong(&s_mfc_bind.mode, &expected, mode);
+    return atomic_load_explicit(&s_mfc_bind.mode, memory_order_relaxed);
+}
+static inline int spu_mfc_bound(void)
+{
+    int mode = atomic_load_explicit(&s_mfc_bind.mode, memory_order_relaxed);
+    if (__builtin_expect(mode == 0, 0)) mode = spu_mfc_bind_init();
+    return mode == 2;
+}
+
+static inline uint32_t spu_mfc_hash(const spu_context* ctx)
+{
+    uint64_t p = (uint64_t)(uintptr_t)ctx;
+    p ^= p >> 21;
+    p *= 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(p >> 54) & (SPU_MFC_HASH - 1u);
+}
+static spu_mfc_pslot* spu_mfc_bound_find(const spu_context* ctx)   /* either lock */
+{
+    for (spu_mfc_pslot* s = s_mfc_hash[spu_mfc_hash(ctx)]; s; s = s->link)
+        if (atomic_load_explicit(&s->owner, memory_order_relaxed) == ctx) return s;
+    return NULL;
+}
+
+#if defined(_MSC_VER)
+static __declspec(noinline) mfc_engine* mfc_for_bound_slow(spu_context* ctx)
+#else
+static __attribute__((noinline, cold)) mfc_engine* mfc_for_bound_slow(spu_context* ctx)
+#endif
+{
+    { static volatile LONG checked = 0;   /* as in mfc_for_legacy */
+      if (!__atomic_load_n(&checked, __ATOMIC_RELAXED) && !InterlockedExchange(&checked, 1)) {
+          const char* e = getenv("SPU_PCSAMPLE");
+          if (e) CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
+      } }
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
+    spu_mfc_pslot* slot = spu_mfc_bound_find(ctx);
+    if (!slot) {
+        if (!s_mfc_free) {
+            spu_mfc_pslot* chunk = s_mfc_nchunks < SPU_MFC_MAX_CHUNKS
+                ? (spu_mfc_pslot*)calloc(SPU_MFC_CHUNK_SLOTS, sizeof(*chunk)) : NULL;
+            if (!chunk) {
+                fprintf(stderr, "[SPU] cannot allocate private MFC engine for context %p\n", (void*)ctx);
+                fflush(stderr);
+                abort(); /* Shared fallback state would silently corrupt DMA completion. */
+            }
+            const uint32_t base = s_mfc_nchunks * SPU_MFC_CHUNK_SLOTS;
+            for (uint32_t i = SPU_MFC_CHUNK_SLOTS; i-- > 0;) {
+                chunk[i].index = base + i;
+                chunk[i].link = s_mfc_free;
+                s_mfc_free = &chunk[i];
+            }
+            atomic_store_explicit(&s_mfc_chunks[s_mfc_nchunks], chunk, memory_order_release);
+            s_mfc_nchunks++;
+        }
+        slot = s_mfc_free;
+        s_mfc_free = slot->link;
+        mfc_engine_init(&slot->mfc);
+        const uint32_t b = spu_mfc_hash(ctx);
+        slot->link = s_mfc_hash[b];
+        s_mfc_hash[b] = slot;
+        s_mfc_bound_live++;
+        atomic_store_explicit(&slot->owner, ctx, memory_order_release);
+    }
+    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+    __atomic_store_n(&ctx->mfc_slot_hint, slot->index, __ATOMIC_RELAXED);
+    return &slot->mfc;
+}
+
+static inline mfc_engine* mfc_for_bound(spu_context* ctx)
+{
+    const uint32_t h = __atomic_load_n(&ctx->mfc_slot_hint, __ATOMIC_RELAXED);
+    spu_mfc_pslot* chunk = atomic_load_explicit(
+        &s_mfc_chunks[(h / SPU_MFC_CHUNK_SLOTS) & (SPU_MFC_MAX_CHUNKS - 1u)], memory_order_acquire);
+    if (__builtin_expect(chunk != NULL, 1)) {
+        spu_mfc_pslot* slot = &chunk[h % SPU_MFC_CHUNK_SLOTS];
+        if (__builtin_expect(atomic_load_explicit(&slot->owner, memory_order_acquire) == ctx, 1))
+            return &slot->mfc;
+    }
+    return mfc_for_bound_slow(ctx);
+}
+
+static void spu_mfc_bound_unlink(spu_mfc_pslot** link)   /* writer lock */
+{
+    spu_mfc_pslot* slot = *link;
+    *link = slot->link;
+    atomic_store_explicit(&slot->owner, NULL, memory_order_release);
+    slot->link = s_mfc_free;
+    s_mfc_free = slot;
+    s_mfc_bound_live--;
+}
+
+static inline mfc_engine* mfc_for(spu_context* ctx)
+{
+    return spu_mfc_bound() ? mfc_for_bound(ctx) : mfc_for_legacy(ctx);
+}
+
+void spu_mfc_release(spu_context* ctx)
+{
+    if (!ctx) return;
+    if (!spu_mfc_bound()) { spu_mfc_release_legacy(ctx); return; }
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
+    for (spu_mfc_pslot** link = &s_mfc_hash[spu_mfc_hash(ctx)]; *link; link = &(*link)->link) {
+        if (atomic_load_explicit(&(*link)->owner, memory_order_relaxed) == ctx) {
+            spu_mfc_bound_unlink(link);
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+}
+
+/* Exit safety net for contexts unwound off a departing thread's stack.
+ * Pointer comparisons suffice: the abandoned context need not be readable. */
+void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
+{
+    if (!spu_mfc_bound()) { spu_mfc_forget_range_legacy(lo, hi); return; }
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
+    for (uint32_t b = 0; b < SPU_MFC_HASH; b++) {
+        for (spu_mfc_pslot** link = &s_mfc_hash[b]; *link;) {
+            uintptr_t owner = (uintptr_t)atomic_load_explicit(&(*link)->owner, memory_order_relaxed);
+            if (owner >= lo && owner < hi) spu_mfc_bound_unlink(link);
+            else link = &(*link)->link;
         }
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
@@ -1020,13 +1215,41 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+#if defined(_MSC_VER)
+static __declspec(noinline) void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);
+#else
+static __attribute__((noinline)) void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);
+#endif
+
+/* The six MFC parameter writes are most of all channel writes (five or six of
+ * the eight or nine per DMA) and only latch a value. With no channel
+ * diagnostic armed (spu_mfc_diag, PS3_SPU_MFC_FAST) they are stored here,
+ * without the large frame of the full handler, which every other channel
+ * write still goes through. Same stores as the full handler's own latch. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    if (__builtin_expect(!spu_mfc_diag(), 1)) {
+        const uint32_t v = value._u32[0];
+        switch (channel) {
+        case MFC_LSA:       ctx->mfc_lsa = v;         return;
+        case MFC_EAH:       ctx->mfc_eah = v;         return;
+        case MFC_EAL:       ctx->mfc_eal = v;         return;
+        case MFC_Size:      ctx->mfc_size = v;        return;
+        case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
+        default: break;
+        }
+    }
+    spu_wrch_full(ctx, channel, value);
+}
+
+static void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
      * work descriptor or is waiting on a channel we never satisfy; the channel
      * mix distinguishes those. */
-    { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
+    if (__builtin_expect(spu_mfc_diag(), 0)) { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long w[128]; static unsigned long long n;
           w[channel & 127]++;
           if ((++n % (unsigned long long)s_c) == 0) { fprintf(stderr, "[chw] %llu writes:%c", n, 10);
@@ -1294,7 +1517,8 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
     spu_honour_stop_request(ctx);
-    { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
+    const int diag = spu_mfc_diag();
+    if (__builtin_expect(diag, 0)) { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
           r[channel & 127]++;
           if ((++n % (unsigned long long)s_c) == 0) { fprintf(stderr, "[chr] %llu reads:%c", n, 10);
@@ -1312,7 +1536,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
 
     uint32_t v = 0;
 
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
+    if (__builtin_expect(diag, 0)) { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_c[10] = {0}; static uint64_t s_tot = 0;
         int b = (channel==SPU_RdInMbox)?0:(channel==SPU_RdSigNotify1)?1:(channel==SPU_RdSigNotify2)?2:
                 (channel==SPU_RdDec)?3:(channel==SPU_RdEventStat)?4:(channel==SPU_RdEventMask)?5:
@@ -1325,7 +1549,12 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
             (unsigned long long)s_c[8],(unsigned long long)s_c[9]); } }
 
     if (channel_is_mfc(channel)) {
-        v = mfc_channel_read(mfc_for(ctx), ctx, channel);
+        /* Every MFC read channel is context state (mfc_channel_read never
+         * touches the engine). The legacy lookup is kept for =0, where it
+         * also allocated the engine on a context's first MFC access; bound,
+         * that happens at its first engine use instead, with the same fresh
+         * state, and the read skips the lookup. */
+        v = mfc_channel_read(spu_mfc_bound() ? NULL : mfc_for(ctx), ctx, channel);
         return spu_make_preferred_u32(v);
     }
 

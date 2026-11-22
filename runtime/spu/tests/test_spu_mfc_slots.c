@@ -230,14 +230,17 @@ int main(void)
     spu_mfc_forget_range((uintptr_t)range, (uintptr_t)(range + 3));
     CHECK(mfc_for(outside) == outside_engine);
     CHECK(outside_engine->tag_completed == 0x12345678);
-    CHECK(s_mfc_slots && s_mfc_slots->ctx == outside && !s_mfc_slots->next);
+    if (spu_mfc_bound())   /* PS3_SPU_MFC_BIND: pooled slots behind a hash index */
+        CHECK(s_mfc_bound_live == 1 && spu_mfc_bound_find(outside) != NULL);
+    else
+        CHECK(s_mfc_slots && s_mfc_slots->ctx == outside && !s_mfc_slots->next);
     free(range);
     spu_mfc_release(outside);
     free(outside);
 
     for (unsigned i = 0; i < 12; ++i) {
         CHECK(spu_run_lifted_job_img(transient_job, NULL, 0, 0) == 0);
-        CHECK(s_mfc_slots == NULL); /* stack context actually relinquished its node */
+        CHECK(s_mfc_slots == NULL && s_mfc_bound_live == 0); /* stack context actually relinquished its node */
     }
     printf("SPU MFC engine slots: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

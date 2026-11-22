@@ -538,6 +538,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_dma_repeat
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_repeat.py")
+        add_test(NAME spu_mfc_bind
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_mfc_bind.py")
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)

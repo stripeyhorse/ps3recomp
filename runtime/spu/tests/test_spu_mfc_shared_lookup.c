@@ -85,6 +85,10 @@ static void read_lock_case(spu_context* ctx, int operation)
 }
 int main(void)
 {
+    /* This fixture inspects the address-keyed list and its read lock, which
+     * is the PS3_SPU_MFC_BIND=0 registry (test_spu_mfc_bind.c covers the
+     * bound one). The mode is read at the first MFC lookup. */
+    setenv("PS3_SPU_MFC_BIND", "0", 1);
     /* Retain the pre-existing ownership, 48 live allocation lifetimes, real
      * stalled-list DMA, same-address reset and range cleanup regressions. */
     if (registry_previous_main()) return 1;
