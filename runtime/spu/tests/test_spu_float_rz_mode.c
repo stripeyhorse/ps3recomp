@@ -2,7 +2,8 @@
  * flush-to-zero and puts the caller's FPCR back on the way out -- after a normal return, after a
  * halt (longjmp), and around a nested run. A run can happen synchronously on a PPU thread, whose
  * floating point must keep round to nearest with denormals. Without SPU_FLOAT_RZ=1 FPCR is never
- * touched. arm64 only. */
+ * touched -- unless a TU was built SPU_FLOAT_RZ_ONLY (tools/test_spu_float_rz_mode.py builds this
+ * file both ways), which turns the mode on for every run whatever SPU_FLOAT_RZ says. arm64 only. */
 #include "../spu_helpers.h"
 #include "../spu_interp.h"
 #include <assert.h>
@@ -17,7 +18,7 @@ extern void spu_halt(spu_context*);
 
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
 static uint64_t fpcr_get(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
-static void fpcr_set(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
+static void fpcr_set(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v) : "memory"); }
 
 static spu_context ctx, inner_ctx;
 static uint64_t seen_inner, seen_outer_after;
@@ -55,14 +56,30 @@ static void run(void (*entry)(spu_context*), uint64_t caller, const char* what)
 int main(void)
 {
     const char* e = getenv("SPU_FLOAT_RZ");
-    rz = e && !strcmp(e, "1");
+    extern int spu_float_rz_required;
+    rz = (e && !strcmp(e, "1")) || spu_float_rz_required;
+#if defined(SPU_FLOAT_RZ_ONLY)
+    if (!spu_float_rz_required) { fputs("FAIL: SPU_FLOAT_RZ_ONLY TU did not register\n", stderr); return 1; }
+    /* every native form, no exact one: a truncating add must truncate */
+    fpcr_set(SPU_FPCR_RZFZ);
+    volatile uint32_t w_one = 0x3F800000u, w_tiny = 0x33800001u;   /* 1 + 2^-24(1 + 2^-23): not foldable */
+    const u128 one = spu_splat_u32(w_one), tiny = spu_splat_u32(w_tiny);
+    if (spu_fa(one, tiny)._u32[0] != 0x3F800000u) { fputs("FAIL: RZ-only fa did not truncate\n", stderr); return 1; }
+    /* and it is the native form: outside the mode it rounds to nearest, which is why the
+     * runtime must establish the mode for such a TU */
+    fpcr_set(0);
+    const u128 one2 = spu_splat_u32(w_one), tiny2 = spu_splat_u32(w_tiny);
+    volatile uint32_t probe = spu_fa(one2, tiny2)._u32[0];
+    if (probe != 0x3F800001u) { fputs("FAIL: RZ-only fa is not the native form\n", stderr); return 1; }
+#endif
     const uint64_t callers[] = { 0, 0x00400000ull /* round toward +inf */, SPU_FPCR_RZFZ };
     for (unsigned i = 0; i < sizeof callers / sizeof callers[0]; i++) {
         run(leaf_return, callers[i], "return");
         run(leaf_halt, callers[i], "halt");
         run(outer_nested, callers[i], "nested");
     }
-    printf("PASS: SPU_FLOAT_RZ=%d FPCR inside runs and restored after return, halt and nesting\n", rz);
+    printf("PASS: SPU_FLOAT_RZ=%s%s: FPCR inside runs and restored after return, halt and nesting\n",
+           e ? e : "(unset)", spu_float_rz_required ? " with an RZ-only TU" : "");
     return 0;
 }
 #else

@@ -247,7 +247,21 @@ void spu_stop(spu_context* ctx)
  * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
  * lifted floating point must keep round to nearest with denormals. Double precision restores
  * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
- * Returns the FPCR to restore, or ~0 when nothing was changed. */
+ *
+ * Every lifted SPU entry goes through spu_run_with_halt -- SPURS policy and job runs, the
+ * async task threads (spu_lifted_job.h), raw SPU threads -- and interrupts, halts and the
+ * drain loop stay inside it, so one switch here covers them. Inside a run the only host
+ * floating point is diagnostic (profiling timers and log formatting), which is not guest
+ * state.
+ *
+ * A binary with a TU built SPU_FLOAT_RZ_ONLY (spu_float_rz_required, set by its constructor)
+ * has no round-to-nearest path in that code, so the mode is then on for every run and
+ * SPU_FLOAT_RZ=0 is refused with a message. If the mode cannot be established -- FPCR does
+ * not read back as written -- such a binary stops: running on would silently compute wrong
+ * guest floats. Returns the FPCR to restore, or ~0 when nothing was changed. */
+#if !defined(SPU_FLOAT_RZ_REQUIRED_DEFINED)
+SPU_GATE int spu_float_rz_required = 0;
+#endif
 static uint64_t spu_float_mode_enter(void)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
@@ -256,6 +270,13 @@ static uint64_t spu_float_mode_enter(void)
     if (on < 0) {
         const char* e = getenv("SPU_FLOAT_RZ");
         on = e && e[0] == '1' && !e[1];
+        if (__atomic_load_n(&spu_float_rz_required, __ATOMIC_RELAXED)) {
+            if (e && !on)
+                fprintf(stderr, "[spu] SPU_FLOAT_RZ=%s ignored: lifted SPU code in this binary was built "
+                        "for round toward zero only (PS3RECOMP_SPU_FLOAT_RZ_ONLY); rebuild with it OFF "
+                        "to run SPU code in the default FPCR\n", e);
+            on = 2;
+        }
         __atomic_store_n(&s_on, on, __ATOMIC_RELAXED);
     }
     if (!on) return ~0ull;
@@ -263,6 +284,16 @@ static uint64_t spu_float_mode_enter(void)
     __asm__ volatile("mrs %0, fpcr" : "=r"(v));
     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
+    if (on == 2) {
+        uint64_t check;
+        __asm__ volatile("mrs %0, fpcr" : "=r"(check));
+        if (check != SPU_FPCR_RZFZ) {
+            fprintf(stderr, "[spu] FATAL: FPCR reads 0x%llX after writing 0x%llX; lifted SPU code built "
+                    "PS3RECOMP_SPU_FLOAT_RZ_ONLY cannot run correctly on this host\n",
+                    (unsigned long long)check, (unsigned long long)SPU_FPCR_RZFZ);
+            abort();
+        }
+    }
     return v;
 #else
     return ~0ull;
@@ -288,11 +319,29 @@ static void spu_honour_stop_request(spu_context* ctx)
     spu_halt(ctx);
 }
 
+/* SPU_LS_NO_DIAG lifted TUs (spu_context.h) skip the local-store diagnostics. Say so once
+ * when one of them is armed, so a watch that stays silent is not mistaken for a result. */
+#if !defined(SPU_LS_NODIAG_IMAGES_DEFINED)
+SPU_GATE int spu_ls_nodiag_images = 0;
+#endif
+static void spu_ls_nodiag_note(void)
+{
+    static int s_done;
+    if (__atomic_exchange_n(&s_done, 1, __ATOMIC_RELAXED)) return;
+    if (!__atomic_load_n(&spu_ls_nodiag_images, __ATOMIC_RELAXED)) return;
+    static const char* const k_diag[] = { "SPU_LS_WATCH", "SPU_LS_LOWREAD", "SPU_SMC_WATCH", "SPU_WWS_PROBE" };
+    for (unsigned i = 0; i < sizeof k_diag / sizeof k_diag[0]; i++)
+        if (getenv(k_diag[i]))
+            fprintf(stderr, "[spu] %s does not see lifted SPU images built with PS3RECOMP_SPU_LS_DIRECT; "
+                    "rebuild with it OFF to watch them\n", k_diag[i]);
+}
+
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     const uint64_t fpcr_outer = spu_float_mode_enter();   /* not modified after setjmp */
+    { static int s_noted; if (__builtin_expect(!s_noted, 0)) { s_noted = 1; spu_ls_nodiag_note(); } }
     int halted = 0;
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count

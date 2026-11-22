@@ -20,6 +20,51 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Options
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
+# Build options for a port's lifted SPU translation units (the <image>/spu_recomp.c files).
+#
+#   ps3recomp_spu_lifted_options(<sources> PRIVATE_LS <images...>)
+#
+# appends the compile definitions below to each source. PRIVATE_LS names the images (their
+# directory names) that only ever run in a SPURS context with its own local store -- job and
+# policy modules, never a sys_spu_image program, which can run as a raw SPU whose local store
+# is guest memory.
+#
+#   PS3RECOMP_SPU_FLOAT_RZ_ONLY  SPU_FLOAT_RZ_ONLY on every lifted image: single precision is
+#       compiled for the round-toward-zero/flush-to-zero FPCR only, and the runtime then sets
+#       that mode for every SPU run (runtime/spu/spu_channels.c, spu_float_mode_enter). ARM64
+#       only; other hosts ignore the definition.
+#   PS3RECOMP_SPU_LS_DIRECT  SPU_LS_NO_DIAG on every lifted image (no per-access local-store
+#       diagnostic gate) and SPU_LS_PRIVATE on the PRIVATE_LS images (local store addressed at
+#       its fixed place in the context); runtime/spu/spu_context.h.
+# Both default to ON on ARM64 and OFF elsewhere.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$" OR CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+    set(_ps3recomp_spu_arm64 ON)
+else()
+    set(_ps3recomp_spu_arm64 OFF)
+endif()
+option(PS3RECOMP_SPU_FLOAT_RZ_ONLY "Lifted SPU single precision for the round-toward-zero FPCR only (ARM64)" ${_ps3recomp_spu_arm64})
+option(PS3RECOMP_SPU_LS_DIRECT "Lifted SPU local-store access without diagnostics, and direct in SPURS job/policy images" ${_ps3recomp_spu_arm64})
+
+function(ps3recomp_spu_lifted_options sources)
+    cmake_parse_arguments(ARG "" "" "PRIVATE_LS" ${ARGN})
+    foreach(src IN LISTS sources)
+        set(defs "")
+        if(PS3RECOMP_SPU_FLOAT_RZ_ONLY)
+            list(APPEND defs SPU_FLOAT_RZ_ONLY)
+        endif()
+        get_filename_component(dir "${src}" DIRECTORY)
+        get_filename_component(image "${dir}" NAME)
+        if(PS3RECOMP_SPU_LS_DIRECT)
+            list(APPEND defs SPU_LS_NO_DIAG)
+            if(image IN_LIST ARG_PRIVATE_LS)
+                list(APPEND defs SPU_LS_PRIVATE)
+            endif()
+        endif()
+        if(defs)
+            set_property(SOURCE "${src}" APPEND PROPERTY COMPILE_DEFINITIONS ${defs})
+        endif()
+    endforeach()
+endfunction()
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -483,6 +528,23 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_spu_fi_cflts_neon PRIVATE m)
         add_test(NAME spu_fi_cflts_neon COMMAND test_spu_fi_cflts_neon)
         set_tests_properties(spu_fi_cflts_neon PROPERTIES TIMEOUT 300)
+        # The float compares and int<->float conversions (NEON on ARM64, SSE2/AVX2 on
+        # x86) against their scalar references, in both FPCR modes on ARM64.
+        add_executable(test_spu_neon_cmp_cvt
+            runtime/spu/tests/test_spu_neon_cmp_cvt.c)
+        target_include_directories(test_spu_neon_cmp_cvt PRIVATE include runtime/spu)
+        target_compile_options(test_spu_neon_cmp_cvt PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_neon_cmp_cvt PRIVATE m)
+        add_test(NAME spu_neon_cmp_cvt COMMAND test_spu_neon_cmp_cvt)
+        set_tests_properties(spu_neon_cmp_cvt PROPERTIES TIMEOUT 300)
+        # The round-toward-zero fm/fma forms against the exact references (ARM64; skips elsewhere).
+        add_executable(test_spu_rz_fused
+            runtime/spu/tests/test_spu_rz_fused.c)
+        target_include_directories(test_spu_rz_fused PRIVATE include runtime/spu)
+        target_compile_options(test_spu_rz_fused PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_rz_fused PRIVATE m)
+        add_test(NAME spu_rz_fused COMMAND test_spu_rz_fused)
+        set_tests_properties(spu_rz_fused PROPERTIES TIMEOUT 300)
 
         add_executable(test_spu_lockline_wait
             runtime/spu/tests/test_spu_lockline_wait.c)

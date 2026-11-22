@@ -680,13 +680,45 @@ static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t 
     g_spu_ls_rdiag = g_spu_ls_probe || spu_ls_wws_probe_on() || g_spu_ls_watch_n != 0;
 }
 
+/* Per-TU local-store access options for lifted code (CMake PS3RECOMP_SPU_LS_DIRECT: NO_DIAG on
+ * every lifted image, PRIVATE on the port's job and policy images; cmake/PS3RecompSPUOptions.cmake).
+ * Every lqd/stqd of lifted code runs through the two accessors below, and lifted code stores each
+ * result to ctx->gpr[] (char-aliasing union TBAA), so ctx->ls and the diagnostic gate are reloaded
+ * on every access. On the 64 captured PAIN ICE mesh jobs (Apple M2, eight paired rounds) NO_DIAG
+ * alone took a median 5.8% off the job time, PRIVATE alone nothing measurable, both 11.4%:
+ *   SPU_LS_PRIVATE  -- address ctx->ls_store, at a constant offset from ctx, instead of
+ *                      loading ctx->ls. Only for an image that never runs as a raw SPU, the
+ *                      one context whose `ls` points at guest memory (spu_raw.c): SPURS job
+ *                      modules and policy modules, which run in SPURS contexts (spurs_job.c,
+ *                      spurs_policy.c, spu_lifted_job.h) that all use ls_store. A port sets it
+ *                      for those images only, never for a sys_spu_image program.
+ *   SPU_LS_NO_DIAG  -- leave out the per-access diagnostic gate. SPU_LS_WATCH, SPU_LS_LOWREAD,
+ *                      SPU_SMC_WATCH and SPU_WWS_PROBE then do not see this TU's quadword
+ *                      accesses; the runtime says so once when one of them is armed. */
+#if defined(SPU_LS_PRIVATE)
+#define SPU__LS_BASE(ctx) ((ctx)->ls_store)
+#else
+#define SPU__LS_BASE(ctx) ((ctx)->ls)
+#endif
+#if defined(SPU_LS_NO_DIAG)
+#define SPU__LS_DIAG_ON(gate) 0
+SPU_GATE int spu_ls_nodiag_images = 0;   /* nonzero: some TU was built SPU_LS_NO_DIAG */
+#define SPU_LS_NODIAG_IMAGES_DEFINED 1
+static void __attribute__((constructor, used)) spu__ls_nodiag_tu(void)
+{
+    __atomic_store_n(&spu_ls_nodiag_images, 1, __ATOMIC_RELAXED);
+}
+#else
+#define SPU__LS_DIAG_ON(gate) __builtin_expect((gate) != 0, 0)
+#endif
+
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_rdiag != 0, 0))
+    if (SPU__LS_DIAG_ON(g_spu_ls_rdiag))
         spu_ls_read_diag(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
-    const uint8_t* p = &ctx->ls[lsa];
+    const uint8_t* p = &SPU__LS_BASE(ctx)[lsa];
 #if defined(__ARM_NEON)
     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
 #elif SPU_LS_VEC
@@ -785,7 +817,7 @@ static SPU_NOINLINE_COLD void spu_ls_write_diag(spu_context* ctx, uint32_t lsa, 
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
-    uint8_t* p = &ctx->ls[lsa];
+    uint8_t* p = &SPU__LS_BASE(ctx)[lsa];
 #if defined(__ARM_NEON)
     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
 #elif SPU_LS_VEC
@@ -804,7 +836,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-    if (__builtin_expect(g_spu_ls_wdiag != 0, 0))
+    if (SPU__LS_DIAG_ON(g_spu_ls_wdiag))
         spu_ls_write_diag(ctx, lsa, val);
 }
 

@@ -945,7 +945,22 @@ SPU__NV_INLINE u128 spu__nv_fa(u128 a, u128 b, uint32_t negb) {
  * being a plain asm with no memory effects, is hoisted and shared by the compiler; it changes only
  * in spu_run_with_halt, outside generated code. */
 #define SPU_FPCR_RZFZ 0x01C00000ull   /* FZ (bit 24), RMode = 0b11 round toward zero (bits 22-23) */
+/* SPU_FLOAT_RZ_ONLY (CMake PS3RECOMP_SPU_FLOAT_RZ_ONLY, set per lifted TU): the TU assumes it
+ * always runs in that mode, so only the native forms are emitted and the exact
+ * round-to-nearest forms and the per-operation mrs drop out (a fifth of PAIN's ICE mesh
+ * module's ARM64 text). The constructor below tells the runtime, which then sets the mode for every
+ * run whatever SPU_FLOAT_RZ says (spu_float_mode_enter, spu_channels.c). */
+#if defined(SPU_FLOAT_RZ_ONLY)
+SPU__NV_INLINE int spu__nv_rz(void) { return 1; }
+SPU_GATE int spu_float_rz_required = 0;
+#define SPU_FLOAT_RZ_REQUIRED_DEFINED 1
+static void __attribute__((constructor, used)) spu__float_rz_only_tu(void)
+{
+    __atomic_store_n(&spu_float_rz_required, 1, __ATOMIC_RELAXED);
+}
+#else
 SPU__NV_INLINE int spu__nv_rz(void) { uint64_t v; __asm__("mrs %0, fpcr" : "=r"(v)); return v == SPU_FPCR_RZFZ; }
+#endif
 SPU__NV_INLINE u128 spu__rz_fa(u128 a, u128 b, uint32_t negb) {
     const uint32x4_t x = vld1q_u32(a._u32), yb = vld1q_u32(b._u32), y = veorq_u32(yb, vdupq_n_u32(negb));
     const float32x4_t s = vaddq_f32(spu__nv_f(x), spu__nv_f(y));
@@ -954,23 +969,29 @@ SPU__NV_INLINE u128 spu__rz_fa(u128 a, u128 b, uint32_t negb) {
     if (!spu__nv_all4(ok)) r = spu__fa_fix(r, ok, x, yb, negb);
     return spu__nv_u128(r);
 }
+/* fm and fma in that mode need no zero masks either. FZ reads an exponent-0 operand as a zero,
+ * so a zero factor times an ordinary one is a host zero and fma's addend comes through exactly
+ * (an exponent-0 addend is a zero, and (+0) + (-0) is +0 under round toward zero); the result
+ * then needs only the +0 rule. Truncation equals the SPU's below FLT_MAX: a product or sum at or
+ * above it, an extended-range operand the host reads as Inf or NaN, and zero times such an
+ * operand (NaN) all fail the range test and take the exact per-lane fix-up. Underflow is +0 both
+ * ways (FZ flushes a tiny result; truncation never rounds one up to 2^-126).
+ * tests/test_spu_rz_fused.c checks both against the exact references over every triple of edge
+ * encodings and random words. */
 SPU__NV_INLINE u128 spu__rz_fm(u128 a, u128 b) {
     const uint32x4_t x = vld1q_u32(a._u32), y = vld1q_u32(b._u32);
-    const uint32x4_t zp = vorrq_u32(spu__nv_z(x), spu__nv_z(y));         /* zero product */
     const float32x4_t s = vmulq_f32(spu__nv_f(x), spu__nv_f(y));
-    const uint32x4_t ok = vorrq_u32(spu__nv_inrange(s), zp);
-    uint32x4_t r = vbicq_u32(spu__nv_flush(spu__nv_u(s)), zp);
+    const uint32x4_t ok = spu__nv_inrange(s);
+    uint32x4_t r = spu__nv_flush(spu__nv_u(s));
     if (!spu__nv_all4(ok)) r = spu__fm_fix(r, ok, x, y);
     return spu__nv_u128(r);
 }
 SPU__NV_INLINE u128 spu__rz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
     const uint32x4_t xa = vld1q_u32(a._u32), y = vld1q_u32(b._u32), zc = vld1q_u32(c._u32);
-    const uint32x4_t zp = vorrq_u32(spu__nv_z(xa), spu__nv_z(y));        /* zero product */
-    const uint32x4_t zi = vbicq_u32(veorq_u32(zc, vdupq_n_u32(negc)), spu__nv_z(zc));   /* zero: +0 */
-    const uint32x4_t x = veorq_u32(xa, vdupq_n_u32(negp));
-    const float32x4_t s = vfmaq_f32(spu__nv_f(zi), spu__nv_f(x), spu__nv_f(y));
-    const uint32x4_t ok = vorrq_u32(spu__nv_inrange(s), zp);
-    uint32x4_t r = vbslq_u32(zp, zi, spu__nv_flush(spu__nv_u(s)));
+    const uint32x4_t x = veorq_u32(xa, vdupq_n_u32(negp)), z = veorq_u32(zc, vdupq_n_u32(negc));
+    const float32x4_t s = vfmaq_f32(spu__nv_f(z), spu__nv_f(x), spu__nv_f(y));
+    const uint32x4_t ok = spu__nv_inrange(s);
+    uint32x4_t r = spu__nv_flush(spu__nv_u(s));
     if (!spu__nv_all4(ok)) r = spu__fma_fix(r, ok, xa, y, zc, negp, negc);
     return spu__nv_u128(r);
 }
@@ -1290,6 +1311,26 @@ SPU__SSE_CMP(spu_fcgt,  _mm_cmpgt_epi32, spu__sse_key)
 SPU__SSE_CMP(spu_fcmeq, _mm_cmpeq_epi32, spu__sse_mag)
 SPU__SSE_CMP(spu_fcmgt, _mm_cmpgt_epi32, spu__sse_mag)
 #undef SPU__SSE_CMP
+#elif defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+#include <arm_neon.h>
+/* The same keys in NEON integer lanes (test_spu_neon_cmp_cvt.c checks them against the
+ * _ref loops): an exponent-0 word is 0, exponent 255 an ordinary magnitude, and a host
+ * float compare would get both wrong, so these never touch the FP unit or FPCR. */
+static inline uint32x4_t spu__nvc_mag(uint32x4_t x) {
+    return vbicq_u32(vandq_u32(x, vdupq_n_u32(0x7FFFFFFFu)), vceqzq_u32(vandq_u32(x, vdupq_n_u32(0x7F800000u))));
+}
+static inline int32x4_t spu__nvc_key(uint32x4_t x) {
+    const int32x4_t neg = vshrq_n_s32(vreinterpretq_s32_u32(x), 31);
+    return vsubq_s32(veorq_s32(vreinterpretq_s32_u32(spu__nvc_mag(x)), neg), neg);
+}
+#define SPU__NVC_CMP(name, expr) static inline u128 name(u128 a, u128 b) { \
+    uint32x4_t A, B; memcpy(&A, &a, 16); memcpy(&B, &b, 16); \
+    const uint32x4_t r = (expr); u128 out; memcpy(&out, &r, 16); return out; }
+SPU__NVC_CMP(spu_fceq,  vceqq_s32(spu__nvc_key(A), spu__nvc_key(B)))
+SPU__NVC_CMP(spu_fcgt,  vcgtq_s32(spu__nvc_key(A), spu__nvc_key(B)))
+SPU__NVC_CMP(spu_fcmeq, vceqq_u32(spu__nvc_mag(A), spu__nvc_mag(B)))
+SPU__NVC_CMP(spu_fcmgt, vcgtq_u32(spu__nvc_mag(A), spu__nvc_mag(B)))
+#undef SPU__NVC_CMP
 #else
 static inline u128 spu_fceq(u128 a, u128 b)  { return spu_fceq_ref(a, b); }
 static inline u128 spu_fcgt(u128 a, u128 b)  { return spu_fcgt_ref(a, b); }
@@ -1829,9 +1870,50 @@ static inline u128 spu_cflts(u128 a, int i8) {
     r = vbicq_u32(r, vceqzq_u32(e));
     u128 out; memcpy(&out, &r, 16); return out;
 }
-static inline u128 spu_cfltu(u128 a, int i8)   { return spu_cfltu_ref(a, i8); }
-static inline u128 spu_csflt(u128 a, int i8)   { return spu_csflt_ref(a, i8); }
-static inline u128 spu_cuflt(u128 a, int i8)   { return spu_cuflt_ref(a, i8); }
+/* cfltu, scales 0..127: the cflts argument with FCVTZU, which truncates and saturates to
+ * 0..2^32-1 like the SPU (a negative value, -0 included, gives 0). The input is normal, so
+ * the scaled value cannot underflow. Exponent 0 gives 0, exponent 255 all ones when
+ * positive and 0 when negative. */
+static inline u128 spu_cfltu(u128 a, int i8) {
+    const int scale = 173 - (i8 & 0xFF);
+    if (scale < 0 || scale > 127) return spu_cfltu_ref(a, i8);
+    uint32x4_t x; memcpy(&x, &a, 16);
+    const float32x4_t f = vmulq_f32(vreinterpretq_f32_u32(x),
+                                    vreinterpretq_f32_u32(vdupq_n_u32((uint32_t)(scale + 127) << 23)));
+    uint32x4_t r = vcvtq_u32_f32(f);
+    const uint32x4_t e = vandq_u32(vshrq_n_u32(x, 23), vdupq_n_u32(0xFFu));
+    const uint32x4_t neg = vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(x), 31));
+    r = vorrq_u32(r, vceqq_u32(e, vdupq_n_u32(0xFFu)));
+    r = vbicq_u32(r, vorrq_u32(vceqzq_u32(e), neg));
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+/* csflt / cuflt, scales 0..127: the integer's magnitude m, normalised by its leading-zero
+ * count c, gives the truncated single directly in integer lanes -- biased exponent
+ * 158 - scale - c (at most 158, so never saturating), fraction the 23 bits below the
+ * leading one -- with no FP operation, so the same in any FPCR. A zero integer or a
+ * biased exponent below 1 gives +0. Other scales use the reference. */
+static inline uint32x4_t spu__nv_cxflt(uint32x4_t m, uint32x4_t sign, int scale) {
+    const uint32x4_t c = vclzq_u32(m);
+    const int32x4_t be = vsubq_s32(vdupq_n_s32(158 - scale), vreinterpretq_s32_u32(c));
+    const uint32x4_t frac = vandq_u32(vshrq_n_u32(vshlq_u32(m, vreinterpretq_s32_u32(c)), 8), vdupq_n_u32(0x7FFFFFu));
+    const uint32x4_t bits = vorrq_u32(sign, vorrq_u32(frac, vshlq_n_u32(vreinterpretq_u32_s32(be), 23)));
+    return vandq_u32(bits, vandq_u32(vcgtzq_s32(be), vtstq_u32(m, m)));
+}
+static inline u128 spu_csflt(u128 a, int i8) {
+    const int scale = 155 - (i8 & 0xFF);
+    if (scale < 0 || scale > 127) return spu_csflt_ref(a, i8);
+    int32x4_t v; memcpy(&v, &a, 16);
+    const uint32x4_t sign = vandq_u32(vreinterpretq_u32_s32(v), vdupq_n_u32(0x80000000u));
+    const uint32x4_t r = spu__nv_cxflt(vreinterpretq_u32_s32(vabsq_s32(v)), sign, scale);  /* |INT_MIN| = 2^31 unsigned */
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+static inline u128 spu_cuflt(u128 a, int i8) {
+    const int scale = 155 - (i8 & 0xFF);
+    if (scale < 0 || scale > 127) return spu_cuflt_ref(a, i8);
+    uint32x4_t v; memcpy(&v, &a, 16);
+    const uint32x4_t r = spu__nv_cxflt(v, vdupq_n_u32(0), scale);
+    u128 out; memcpy(&out, &r, 16); return out;
+}
 #else
 static inline u128 spu_fi(u128 a, u128 b)      { return spu_fi_ref(a, b); }
 static inline u128 spu_frest(u128 a)           { return spu_frest_ref(a); }
