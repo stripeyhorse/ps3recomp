@@ -91,7 +91,14 @@ typedef struct {
     u8   press_square;
     u8   press_l1;
     u8   press_r1;
+    /* Motion in DualShock 3 counts (accel X, Y, Z, gyro); only used while
+     * motion_live, otherwise the guest gets the at-rest values. */
+    u16  sensor[4];
+    u8   motion_live;
 } PadHostState;
+/* A DualShock 3 lying still: 512 is 0 g, so Y = 399 is gravity (113 counts
+ * per g); the gyro is still. */
+static const u16 s_sensor_rest[4] = { 512, 399, 512, 512 };
 
 static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
@@ -216,7 +223,7 @@ static int pad_rumble_pct(void)
     return s_cfg_rumble;
 }
 #if PAD_BACKEND_SDL2
-static int s_cfg_deadzone = -1, s_cfg_quit = -1;
+static int s_cfg_deadzone = -1, s_cfg_quit = -1, s_cfg_motion = -1, s_cfg_shake = -2;
 static int pad_deadzone_pct(void)
 {
     if (s_cfg_deadzone < 0) s_cfg_deadzone = pad_env_percent("PS3_PAD_DEADZONE", 0, 50, 10);
@@ -230,6 +237,32 @@ static int pad_quit_enabled(void)
                              !strcmp(e, "no") || !strcmp(e, "false")));
     }
     return s_cfg_quit;
+}
+/* PS3_PAD_MOTION: the controller's own accelerometer and gyroscope, default
+ * on; the same words as PS3_PAD_QUIT turn it off. */
+static int pad_motion_enabled(void)
+{
+    if (s_cfg_motion < 0) {
+        const char* e = getenv("PS3_PAD_MOTION");
+        s_cfg_motion = !(e && (!*e || !strcmp(e, "0") || !strcmp(e, "off") ||
+                               !strcmp(e, "no") || !strcmp(e, "false")));
+    }
+    return s_cfg_motion;
+}
+/* PS3_PAD_SHAKE_BUTTON: off (default), l3, r3 or touchpad. The SDL button,
+ * or -1 for none. */
+static int pad_shake_button(void)
+{
+    if (s_cfg_shake < -1) {
+        const char* e = getenv("PS3_PAD_SHAKE_BUTTON");
+        s_cfg_shake = -1;
+        if (!e || !strcmp(e, "off")) {}
+        else if (!strcmp(e, "l3"))       s_cfg_shake = SDL_CONTROLLER_BUTTON_LEFTSTICK;
+        else if (!strcmp(e, "r3"))       s_cfg_shake = SDL_CONTROLLER_BUTTON_RIGHTSTICK;
+        else if (!strcmp(e, "touchpad")) s_cfg_shake = SDL_CONTROLLER_BUTTON_TOUCHPAD;
+        else fprintf(stderr, "[cellPad] PS3_PAD_SHAKE_BUTTON=%s: not off, l3, r3 or touchpad, using off\n", e);
+    }
+    return s_cfg_shake;
 }
 #endif
 /* A motor level scaled by PS3_PAD_RUMBLE: 0 never starts a motor. */
@@ -641,6 +674,115 @@ static u16 pad_quit_watch(int p, u16 btns, int guide, unsigned long long now)
     return btns;
 }
 
+/* ---- motion (PS3_PAD_MOTION, PS3_PAD_SHAKE_BUTTON) -------------------------
+ * The guest's sensor block (CELL_PAD_BTN_OFFSET_SENSOR_X..G, sent only in
+ * sensor mode) is a DualShock 3's: 10-bit values centred on 512, 113 counts
+ * per g on the accelerometer, and one gyro axis, yaw, at 123 counts per
+ * 90 degrees/s. A DS3 lying flat reads X 512, Y 399, Z 512, G 512.
+ * SDL's sensor axes (SDL_sensor.h) are +X right, +Y up out of the face,
+ * +Z towards the player, in m/s^2 with gravity included (at rest
+ * Y = +SDL_STANDARD_GRAVITY), and rad/s counter-clockwise; each accelerometer
+ * axis is negated into the DS3's, as RPCS3's SDL handler does, which gives
+ * exactly the at-rest values above.
+ *
+ * SDL's sensors are enabled for a port only while the guest has sensor mode
+ * on there and PS3_PAD_MOTION is on, and disabled again when either goes.
+ *
+ * Shake button: PAIN counts a shake when the mean frame-to-frame change of
+ * sensor Y, after its own low-pass filter, is at least 20 counts over its
+ * last four samples (func_0021D8EC, threshold at 0xC6F164). While the button
+ * is held, Y swings 3 g either side of rest at 4 Hz in a triangle wave (an
+ * even change per frame), from the moment of the press, which keeps that
+ * mean above 20 from 15 to 60 game frames per second; release returns to rest
+ * at once. The button's own press still reaches the guest. */
+#define PAD_DS3_ONE_G     113
+#define PAD_SHAKE_G         3
+#define PAD_SHAKE_PERIOD_MS 250
+#define PAD_MOTION_ACCEL    1
+#define PAD_MOTION_GYRO     2
+static int s_motion_want[PAD_MAX_HOST_PORTS];      /* sensors asked for on this port */
+static int s_motion_on[PAD_MAX_HOST_PORTS];        /* PAD_MOTION_* SDL enabled */
+static unsigned long long s_shake_ms[PAD_MAX_HOST_PORTS];   /* press time, 0 = not held */
+
+static u16 pad_ds3_count(double v)
+{
+    v = v < 0 ? v - 0.5 : v + 0.5;
+    return (u16)(v < 0 ? 0 : v > 1023 ? 1023 : (int)v);
+}
+
+/* SDL accelerometer (m/s^2) and yaw rate (rad/s) as DS3 sensor counts. */
+static void pad_ds3_sensors(const float accel[3], float yaw, u16 out[4])
+{
+    for (int k = 0; k < 3; k++)
+        out[k] = pad_ds3_count(512.0 - accel[k] / SDL_STANDARD_GRAVITY * PAD_DS3_ONE_G);
+    out[3] = pad_ds3_count(512.0 + yaw * (180.0 / 3.14159265358979323846) * (123.0 / 90.0));
+}
+
+/* Turn port p's SDL sensors on or off to match `want`. */
+static void pad_sdl_motion_switch(int p, SDL_GameController* gc, int want)
+{
+    if (want == s_motion_want[p]) return;
+    s_motion_want[p] = want;
+    static const SDL_SensorType type[2] = { SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO };
+    for (int k = 0; k < 2; k++) {
+        const int bit = k ? PAD_MOTION_GYRO : PAD_MOTION_ACCEL;
+        if (want && SDL_GameControllerHasSensor(gc, type[k]) &&
+            SDL_GameControllerSetSensorEnabled(gc, type[k], SDL_TRUE) == 0)
+            s_motion_on[p] |= bit;
+        else if (!want && (s_motion_on[p] & bit)) {
+            SDL_GameControllerSetSensorEnabled(gc, type[k], SDL_FALSE);
+            s_motion_on[p] &= ~bit;
+        }
+    }
+    if (want)
+        fprintf(stderr, "[cellPad] port %d: motion sensors %s\n", p,
+                s_motion_on[p] == (PAD_MOTION_ACCEL | PAD_MOTION_GYRO) ? "accelerometer and gyroscope"
+                : s_motion_on[p] == PAD_MOTION_ACCEL ? "accelerometer only"
+                : s_motion_on[p] == PAD_MOTION_GYRO ? "gyroscope only" : "none");
+}
+
+/* Port p's sensor block for this poll: the shake while its button is held,
+ * else the controller's own sensors, else nothing (the at-rest values). */
+static void pad_sdl_motion(int p, SDL_GameController* gc, unsigned long long now)
+{
+    PadHostState* hs = &s_host_state[p];
+    pad_sdl_motion_switch(p, gc, pad_motion_enabled() && (s_port_setting[p] & CELL_PAD_SETTING_SENSOR_ON));
+    hs->motion_live = 0;
+    const int sb = pad_shake_button();
+    if (sb >= 0 && SDL_GameControllerGetButton(gc, (SDL_GameControllerButton)sb)) {
+        if (!s_shake_ms[p]) s_shake_ms[p] = now;
+        /* A triangle wave, -1..1, starting at 0 on its way up. */
+        const double q = (double)((now - s_shake_ms[p]) % PAD_SHAKE_PERIOD_MS) / PAD_SHAKE_PERIOD_MS;
+        const double wave = q < 0.25 ? 4 * q : q < 0.75 ? 2 - 4 * q : 4 * q - 4;
+        memcpy(hs->sensor, s_sensor_rest, sizeof hs->sensor);
+        hs->sensor[1] = pad_ds3_count(s_sensor_rest[1] + PAD_SHAKE_G * PAD_DS3_ONE_G * wave);
+        hs->motion_live = 1;
+        return;
+    }
+    s_shake_ms[p] = 0;
+    if (!s_motion_on[p]) return;
+    float accel[3] = { 0, 0, 0 }, gyro[3] = { 0, 0, 0 };
+    const int got_accel = (s_motion_on[p] & PAD_MOTION_ACCEL) &&
+        SDL_GameControllerGetSensorData(gc, SDL_SENSOR_ACCEL, accel, 3) == 0;
+    const int got_gyro = (s_motion_on[p] & PAD_MOTION_GYRO) &&
+        SDL_GameControllerGetSensorData(gc, SDL_SENSOR_GYRO, gyro, 3) == 0;
+    /* All zero is a sensor that has not reported yet, not free fall: a jump
+     * from rest to 512 and back would read as a shake. */
+    if (!got_accel || (accel[0] == 0 && accel[1] == 0 && accel[2] == 0)) {
+        accel[0] = accel[2] = 0;
+        accel[1] = SDL_STANDARD_GRAVITY;
+    }
+    if (!got_gyro) gyro[1] = 0;
+    pad_ds3_sensors(accel, gyro[1], hs->sensor);
+    hs->motion_live = 1;
+}
+
+static void pad_sdl_motion_reset(int p)
+{
+    s_motion_want[p] = s_motion_on[p] = 0;
+    s_shake_ms[p] = 0;
+}
+
 static u8 pad_sdl_trigger_to_u8(int raw)
 {
     /* SDL trigger: 0..32767 -> 0..255 */
@@ -705,6 +847,7 @@ static void pad_sdl_close(int p, int gone)
     s_sdl_ids[p] = -1;
     memset(&s_rumble[p], 0, sizeof s_rumble[p]);
     memset(&s_quit_hold[p], 0, sizeof s_quit_hold[p]);
+    pad_sdl_motion_reset(p);
     pad_host_release(&s_host_state[p]);
 }
 
@@ -733,6 +876,7 @@ static void pad_sdl_scan(void)
         s_sdl_last_guid[port] = guid;
         s_sdl_had[port] = 1;
         memset(&s_rumble[port], 0, sizeof s_rumble[port]);   /* nothing left over from before */
+        pad_sdl_motion_reset(port);
         SDL_GameControllerRumble(gc, 0, 0, 0);
         const char* name = SDL_GameControllerName(gc);
         fprintf(stderr, "[cellPad] SDL controller %s on port %d: %s (instance %d)%s\n",
@@ -779,6 +923,7 @@ static void pad_poll_sdl2(void)
             pad_host_release(&s_host_state[i]);
             memset(&s_rumble[i], 0, sizeof s_rumble[i]);
             memset(&s_quit_hold[i], 0, sizeof s_quit_hold[i]);
+            pad_sdl_motion_reset(i);
             continue;
         }
 
@@ -839,6 +984,8 @@ static void pad_poll_sdl2(void)
         s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
         s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+
+        pad_sdl_motion(i, gc, pad_now_ms());
     }
 }
 
@@ -1306,13 +1453,14 @@ skip_inject: ;
                 data->button[pm[k].off] = 255;
     }
 
-    /* Sensor data (only meaningful if SENSOR_ON) */
+    /* Sensor data (only meaningful if SENSOR_ON): the controller's motion
+     * (SDL backend, see pad_sdl_motion), else the at-rest values. */
     if (setting & CELL_PAD_SETTING_SENSOR_ON) {
-        /* Default sensor values: accelerometer at rest (512 = 1g center) */
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = 512;
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 399; /* gravity */
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
+        const u16* s = hs->motion_live ? hs->sensor : s_sensor_rest;
+        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = s[0];
+        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = s[1];
+        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = s[2];
+        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = s[3];
     }
     }  /* end connected block */
 
