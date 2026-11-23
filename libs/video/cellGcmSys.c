@@ -19,6 +19,17 @@
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
+/* This file's own PS3_FTRACE kinds, numbered past the header's so the shared
+ * enum (which the lifted code can see) does not change. */
+enum {
+    GCM_FT_KICK_WAIT  = 20,  /* frame clock idle in cellGcm_fifo_kick_wait, a = 1 woken early     */
+    GCM_FT_REF_PUSH   = 21,  /* instant: the walker reached SET_REFERENCE, a = value, b = get      */
+    GCM_FT_REF_PUB    = 22,  /* instant: REF published to the guest, a = value, b = 1 from a poll  */
+    GCM_FT_REF_SPIN   = 23,  /* a guest thread spinning on REF, a = REF at start, b = REF at end   */
+    GCM_FT_DRAIN_STOP = 24,  /* instant: why a drain pass stopped, a = reason | (get != put) << 8, b = get */
+    GCM_FT_VBLANK     = 25,  /* instant: a vblank tick published, a = count                        */
+    GCM_FT_FLIP_DONE  = 26,  /* instant: a flip completion marked at a tick (cellGcmTickFlip)      */
+};
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -962,6 +973,91 @@ static int gcm_vblank_counted(void)
     return (int)gcm_env_once(&v, "PS3_VBLANK_COUNTED", gcm_parse_default_on);
 }
 
+/* FIFO park wake and the frame-pacing counters (PS3_VBLANK_STATS).
+ *
+ * A self-JUMP park is a hole in the command stream: PAIN's SPU mesh jobs (and
+ * Edge geometry in general) reserve them and patch each into a JUMP to the
+ * commands they built. The RSX spins on the word and runs on the moment it
+ * changes. The walker stops the pass there and waits for its kick, which a
+ * patch -- an SPU DMA or a PPU store to the ring, not to PUT -- never sends, so
+ * it noticed a patched park only when its idle wait (PAIN_FIFO_WAIT_MS, 4 ms)
+ * ran out. Headless, a Crash Course frame stopped at about three parks, each
+ * then sat out the whole 4 ms. PS3_GCM_PARK_WAKE=1 (the default) watches the
+ * park word while it waits, every PS3_GCM_PARK_POLL_US (default 100), and runs
+ * the next pass as soon as it changes; past PS3_GCM_PARK_POLL_MS (default 100)
+ * on one park it goes back to the plain wait, so a park nobody patches costs
+ * no CPU. =0 is the plain wait. */
+static int gcm_park_wake_on(void)
+{
+    static gcm_a32 v;
+    return (int)gcm_env_once(&v, "PS3_GCM_PARK_WAKE", gcm_parse_default_on);
+}
+static u32 gcm_parse_park_poll_us(const char* e)
+{
+    const int n = e && *e ? atoi(e) : 100;
+    return (u32)(n < 20 ? 20 : n > 4000 ? 4000 : n);
+}
+static u32 gcm_park_poll_us(void)
+{
+    static gcm_a32 v;
+    return gcm_env_once(&v, "PS3_GCM_PARK_POLL_US", gcm_parse_park_poll_us);
+}
+static u32 gcm_parse_park_poll_ms(const char* e)
+{
+    const int n = e && *e ? atoi(e) : 100;
+    return (u32)(n < 1 ? 1 : n > 10000 ? 10000 : n);
+}
+static u32 gcm_park_poll_ms(void)
+{
+    static gcm_a32 v;
+    return gcm_env_once(&v, "PS3_GCM_PARK_POLL_MS", gcm_parse_park_poll_ms);
+}
+/* The park the last pass stopped on: set by the walker, read by the frame
+ * clock's idle wait (the same thread today, atomics in case it is not). */
+static gcm_a32 s_park_watch_on, s_park_watch_io, s_park_watch_word;
+static gcm_a64 s_park_watch_since_ns;
+/* Cumulative, nanoseconds unless noted. Walker side: passes that stopped on a
+ * park, time idle in the wait with a park outstanding, of that the time after
+ * the park word had already changed ("late": what the plain wait loses), and
+ * waits a patch ended. All idle time of the frame clock's wait. Guest side:
+ * runs of REF polls (the frame's "wait for the RSX"), their time, and how much
+ * of it the walker spent idle / idle at a park meanwhile. */
+static gcm_a64 s_pace_park_stops, s_pace_park_wait_ns, s_pace_park_late_ns, s_pace_park_patch_wakes;
+static gcm_a64 s_pace_idle_ns, s_pace_parked_ns, s_pace_idle_since, s_pace_parked_since;
+static gcm_a64 s_pace_ref_spins, s_pace_ref_spin_ns, s_pace_ref_spin_idle_ns, s_pace_ref_spin_parked_ns;
+
+static u64 gcm_pace_idle_at(u64 now, int parked)
+{
+    const u64 since = parked ? GCM_A64_LOAD(s_pace_parked_since) : GCM_A64_LOAD(s_pace_idle_since);
+    const u64 total = parked ? GCM_A64_LOAD(s_pace_parked_ns) : GCM_A64_LOAD(s_pace_idle_ns);
+    return total + (since && now > since ? now - since : 0);
+}
+
+/* For a port's own per-frame accounting: the counters above, in this order. */
+void cellGcm_pace_counters(uint64_t* out, unsigned n)
+{
+    const u64 v[10] = {
+        GCM_A64_LOAD(s_pace_ref_spins), GCM_A64_LOAD(s_pace_ref_spin_ns),
+        GCM_A64_LOAD(s_pace_ref_spin_idle_ns), GCM_A64_LOAD(s_pace_ref_spin_parked_ns),
+        GCM_A64_LOAD(s_pace_park_stops), GCM_A64_LOAD(s_pace_park_wait_ns),
+        GCM_A64_LOAD(s_pace_park_late_ns), GCM_A64_LOAD(s_pace_park_patch_wakes),
+        gcm_pace_idle_at(get_timestamp_ns(), 0), gcm_pace_idle_at(get_timestamp_ns(), 1),
+    };
+    for (unsigned i = 0; i < n && i < 10; i++) out[i] = v[i];
+}
+
+static void gcm_pace_stats_print(void)
+{
+    uint64_t c[10];
+    cellGcm_pace_counters(c, 10);
+    fprintf(stderr, "[rsx-pace] park_wake=%d poll_us=%u park_stops=%llu park_wait_ms=%.1f park_late_ms=%.1f "
+            "park_patch_wakes=%llu walker_idle_ms=%.1f walker_parked_ms=%.1f ref_spins=%llu ref_spin_ms=%.1f "
+            "ref_spin_walker_idle_ms=%.1f ref_spin_walker_parked_ms=%.1f%c",
+            gcm_park_wake_on(), gcm_park_poll_us(), (unsigned long long)c[4], c[5] / 1e6, c[6] / 1e6,
+            (unsigned long long)c[7], c[8] / 1e6, c[9] / 1e6, (unsigned long long)c[0], c[1] / 1e6,
+            c[2] / 1e6, c[3] / 1e6, 10);
+}
+
 static u32 gcm_vblank_backlog_max(void)
 {
     static gcm_a32 v;
@@ -1041,6 +1137,7 @@ static void gcm_vblank_stats_print(void)
     char line[768];
     cellGcm_vblank_stats_line(line, sizeof line);
     fprintf(stderr, "%s%c", line, 10);
+    gcm_pace_stats_print();
 }
 
 /* Publish one tick: its count (the vblank count after this tick's increment)
@@ -1053,6 +1150,7 @@ static void gcm_vblank_publish(u32 count_after)
     GCM_A64_STORE(s_vb_ring[next % GCM_VB_RING].t_ns, now);
     GCM_A32_STORE(s_vb_ring[next % GCM_VB_RING].count, count_after);
     GCM_A32_PUBLISH(s_vb_published);
+    if (PS3_FT_ON()) ps3_ft_span(GCM_FT_VBLANK, 0, count_after, 0, now, now);
     if (gcm_vblank_stats_on()) {
         static u64 last_print;
         static int registered;
@@ -1387,6 +1485,7 @@ void cellGcmTickFlip(void)
     if (waiting) s_flip_tick_seq = s_flip_req_seq;
     FLIP_UNLOCK();
     if (waiting) GCM_PENDING_SET(2);
+    if (waiting && PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(GCM_FT_FLIP_DONE, 0, 0, 0, t, t); }
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -2331,6 +2430,7 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
     GCM_REFQ_STORE(s_ref_qtail, t + 1);       /* publishes the slot */
+    if (PS3_FT_ON()) { const uint64_t ft = ps3_ft_now(); ps3_ft_span(GCM_FT_REF_PUSH, 0, v, getoff, ft, ft); }
 }
 
 /* Global fence-publication counter: lets the lwmutex convoy trace correlate a
@@ -2348,6 +2448,7 @@ unsigned long long ps3_qpc_us(void)
     return (unsigned long long)(n.QuadPart / (f.QuadPart / 1000000));
 }
 
+static int s_ref_publishing_from_poll;   /* under s_ref_pub_lock: for PS3_FTRACE */
 static void gcm_ref_publish_one(void)
 {
     const u32 h = GCM_REFQ_HEAD_LOAD();
@@ -2362,6 +2463,8 @@ static void gcm_ref_publish_one(void)
                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
     GCM_REFQ_STORE(s_ref_qhead, h + 1);       /* release: the slot is free */
     g_gcm_ref_pub_count++;
+    if (PS3_FT_ON()) { const uint64_t ft = ps3_ft_now();
+                       ps3_ft_span(GCM_FT_REF_PUB, 0, s_ref_q[h % GCM_REF_QLEN], s_ref_publishing_from_poll, ft, ft); }
 }
 
 /* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the
@@ -2475,6 +2578,77 @@ static int gcm_put_wake_on(void)
     return on;
 }
 
+/* The park word, read while another thread (an SPU job's DMA, the PPU) may
+ * be writing it: one aligned 32-bit load, in guest byte order. */
+static u32 gcm_park_word_load(u32 ea)
+{
+    const volatile u32* w = (const volatile u32*)(vm_base + (ea & ~3u));
+#ifdef _WIN32
+    const u32 v = *w;
+    return _byteswap_ulong(v);
+#else
+    const u32 v = __atomic_load_n((const u32*)w, __ATOMIC_ACQUIRE);
+    return __builtin_bswap32(v);
+#endif
+}
+
+/* The idle wait itself: the kick event for up to `ms`, and with a park
+ * outstanding (and PS3_GCM_PARK_WAKE or PS3_VBLANK_STATS on) a watch on the
+ * park word in PS3_GCM_PARK_POLL_US slices. Returns 1 if woken (kick or
+ * patch), 0 on timeout. With the switch off and stats on, the watch only
+ * measures: the wait still ends on the kick or the timeout, as before. */
+static int gcm_kick_wait_event(HANDLE ev, unsigned ms)
+{
+    const int stats = gcm_vblank_stats_on(), wake = gcm_park_wake_on();
+    const int parked = GCM_A32_LOAD(s_park_watch_on) != 0;
+    const u64 t0 = (stats || parked) ? get_timestamp_ns() : 0;
+    if (stats) {
+        GCM_A64_STORE(s_pace_idle_since, t0);
+        if (parked) GCM_A64_STORE(s_pace_parked_since, t0);
+    }
+    int woken = 0;
+    u64 patched_at = 0;
+    const u32 io = GCM_A32_LOAD(s_park_watch_io);
+    const u32 ea = parked ? gcm_io2ea(io) : 0;
+    const int watch = ea && (wake || stats) &&
+                      t0 - GCM_A64_LOAD(s_park_watch_since_ns) < (u64)gcm_park_poll_ms() * 1000000ull;
+    if (!watch) {
+        woken = WaitForSingleObject(ev, ms) == WAIT_OBJECT_0;
+    } else {
+        const u32 word = GCM_A32_LOAD(s_park_watch_word);
+        const u64 deadline = t0 + (u64)ms * 1000000ull, slice = (u64)gcm_park_poll_us() * 1000ull;
+        for (;;) {
+            if (WaitForSingleObject(ev, 0) == WAIT_OBJECT_0) { woken = 1; break; }
+            u64 now = get_timestamp_ns();
+            if (!patched_at && gcm_park_word_load(ea) != word) {
+                patched_at = now;
+                if (wake) { woken = 1; GCM_A64_ADD(s_pace_park_patch_wakes, 1u); break; }
+            }
+            if (now >= deadline) break;
+            const u64 left = deadline - now, step = left < slice ? left : slice;
+#ifdef _WIN32
+            if (WaitForSingleObject(ev, step >= 1000000ull ? (DWORD)(step / 1000000ull) : 1) == WAIT_OBJECT_0) {
+                woken = 1; break;
+            }
+#else
+            usleep((useconds_t)(step / 1000ull ? step / 1000ull : 1));
+#endif
+        }
+    }
+    if (stats) {
+        const u64 t1 = get_timestamp_ns();
+        if (parked) {
+            GCM_A64_ADD(s_pace_parked_ns, t1 - t0);
+            GCM_A64_STORE(s_pace_parked_since, 0);
+            GCM_A64_ADD(s_pace_park_wait_ns, t1 - t0);
+            if (patched_at) GCM_A64_ADD(s_pace_park_late_ns, t1 - patched_at);
+        }
+        GCM_A64_ADD(s_pace_idle_ns, t1 - t0);
+        GCM_A64_STORE(s_pace_idle_since, 0);
+    }
+    return woken;
+}
+
 void cellGcm_fifo_kick_wait(unsigned ms)
 {
     static int on = -1;
@@ -2487,17 +2661,58 @@ void cellGcm_fifo_kick_wait(unsigned ms)
             gcm_put_wake_init(&s_put_wake, GCM_CONTROL_GUEST_ADDR, ev);
             atomic_store_explicit(&s_put_wake_active, 1, memory_order_release);
         }
-        if (!gcm_put_wake_arm(&s_put_wake)) WaitForSingleObject(ev, ms);
+        const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        int woken = 1;
+        if (!gcm_put_wake_arm(&s_put_wake)) woken = gcm_kick_wait_event(ev, ms);
         gcm_put_wake_disarm(&s_put_wake);
+        if (ft0) ps3_ft_span(GCM_FT_KICK_WAIT, 0, (u32)woken, 0, ft0, ps3_ft_now());
         return;
     }
-    if (ev) WaitForSingleObject(ev, ms);
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    int woken = 0;
+    if (ev) woken = gcm_kick_wait_event(ev, ms);
     else    Sleep(ms);
+    if (ft0) ps3_ft_span(GCM_FT_KICK_WAIT, 0, (u32)woken, 0, ft0, ps3_ft_now());
 }
 
 
+/* PS3_FTRACE: one span per run of REF polls by a thread (polls closer than
+ * 1 ms apart), so a timeline shows how long the guest waited on the RSX. */
+static void gcm_ft_ref_spin(void)
+{
+    static PPU_THREAD_LOCAL uint64_t t0, t1;
+    static PPU_THREAD_LOCAL u32 v0, v1;
+    const uint64_t now = ps3_ft_now();
+    const uint8_t* r = vm_base + GCM_CONTROL_GUEST_ADDR + 8;
+    const u32 v = ((u32)r[0] << 24) | ((u32)r[1] << 16) | ((u32)r[2] << 8) | r[3];
+    if (t0 && now - t1 < 1000000ull) { t1 = now; v1 = v; return; }
+    if (t0) ps3_ft_span(GCM_FT_REF_SPIN, (uint32_t)GetCurrentThreadId() & 0xFFu, v0, v1, t0, t1);
+    t0 = t1 = now; v0 = v1 = v;
+}
+
+/* PS3_VBLANK_STATS: a run of REF polls by one thread (closer than 1 ms apart)
+ * is the guest waiting for the RSX; count its time, and the walker's idle and
+ * parked time inside it, poll by poll, so the totals are current at any frame
+ * boundary. */
+static void gcm_pace_ref_spin(void)
+{
+    static PPU_THREAD_LOCAL u64 last, idle, parked;
+    const u64 now = get_timestamp_ns();
+    const u64 i = gcm_pace_idle_at(now, 0), p = gcm_pace_idle_at(now, 1);
+    if (last && now - last < 1000000ull) {
+        GCM_A64_ADD(s_pace_ref_spin_ns, now - last);
+        if (i > idle) GCM_A64_ADD(s_pace_ref_spin_idle_ns, i - idle);
+        if (p > parked) GCM_A64_ADD(s_pace_ref_spin_parked_ns, p - parked);
+    } else {
+        GCM_A64_ADD(s_pace_ref_spins, 1u);
+    }
+    last = now; idle = i; parked = p;
+}
+
 void cellGcm_ref_on_poll(void)
 {
+    if (PS3_FT_ON()) gcm_ft_ref_spin();
+    if (gcm_vblank_stats_on()) gcm_pace_ref_spin();
     /* Pace: leave each published value observable for >= ~200us of spins
      * (equality-waiters at any poll rate see every value; still ~5000/s so
      * loading's fence storms clear in seconds, not minutes). */
@@ -2510,7 +2725,9 @@ void cellGcm_ref_on_poll(void)
     LONGLONG min_gap = s_freq.QuadPart / 5000;          /* ~200us */
     int dry = 0;
     if (now.QuadPart - s_last_pub >= min_gap) {
+        s_ref_publishing_from_poll = 1;
         gcm_ref_publish_one();
+        s_ref_publishing_from_poll = 0;
         s_last_pub = now.QuadPart;
         dry = (GCM_REFQ_HEAD_LOAD() == GCM_REFQ_TAIL_LOAD());
     }
@@ -3516,6 +3733,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * ring start, and the resync dropped them: inFAMOUS 2 stopped presenting
      * for good that way in about one New Marais run in five ("stuck-get" at a
      * self-jump with no "jump-park" before it). */
+    if (PS3_FT_ON()) {
+        /* 0 caught up (or out of budget), 1 flip, 2 park, 3 acquire, 4 report hold, 9 other. */
+        u32 code = !strcmp(why, "caught-up") ? 0u : !strcmp(why, "flip") ? 1u : !strcmp(why, "parked") ? 2u : 9u;
+        if (s_sema_blocked_pass) code = 3u;
+        if (s_report_hold_pass) code = 4u;
+        const uint64_t ft = ps3_ft_now();
+        ps3_ft_span(GCM_FT_DRAIN_STOP, 0, code | ((s_fifo_getoff != put) ? 0x100u : 0u), s_fifo_getoff, ft, ft);
+    }
+    /* The park this pass stopped on, for the idle wait to watch. */
+    if (!strcmp(why, "parked") && s_fifo_getoff != put && gcm_io2ea(s_fifo_getoff)) {
+        if (!GCM_A32_LOAD(s_park_watch_on) || GCM_A32_LOAD(s_park_watch_io) != s_fifo_getoff)
+            GCM_A64_STORE(s_park_watch_since_ns, get_timestamp_ns());
+        GCM_A32_STORE(s_park_watch_io, s_fifo_getoff);
+        GCM_A32_STORE(s_park_watch_word, vm_read32(gcm_io2ea(s_fifo_getoff)));
+        GCM_A32_STORE(s_park_watch_on, 1u);
+        GCM_A64_ADD(s_pace_park_stops, 1u);
+    } else {
+        GCM_A32_STORE(s_park_watch_on, 0u);
+    }
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
       if (s_sema_blocked_pass || s_park_pass || s_report_hold_pass) {
           stuck = 0; last = s_fifo_getoff;

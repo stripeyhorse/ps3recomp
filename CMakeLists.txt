@@ -647,6 +647,26 @@ if(PS3RECOMP_BUILD_TESTS)
         endif()
         add_test(NAME gcm_ref_queue COMMAND test_gcm_ref_queue)
         set_tests_properties(gcm_ref_queue PROPERTIES TIMEOUT 120)
+
+        # The FIFO park wake (PS3_GCM_PARK_WAKE): a park patched by another
+        # thread ends the frame clock's idle wait; =0 waits out the timeout.
+        add_executable(test_gcm_park_wake
+            libs/video/tests/test_gcm_park_wake.c
+            runtime/spu/spu_coherency.c
+            runtime/platform/win32_compat.c)
+        target_include_directories(test_gcm_park_wake PRIVATE include libs/video)
+        target_link_libraries(test_gcm_park_wake PRIVATE pthread)
+        target_compile_options(test_gcm_park_wake PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+        if(APPLE)
+            target_link_options(test_gcm_park_wake PRIVATE -Wl,-dead_strip)
+        else()
+            target_link_options(test_gcm_park_wake PRIVATE -Wl,--gc-sections)
+        endif()
+        add_test(NAME gcm_park_wake COMMAND test_gcm_park_wake)
+        add_test(NAME gcm_park_wake_stats COMMAND test_gcm_park_wake)
+        add_test(NAME gcm_park_wake_off COMMAND test_gcm_park_wake)
+        set_tests_properties(gcm_park_wake_stats PROPERTIES ENVIRONMENT "PS3_VBLANK_STATS=1")
+        set_tests_properties(gcm_park_wake_off PROPERTIES ENVIRONMENT "PS3_GCM_PARK_WAKE=0;PS3_VBLANK_STATS=1")
     endif()
 
 
