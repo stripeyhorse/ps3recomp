@@ -3840,6 +3840,153 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     return fn;
 }
 
+/* ---- pipeline archive -----------------------------------------------------
+ * PS3RECOMP_PIPELINE_CACHE=<dir>: the pipelines prepared before Play are kept
+ * in a Metal binary archive, <dir>/pipelines.metalarchive, so the next start
+ * loads their GPU code instead of compiling it. pipelines.id beside it names
+ * the GPU and the macOS build it was made on; an archive from another one is
+ * not opened. Every prepared pipeline first looks itself up in the archive
+ * (MTLPipelineOptionFailOnBinaryArchiveMiss, which also counts the hits) and
+ * is compiled as before on a miss, so a missing, unreadable or stale archive
+ * only costs the compile. When anything had to be compiled, a fresh archive
+ * of everything prepared this start is written after preparation, on a
+ * background queue, to a temporary file renamed over the old one: an archive
+ * is never added to after it has been loaded or saved (macOS 27 refuses some
+ * of those), and pipelines no longer prepared drop out of it. Pipelines built
+ * during play are not added here; the draw engine records them, they are
+ * prepared on the next start, and join the archive then. */
+static id s_arch_read;                 /* id<MTLBinaryArchive>: lookups only */
+static NSMutableArray* s_arch_descs;   /* this start's prepared descriptors */
+static NSString* s_arch_dir;
+static u32 s_arch_hits, s_arch_compiles;
+static double s_arch_hit_ms, s_arch_compile_ms;
+
+static double arch_now_ms(void) { return CACurrentMediaTime() * 1000.0; }
+
+static NSString* arch_fingerprint(void)
+{
+    return [NSString stringWithFormat:@"pipeline archive 1\ngpu %@\nmacos %@\n",
+            [s_dev name], [[NSProcessInfo processInfo] operatingSystemVersionString]];
+}
+
+static void arch_open(void)
+{
+    const char* dir = getenv("PS3RECOMP_PIPELINE_CACHE");
+    s_arch_read = nil; s_arch_descs = nil; s_arch_dir = nil;
+    s_arch_hits = s_arch_compiles = 0;
+    s_arch_hit_ms = s_arch_compile_ms = 0.0;
+    if (!dir || !*dir || !s_guest_shaders) return;
+    if (@available(macOS 11.0, *)) {
+        s_arch_dir = [NSString stringWithUTF8String:dir];
+        s_arch_descs = [NSMutableArray array];
+        NSString* path = [s_arch_dir stringByAppendingPathComponent:@"pipelines.metalarchive"];
+        NSString* idPath = [s_arch_dir stringByAppendingPathComponent:@"pipelines.id"];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return;
+        NSString* made = [NSString stringWithContentsOfFile:idPath encoding:NSUTF8StringEncoding error:nil];
+        if (![made isEqualToString:arch_fingerprint()]) {
+            fprintf(stderr, "[shader-prep] Pipeline archive was made on another GPU or macOS build;"
+                            " compiling and replacing it\n");
+            return;
+        }
+        MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
+        d.url = [NSURL fileURLWithPath:path];
+        NSError* err = nil;
+        const double t = arch_now_ms();
+        s_arch_read = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
+        const unsigned long long bytes = [[[NSFileManager defaultManager]
+            attributesOfItemAtPath:path error:nil] fileSize];
+        if (!s_arch_read)
+            fprintf(stderr, "[shader-prep] Pipeline archive could not be opened (%s);"
+                            " compiling and replacing it\n",
+                    [[err localizedDescription] UTF8String]);
+        else
+            fprintf(stderr, "[shader-prep] Opened pipeline archive (%llu KB) in %.0f ms\n",
+                    bytes / 1024ull, arch_now_ms() - t);
+    }
+}
+
+/* A pipeline state for the descriptor: from the archive when it has one,
+ * compiled otherwise. While preparing, the descriptor is kept for the next
+ * archive. */
+static id<MTLRenderPipelineState> eng_new_pso(MTLRenderPipelineDescriptor* pd, NSError** err)
+{
+    const int preparing = s_arch_descs && rsx_draw_engine_preparing_shaders();
+    const double t = arch_now_ms();
+    id<MTLRenderPipelineState> pso = nil;
+    if (@available(macOS 11.0, *)) {
+        if (s_arch_read) {
+            pd.binaryArchives = @[ s_arch_read ];
+            pso = [s_dev newRenderPipelineStateWithDescriptor:pd
+                                                      options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                   reflection:nil
+                                                        error:nil];
+            if (pso) {
+                if (preparing) {
+                    s_arch_hits++;
+                    s_arch_hit_ms += arch_now_ms() - t;
+                    [s_arch_descs addObject:[pd copy]];
+                }
+                return pso;
+            }
+        }
+    }
+    pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:err];
+    if (pso && preparing) {
+        s_arch_compiles++;
+        s_arch_compile_ms += arch_now_ms() - t;
+        [s_arch_descs addObject:[pd copy]];
+    }
+    return pso;
+}
+
+static void arch_commit(void)
+{
+    NSArray* descs = s_arch_descs;
+    s_arch_descs = nil;
+    if (!descs) return;
+    fprintf(stderr, "[shader-prep] Pipeline states: %u from the archive in %.0f ms,"
+                    " %u compiled in %.0f ms\n",
+            s_arch_hits, s_arch_hit_ms, s_arch_compiles, s_arch_compile_ms);
+    if (!descs.count || (s_arch_read && !s_arch_compiles)) return;
+    if (@available(macOS 11.0, *)) {
+        id<MTLDevice> dev = s_dev;
+        NSString* dir = s_arch_dir;
+        NSString* made = arch_fingerprint();
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                const double t = arch_now_ms();
+                NSString* path = [dir stringByAppendingPathComponent:@"pipelines.metalarchive"];
+                NSString* tmp = [dir stringByAppendingPathComponent:@"pipelines.metalarchive.tmp"];
+                NSString* idPath = [dir stringByAppendingPathComponent:@"pipelines.id"];
+                NSError* err = nil;
+                id<MTLBinaryArchive> archive =
+                    [dev newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&err];
+                u32 added = 0;
+                for (MTLRenderPipelineDescriptor* pd in descs) {
+                    NSError* e = nil;
+                    if ([archive addRenderPipelineFunctionsWithDescriptor:pd error:&e]) added++;
+                    else if (!err) err = e;
+                }
+                unlink([tmp fileSystemRepresentation]);
+                BOOL ok = archive && added &&
+                          [archive serializeToURL:[NSURL fileURLWithPath:tmp] error:&err];
+                if (ok) ok = rename([tmp fileSystemRepresentation], [path fileSystemRepresentation]) == 0;
+                if (ok) ok = [made writeToFile:idPath atomically:YES encoding:NSUTF8StringEncoding error:&err];
+                if (!ok) unlink([tmp fileSystemRepresentation]);
+                const unsigned long long bytes = ok ? [[[NSFileManager defaultManager]
+                    attributesOfItemAtPath:path error:nil] fileSize] : 0;
+                if (ok)
+                    fprintf(stderr, "[shader-prep] Saved pipeline archive: %u of %u pipelines,"
+                                    " %llu KB, in %.0f ms\n",
+                            added, (u32)descs.count, bytes / 1024ull, arch_now_ms() - t);
+                else
+                    fprintf(stderr, "[shader-prep] Could not save the pipeline archive (%s)\n",
+                            err ? [[err localizedDescription] UTF8String] : "nothing to add");
+            }
+        });
+    }
+}
+
 static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                const rsx_be_render_state* rs,
                                const rsx_vertex_layout_plan* layout,
@@ -3928,8 +4075,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     }
 
     NSError* err = nil;
-    id<MTLRenderPipelineState> pso =
-        [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    id<MTLRenderPipelineState> pso = eng_new_pso(pd, &err);
     if (!pso) {
         fprintf(stderr, "[rsx engine/metal] pipeline state failed: %s\n",
                 [[err localizedDescription] UTF8String]);
@@ -3948,7 +4094,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
             pd.vertexFunction = pull_vs;
             pd.vertexDescriptor = nil;
             err = nil;
-            pull_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            pull_pso = eng_new_pso(pd, &err);
             if (!pull_pso)
                 fprintf(stderr, "[rsx engine/metal] vertex-pull pipeline state failed: %s\n",
                         [[err localizedDescription] UTF8String]);
@@ -5640,10 +5786,13 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * passes both ways. PS3RECOMP_RSX_ENGINE=vtable is the way back, and
          * it stays that way until the vtable path has nothing left to say. */
         rsx_draw_engine_set_default(1);
+        arch_open();
         if (rsx_draw_engine_enabled() &&
             rsx_draw_engine_init(s_width, s_height) == 0) {
             s_eng_active = 1;
+            arch_commit();
         } else {
+            s_arch_read = nil; s_arch_descs = nil;
             res_scale_set(1.0f);       /* the vtable path has no scaled targets */
             rsx_set_backend(&s_backend_vtable);
         }
@@ -5678,6 +5827,8 @@ void rsx_metal_backend_shutdown(void)
         if (s_ready) rsx_set_backend(NULL);
         if (s_eng_active) rsx_draw_engine_shutdown();
         rsx_draw_engine_set_backend(NULL);
+        s_arch_read = nil;
+        s_arch_descs = nil;
         /* Reclaim every in-flight slot so no command buffer is still
          * referencing the device, queue or textures when they are released,
          * then hand the slots back. libdispatch traps if a semaphore is

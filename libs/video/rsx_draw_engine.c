@@ -2310,15 +2310,19 @@ static int eng_read_shader_bytes(const char* root, const char* name, u64 offset,
     return ok;
 }
 
-static int eng_build_recipe(const eng_shader_recipe* recipe, u8* vs, u8* fs)
+/* 1 built, 0 rejected (its programs no longer translate to the recorded
+ * text, or the backend refused it), 2 already present. */
+static int eng_build_recipe(const eng_shader_recipe* recipe, u8* vs, u8* fs, int vp_big_endian)
 {
     u32 slot = eng_pipeline_slot(recipe->key);
     for (; g.pipeline_index[slot]; slot = (slot + 1u) & (ENG_PIPELINE_INDEX - 1u))
-        if (g.pipelines[g.pipeline_index[slot] - 1u].key == recipe->key) return 0;
+        if (g.pipelines[g.pipeline_index[slot] - 1u].key == recipe->key) return 2;
+    if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
     /* The VP decompiler consumes little-endian words. On-disc VP words are
-     * big-endian, while FP input is in the RSX's raw byte order. */
-    for (u32 i = 0; i < recipe->vp_bytes; i += 4) {
+     * big-endian, while FP input is in the RSX's raw byte order. A learned
+     * recipe holds the words as the live draw had them. */
+    if (vp_big_endian) for (u32 i = 0; i < recipe->vp_bytes; i += 4) {
         const u8 a = vs[i], b = vs[i + 1];
         vs[i] = vs[i + 3];
         vs[i + 1] = vs[i + 2];
@@ -2348,40 +2352,243 @@ static int eng_build_recipe(const eng_shader_recipe* recipe, u8* vs, u8* fs)
     return 1;
 }
 
-static void eng_prepare_shaders(void)
+static int eng_recipe_sane(const eng_shader_recipe* recipe)
 {
-    const char* path = getenv("PS3RECOMP_SHADER_RECIPES");
-    const char* root = getenv("PS3RECOMP_SHADER_GAME_DIR");
-    if (!path || !*path || !root || !*root) return;
+    return recipe->key && recipe->vp_bytes && recipe->fp_bytes &&
+           recipe->vp_bytes <= ENG_SHADER_PROGRAM_LIMIT &&
+           recipe->fp_bytes <= ENG_SHADER_PROGRAM_LIMIT &&
+           !(recipe->vp_bytes % 16) && !(recipe->fp_bytes % 16) &&
+           recipe->dbz <= RSX_DSP_NUM_TEXTURES &&
+           recipe->layout.count && recipe->layout.count <= RSX_DSP_NUM_VERTEX_ATTR &&
+           recipe->layout.stride == recipe->layout.count * 16u &&
+           recipe->rt_count && recipe->rt_count <= RSX_BE_MAX_COLOR_TARGETS &&
+           recipe->rt_fmt <= RSX_BE_FMT_R32G32B32A32F;
+}
 
-    FILE* map = fopen(path, "rb");
-    if (!map) {
-        fprintf(stderr, "[shader-prep] Could not read shader recipes\n");
+static double eng_now_ms(void)
+{
+    struct timespec ts;
+    if (!timespec_get(&ts, TIME_UTC)) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+/* ---- learned recipes ------------------------------------------------------
+ * PS3RECOMP_PIPELINE_CACHE=<dir>: every guest pipeline the engine still has to
+ * build during play is appended to <dir>/learned-recipes.bin, and the next
+ * start prepares it before Play together with the shipped map. A record is
+ * the same eng_shader_recipe the shipped map carries, followed by the two
+ * programs as the live draw had them (the player's own data, kept on the
+ * player's machine), behind an FNV-1a check of all three:
+ *
+ *   "PRSLRN1\0", u32 sizeof(eng_shader_recipe), u32 version 1
+ *   { u64 check, recipe, vp bytes, fp bytes } ...
+ *
+ * Loading validates each record (check, sane fields, and the same translated
+ * text hashes the shipped map is held to), so a torn tail from a killed run,
+ * a corrupt file, or records a newer decompiler no longer reproduces are
+ * dropped and the file is rewritten with what survived. A different recipe
+ * size (a toolkit with another recipe layout) discards the whole file. At most
+ * ENG_LEARNED_LIMIT records are kept; past that, play compiles as before. */
+#define ENG_LEARNED_LIMIT 1024u
+#define ENG_LEARNED_FILE_LIMIT (64u * 1024 * 1024)
+static const char kEngLearnMagic[8] = "PRSLRN1";
+static char s_learn_path[1024];      /* "" = not learning */
+static u32 s_learn_count;
+static int s_learn_failed;
+
+static u64 eng_learn_check(const eng_shader_recipe* recipe, const u8* vs, const u8* fs)
+{
+    u64 h = eng_fnv1a(recipe, (u32)sizeof *recipe, 1469598103934665603ull);
+    h = eng_fnv1a(vs, recipe->vp_bytes, h);
+    return eng_fnv1a(fs, recipe->fp_bytes, h);
+}
+
+static int eng_learn_write_header(FILE* file)
+{
+    const u32 header[2] = { (u32)sizeof(eng_shader_recipe), 1u };
+    return fwrite(kEngLearnMagic, sizeof kEngLearnMagic, 1, file) == 1 &&
+           fwrite(header, sizeof header, 1, file) == 1;
+}
+
+static int eng_learn_write_record(FILE* file, const eng_shader_recipe* recipe,
+                                  const u8* vs, const u8* fs)
+{
+    const u64 check = eng_learn_check(recipe, vs, fs);
+    return fwrite(&check, sizeof check, 1, file) == 1 &&
+           fwrite(recipe, sizeof *recipe, 1, file) == 1 &&
+           fwrite(vs, 1, recipe->vp_bytes, file) == recipe->vp_bytes &&
+           fwrite(fs, 1, recipe->fp_bytes, file) == recipe->fp_bytes;
+}
+
+/* The whole file, or NULL when there is none, it is unreadable or too big. */
+static u8* eng_learn_read(size_t* size)
+{
+    *size = 0;
+    FILE* file = fopen(s_learn_path, "rb");
+    if (!file) return NULL;
+    u8* data = NULL;
+    if (fseek(file, 0, SEEK_END) == 0) {
+        const long end = ftell(file);
+        if (end > 0 && (unsigned long)end <= ENG_LEARNED_FILE_LIMIT &&
+            fseek(file, 0, SEEK_SET) == 0 && (data = malloc((size_t)end)) != NULL) {
+            if (fread(data, 1, (size_t)end, file) == (size_t)end) *size = (size_t)end;
+            else { free(data); data = NULL; }
+        }
+    }
+    fclose(file);
+    return data;
+}
+
+/* The next intact record at *at, or 0 at the end or at the first damage. */
+static int eng_learn_next(const u8* data, size_t size, size_t* at,
+                          eng_shader_recipe* recipe, const u8** vs, const u8** fs,
+                          size_t* record_start, size_t* record_size)
+{
+    u64 check;
+    if (size - *at < sizeof check + sizeof *recipe) return 0;
+    memcpy(&check, data + *at, sizeof check);
+    memcpy(recipe, data + *at + sizeof check, sizeof *recipe);
+    if (!eng_recipe_sane(recipe)) return 0;
+    const size_t body = sizeof check + sizeof *recipe;
+    const size_t total = body + recipe->vp_bytes + recipe->fp_bytes;
+    if (size - *at < total) return 0;
+    *vs = data + *at + body;
+    *fs = *vs + recipe->vp_bytes;
+    if (eng_learn_check(recipe, *vs, *fs) != check) return 0;
+    *record_start = *at;
+    *record_size = total;
+    *at += total;
+    return 1;
+}
+
+/* Replace the file with the given records (offsets into data). */
+static void eng_learn_rewrite(const u8* data, const size_t* starts, const size_t* sizes, u32 n)
+{
+    char tmp[sizeof s_learn_path + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", s_learn_path);
+    FILE* file = fopen(tmp, "wb");
+    int ok = file && eng_learn_write_header(file);
+    for (u32 i = 0; ok && i < n; i++)
+        ok = fwrite(data + starts[i], 1, sizes[i], file) == sizes[i];
+    if (file && fclose(file) != 0) ok = 0;
+#ifdef _WIN32
+    if (ok) remove(s_learn_path);
+#endif
+    if (!ok || rename(tmp, s_learn_path) != 0) {
+        remove(tmp);
+        fprintf(stderr, "[shader-prep] Could not rewrite the learned shader list\n");
+    }
+}
+
+static void eng_learn_append(const eng_shader_recipe* recipe, const u8* vs, const u8* fs)
+{
+    if (!s_learn_path[0] || s_learn_failed) return;
+    if (s_learn_count >= ENG_LEARNED_LIMIT) {
+        s_learn_failed = 1;
+        fprintf(stderr, "[shader-prep] Learned shader list is full (%u)\n", ENG_LEARNED_LIMIT);
         return;
     }
-    char magic[8];
-    u32 header[2];
-    if (fread(magic, sizeof magic, 1, map) != 1 || memcmp(magic, "PRSMAP1", 8) != 0 ||
-        fread(header, sizeof header, 1, map) != 1 || header[0] != sizeof(eng_shader_recipe) ||
-        !header[1] || header[1] > ENG_SHADER_MAP_LIMIT) {
-        fprintf(stderr, "[shader-prep] Incompatible shader recipe format\n");
-        fclose(map);
+    FILE* file = fopen(s_learn_path, "ab");
+    int ok = file != NULL;
+    if (ok && ftell(file) == 0) ok = eng_learn_write_header(file);
+    if (ok) ok = eng_learn_write_record(file, recipe, vs, fs);
+    if (file && fclose(file) != 0) ok = 0;
+    if (!ok) {
+        s_learn_failed = 1;
+        fprintf(stderr, "[shader-prep] Could not record a pipeline for the next start\n");
+        return;
+    }
+    s_learn_count++;
+}
+
+static void eng_prepare_progress(u32 done, u32 total)
+{
+    if ((done % 16u) == 0 && done < total)
+        fprintf(stderr, "[shader-prep] Preparing shaders (%u of %u)\n", done, total);
+}
+
+static void eng_prepare_shaders(void)
+{
+    s_learn_path[0] = '\0';
+    s_learn_count = 0;
+    s_learn_failed = 0;
+    const char* cache = getenv("PS3RECOMP_PIPELINE_CACHE");
+    if (cache && *cache) {
+        const int n = snprintf(s_learn_path, sizeof s_learn_path, "%s/learned-recipes.bin", cache);
+        if (n < 0 || (size_t)n >= sizeof s_learn_path) s_learn_path[0] = '\0';
+    }
+
+    const double began = eng_now_ms();
+    const char* path = getenv("PS3RECOMP_SHADER_RECIPES");
+    const char* root = getenv("PS3RECOMP_SHADER_GAME_DIR");
+    FILE* map = NULL;
+    u32 shipped_total = 0;
+    if (path && *path && root && *root) {
+        map = fopen(path, "rb");
+        char magic[8];
+        u32 header[2];
+        if (!map) {
+            fprintf(stderr, "[shader-prep] Could not read shader recipes\n");
+        } else if (fread(magic, sizeof magic, 1, map) != 1 || memcmp(magic, "PRSMAP1", 8) != 0 ||
+                   fread(header, sizeof header, 1, map) != 1 ||
+                   header[0] != sizeof(eng_shader_recipe) ||
+                   !header[1] || header[1] > ENG_SHADER_MAP_LIMIT) {
+            fprintf(stderr, "[shader-prep] Incompatible shader recipe format\n");
+            fclose(map);
+            map = NULL;
+        } else {
+            shipped_total = header[1];
+        }
+    }
+
+    /* The learned list: its intact records, counted first so the progress
+     * total is the real one. */
+    size_t learned_size = 0;
+    u8* learned = s_learn_path[0] ? eng_learn_read(&learned_size) : NULL;
+    u32 learned_total = 0;
+    size_t learned_at = 0;
+    int learned_rewrite = 0;
+    if (learned) {
+        u32 header[2];
+        if (learned_size < sizeof kEngLearnMagic + sizeof header ||
+            memcmp(learned, kEngLearnMagic, sizeof kEngLearnMagic) != 0 ||
+            (memcpy(header, learned + sizeof kEngLearnMagic, sizeof header),
+             header[0] != sizeof(eng_shader_recipe) || header[1] != 1u)) {
+            fprintf(stderr, "[shader-prep] Learned shader list is from another version; starting a new one\n");
+            learned_rewrite = 1;
+        } else {
+            learned_at = sizeof kEngLearnMagic + sizeof header;
+            size_t at = learned_at, start, size;
+            eng_shader_recipe recipe;
+            const u8 *vs, *fs;
+            while (learned_total < ENG_LEARNED_LIMIT &&
+                   eng_learn_next(learned, learned_size, &at, &recipe, &vs, &fs, &start, &size))
+                learned_total++;
+            if (at != learned_size) learned_rewrite = 1;   /* damage or overflow */
+        }
+    }
+    if (!map && !learned_total) {
+        if (learned_rewrite) eng_learn_rewrite(learned, NULL, NULL, 0);
+        free(learned);
         return;
     }
 
     u8* buffers = malloc(2 * ENG_SHADER_PROGRAM_LIMIT);
-    if (!buffers) {
-        fclose(map);
+    /* Where each kept learned record lies in the file: starts, then sizes. */
+    size_t* kept = learned_total ? malloc(2 * learned_total * sizeof *kept) : NULL;
+    if (!buffers || (learned_total && !kept)) {
+        free(buffers); free(kept); free(learned);
+        if (map) fclose(map);
         return;
     }
     u8* vs = buffers;
     u8* fs = buffers + ENG_SHADER_PROGRAM_LIMIT;
-    const u32 total = header[1];
-    u32 built = 0;
+    const u32 total = shipped_total + learned_total;
+    u32 done = 0, shipped_built = 0, learned_built = 0;
     const char* fps = getenv("PS3RECOMP_METAL_FPS");
     s_log_prepared_shaders = fps && *fps && *fps != '0';
     s_preparing_shaders = 1;
-    for (u32 i = 0; i < total; i++) {
+    for (u32 i = 0; map && i < shipped_total; i++) {
         eng_shader_recipe recipe;
         u64 offsets[2];
         u32 lengths[2];
@@ -2391,25 +2598,50 @@ static void eng_prepare_shaders(void)
             fread(lengths, sizeof lengths, 1, map) != 1 ||
             !eng_read_shader_path(map, vp_path, lengths[0]) ||
             !eng_read_shader_path(map, fp_path, lengths[1])) break;
-        if (recipe.key && recipe.vp_bytes && recipe.fp_bytes &&
-            recipe.vp_bytes <= ENG_SHADER_PROGRAM_LIMIT &&
-            recipe.fp_bytes <= ENG_SHADER_PROGRAM_LIMIT &&
-            !(recipe.vp_bytes % 16) && !(recipe.fp_bytes % 16) &&
-            recipe.dbz <= RSX_DSP_NUM_TEXTURES &&
-            recipe.layout.count && recipe.layout.count <= RSX_DSP_NUM_VERTEX_ATTR &&
-            recipe.layout.stride == recipe.layout.count * 16u &&
-            recipe.rt_count && recipe.rt_count <= RSX_BE_MAX_COLOR_TARGETS &&
-            recipe.rt_fmt <= RSX_BE_FMT_R32G32B32A32F &&
+        if (eng_recipe_sane(&recipe) &&
             eng_read_shader_bytes(root, vp_path, offsets[0], vs, recipe.vp_bytes) &&
             eng_read_shader_bytes(root, fp_path, offsets[1], fs, recipe.fp_bytes))
-            built += eng_build_recipe(&recipe, vs, fs);
-        if (((i + 1u) % 16u) == 0 && i + 1u < total)
-            fprintf(stderr, "[shader-prep] Preparing shaders (%u of %u)\n", i + 1u, total);
+            shipped_built += eng_build_recipe(&recipe, vs, fs, 1) == 1;
+        eng_prepare_progress(++done, total);
+    }
+    done = shipped_total;
+
+    /* A learned record survives only if it is built here: one the shipped map
+     * already covers, or one that no longer translates to its recorded text,
+     * is dropped from the file. */
+    u32 n_kept = 0;
+    size_t at = learned_at;
+    for (u32 i = 0; i < learned_total; i++) {
+        eng_shader_recipe recipe;
+        const u8 *lvs, *lfs;
+        size_t start, size;
+        if (!eng_learn_next(learned, learned_size, &at, &recipe, &lvs, &lfs, &start, &size))
+            break;
+        /* Built from copies: the file's bytes are written back unchanged. */
+        memcpy(vs, lvs, recipe.vp_bytes);
+        memcpy(fs, lfs, recipe.fp_bytes);
+        if (eng_build_recipe(&recipe, vs, fs, 0) == 1) {
+            learned_built++;
+            kept[n_kept] = start;
+            kept[learned_total + n_kept] = size;
+            n_kept++;
+        } else {
+            learned_rewrite = 1;
+        }
+        eng_prepare_progress(++done, total);
     }
     s_preparing_shaders = 0;
+    if (learned_rewrite)
+        eng_learn_rewrite(learned, kept, kept ? kept + learned_total : NULL, n_kept);
+    s_learn_count = n_kept;
+    free(kept);
+    free(learned);
     free(buffers);
-    fclose(map);
-    fprintf(stderr, "[shader-prep] Prepared %u of %u Metal pipelines before Play\n", built, total);
+    if (map) fclose(map);
+    fprintf(stderr, "[shader-prep] Prepared %u of %u Metal pipelines before Play"
+                    " (shipped %u of %u, learned %u of %u) in %.0f ms\n",
+            shipped_built + learned_built, total, shipped_built, shipped_total,
+            learned_built, learned_total, eng_now_ms() - began);
 }
 
 static u32 eng_pipeline_resolve(const rsx_vertex_layout_plan* layout,
@@ -2574,16 +2806,20 @@ static u32 eng_pipeline_resolve(const rsx_vertex_layout_plan* layout,
         eng_translate_shader(&recipe, vp_uc, fp_uc, g.fp_constants.count,
                              &vi, &fi, &nconst, &dbz_bit);
     }
+    const double began = eng_now_ms();
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
+    const double build_ms = eng_now_ms() - began;
     const u64 fp_hash = fixed ? 0 : eng_fp_debug_hash(fp_uc, fp_size);
     const char* capture = getenv("PS3RECOMP_SHADER_CAPTURE");
-    if (capture && *capture && handle && !fixed) {
+    if (handle && !fixed) {
         recipe.vs_hash = eng_shader_text_hash(s_vs_hlsl);
         recipe.ps_hash = eng_shader_text_hash(s_ps_hlsl);
         recipe.fp_hash = fp_hash;
-        eng_shader_capture(capture, &recipe, vp_uc, fp_uc);
+        if (capture && *capture) eng_shader_capture(capture, &recipe, vp_uc, fp_uc);
+        /* Prepared before Play from the next start on. */
+        if (eng_recipe_sane(&recipe)) eng_learn_append(&recipe, vp_uc, fp_uc);
     }
     /* RSX_ENGINE_SHADER_DUMP=<existing dir>: each new pipeline's two programs
      * as <dir>/pipe<handle>.vs.hlsl and .ps.hlsl, the handle being the one
@@ -2616,12 +2852,14 @@ static u32 eng_pipeline_resolve(const rsx_vertex_layout_plan* layout,
             }
         }
     }
-    { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 32))
+    /* Every build during play is a stall on this thread, so each one is
+     * logged with its cost (this used to stop after 32, which hid the rest). */
+    { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 4096))
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
-                        " %u constants, fp %016llx -> %s\n",
+                        " %u constants, fp %016llx -> %s in %.1f ms\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
                 vi, fi, nconst, (unsigned long long)fp_hash,
-                handle ? "ok" : "FAILED (draw dropped)"); }
+                handle ? "ok" : "FAILED (draw dropped)", build_ms); }
 
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].fp_hash = fp_hash;

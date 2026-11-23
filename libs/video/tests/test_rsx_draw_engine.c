@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>   /* rmdir */
 
 static int g_failures;
 
@@ -3044,6 +3045,118 @@ static void test_pipeline_memo_constants(void)
     engine_down();
 }
 
+/* ---- learned pipelines (PS3RECOMP_PIPELINE_CACHE) ------------------------- */
+
+static void learned_programs(void)
+{
+    u8 vp[16];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
+    m(0x1E9C, 0);
+    for (u32 i = 0; i < 4; ++i) { u32 w; memcpy(&w, vp + i * 4, 4); m(0xB80 + i * 4, w); }
+    m(0x1EA0, 0);
+    u8* program = vm_base + WPOS_FP_OFFSET;
+    rsx_test_fp_instr(program, RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_END, 2u | RSX_TEST_FP_SWZ_IDENT);
+    memset(program + 16, 0, 16);
+    rsx_test_fp_put_word(program + 16, 0x3F800000u);
+    m(0x08E4, WPOS_FP_OFFSET | 2u);
+    m(0x1D60, 0x40u);
+}
+
+static void learned_programs_off(void)
+{
+    m(0x08E4, 0);
+    memset(vm_base + WPOS_FP_OFFSET, 0, 32);
+}
+
+static long file_size(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    const long n = ftell(f);
+    fclose(f);
+    return n;
+}
+
+static void test_learned_pipelines(void)
+{
+    printf("-- learned pipelines\n");
+    char dir[] = "/tmp/rsx-learned-XXXXXX";
+    if (!mkdtemp(dir)) { CHECK(0, "a scratch folder for the learned list"); return; }
+    char file[128];
+    snprintf(file, sizeof file, "%s/learned-recipes.bin", dir);
+    setenv("PS3RECOMP_PIPELINE_CACHE", dir, 1);
+
+    engine_up();
+    learned_programs();
+    draw_triangle();
+    const long one = file_size(file);
+    CHECK(stub.n_pipeline_create == 1 && one > 16,
+          "a pipeline built during play is recorded (%d built, %ld bytes)",
+          stub.n_pipeline_create, one);
+    draw_triangle();
+    CHECK(file_size(file) == one, "and only once");
+    learned_programs_off();
+    engine_down();
+
+    engine_up();
+    CHECK(stub.n_pipeline_create == 1, "the next start builds it before the first draw (%d)",
+          stub.n_pipeline_create);
+    learned_programs();
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 1 && stub.n_draw == 1,
+          "and the draw uses it without building another (%d built, %d drawn)",
+          stub.n_pipeline_create, stub.n_draw);
+    CHECK(file_size(file) == one, "nothing new is recorded");
+    learned_programs_off();
+    engine_down();
+
+    /* A run killed half way through a record leaves a torn tail. */
+    FILE* f = fopen(file, "ab");
+    if (f) { fwrite("torn record", 1, 11, f); fclose(f); }
+    engine_up();
+    CHECK(stub.n_pipeline_create == 1 && file_size(file) == one,
+          "a torn tail is dropped and the intact record still prepared (%d, %ld bytes)",
+          stub.n_pipeline_create, file_size(file));
+    engine_down();
+
+    /* A damaged record fails its check: dropped, then learned again. */
+    f = fopen(file, "r+b");
+    if (f) { fseek(f, 40, SEEK_SET); fputc(0x5A ^ 0xFF, f); fclose(f); }
+    engine_up();
+    CHECK(stub.n_pipeline_create == 0 && file_size(file) == 16,
+          "a damaged record is not prepared and is removed (%d, %ld bytes)",
+          stub.n_pipeline_create, file_size(file));
+    learned_programs();
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 1 && file_size(file) == one,
+          "the draw builds it and records it again (%ld bytes)", file_size(file));
+    learned_programs_off();
+    engine_down();
+
+    /* A list from a toolkit with another recipe layout is discarded whole. */
+    f = fopen(file, "r+b");
+    if (f) { fseek(f, 8, SEEK_SET); fputc(0x01, f); fclose(f); }
+    engine_up();
+    CHECK(stub.n_pipeline_create == 0 && file_size(file) == 16,
+          "a list of another recipe layout is replaced by an empty one (%ld bytes)",
+          file_size(file));
+    engine_down();
+
+    /* An unwritable folder costs nothing but the record. */
+    remove(file);
+    rmdir(dir);
+    engine_up();
+    learned_programs();
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 1 && stub.n_draw == 1 && file_size(file) < 0,
+          "without a usable folder the draw still builds and draws");
+    learned_programs_off();
+    engine_down();
+    unsetenv("PS3RECOMP_PIPELINE_CACHE");
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -3096,6 +3209,7 @@ int main(void)
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
     test_clear_rect();
+    test_learned_pipelines();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
