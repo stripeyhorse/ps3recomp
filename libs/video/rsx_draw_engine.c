@@ -147,6 +147,7 @@ typedef struct {
     u32 handle;
     u64 content_hash;
     u64 sparse_hash;            /* eng_texture_sparse_hash, the per-frame check */
+    u64 content_ref;            /* PS3RECOMP_ENG_TEXHASH_CHECK: the old chain's hash */
     u32 last_full_frame;        /* g.frames of the last full content hash */
     u32 last_hash_frame;
     u64 last_use_serial;
@@ -1325,6 +1326,64 @@ static void eng_unvtc_3d_slice(u8* dst, const u8* src, u32 blocks, u32 d, u32 z,
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
  * content id (rsx_live_draw.c:2002-2026). */
+#define ENG_FNV_BASIS 1469598103934665603ull
+#define ENG_FNV_PRIME 1099511628211ull
+/* The single FNV chain the full hash used to be: one multiply per 8 bytes,
+ * each waiting on the last, about 8 GB/s on an M4 core. Kept as the
+ * reference for PS3RECOMP_ENG_TEXHASH_CHECK. */
+static u64 eng_hash_fnv_chain(const u8* src, u32 span)
+{
+    u64 hash = ENG_FNV_BASIS;
+    u32 i = 0;
+    for (; i + 8 <= span; i += 8) {
+        u64 word;
+        memcpy(&word, src + i, sizeof(word));
+        hash = (hash ^ word) * ENG_FNV_PRIME;
+    }
+    for (; i < span; i++) hash = (hash ^ src[i]) * ENG_FNV_PRIME;
+    return hash;
+}
+/* The same FNV step in eight independent chains, word k of every 64-byte
+ * block in chain k, folded together at the end and continued over the tail.
+ * Each step (h ^ w) * prime is a bijection of h for a fixed w and of w for a
+ * fixed h, and so is each fold, so a change confined to one chain's words
+ * always changes the result -- the guarantee the single chain gave for one
+ * changed word. The chains do not wait on each other: the texture hash was
+ * 10% of the RSX thread at 60 FPS and is bound by the multiply latency. */
+static u64 eng_hash_fnv_lanes(const u8* src, u32 span)
+{
+    u64 lane[8];
+    for (u32 k = 0; k < 8; k++) lane[k] = ENG_FNV_BASIS + k;
+    u32 i = 0;
+    for (; i + 64 <= span; i += 64) {
+        u64 w[8];
+        memcpy(w, src + i, sizeof(w));
+        for (u32 k = 0; k < 8; k++) lane[k] = (lane[k] ^ w[k]) * ENG_FNV_PRIME;
+    }
+    u64 hash = lane[0];
+    for (u32 k = 1; k < 8; k++) hash = (hash ^ lane[k]) * ENG_FNV_PRIME;
+    for (; i + 8 <= span; i += 8) {
+        u64 word;
+        memcpy(&word, src + i, sizeof(word));
+        hash = (hash ^ word) * ENG_FNV_PRIME;
+    }
+    for (; i < span; i++) hash = (hash ^ src[i]) * ENG_FNV_PRIME;
+    return hash;
+}
+/* PS3RECOMP_ENG_TEXHASH_CHECK=1 (diagnostic, read at engine init): every
+ * full hash also runs the old single chain, and each re-hash compares the two
+ * verdicts ("changed since the last full hash" or not). A mismatch is a
+ * change one of them missed. Counts every 600 presented frames. */
+static int s_texhash_check;
+/* PS3RECOMP_ENG_TEXHASH_LANES=0 (read at engine init): the single chain again. */
+static int s_texhash_lanes = 1;
+static u64 s_thc_full, s_thc_changed, s_thc_mismatch;
+static u64 eng_texture_content_hash_ref(u32 location, u32 offset, u32 span)
+{
+    if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
+    const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+    return src ? eng_hash_fnv_chain(src, span) : 0;
+}
 static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
                                     int* readable)
 {
@@ -1332,17 +1391,8 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
     if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
-    u64 hash = 1469598103934665603ull;
-    u32 i = 0;
-    for (; i + 8 <= span; i += 8) {
-        u64 word;
-        memcpy(&word, src + i, sizeof(word));
-        hash ^= word;
-        hash *= 1099511628211ull;
-    }
-    for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
     *readable = 1;
-    return hash;
+    return s_texhash_lanes ? eng_hash_fnv_lanes(src, span) : eng_hash_fnv_chain(src, span);
 }
 
 /* The cheap per-frame change check: 64 bytes out of every 2 KB, plus the
@@ -1573,14 +1623,22 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              * stored hash becomes unknown and the next ordinary check
              * re-uploads once rather than miss a change. */
             int ts_why = TS_CHANGED;
+            u64 ref = e->content_ref;
             if (e->rewritten && readable) {
                 hash = ~e->content_hash;
+                ref = ~e->content_ref;
                 e->rewritten = 0;
                 ts_why = TS_REWRITTEN;
             } else if (readable && (sparse != e->sparse_hash ||
                              eng_texture_full_rehash(span, e->last_full_frame))) {
                 hash = eng_texture_content_hash(location, offset, span, &readable);
                 e->last_full_frame = g.frames;
+                if (s_texhash_check && readable) {
+                    ref = eng_texture_content_hash_ref(location, offset, span);
+                    s_thc_full++;
+                    s_thc_changed += hash != e->content_hash;
+                    s_thc_mismatch += (hash != e->content_hash) != (ref != e->content_ref);
+                }
             }
             if (readable) e->sparse_hash = sparse;
             e->last_hash_frame = g.frames;
@@ -1599,7 +1657,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                     e->handle = fresh;
                     e->levels = levels;
                 }
-                if (fresh) e->content_hash = hash;
+                if (fresh) { e->content_hash = hash; e->content_ref = ref; }
             }
         }
         e->last_use_serial = ++g.texture_use_serial;
@@ -1628,6 +1686,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
+      if (s_texhash_check) e.content_ref = eng_texture_content_hash_ref(location, offset, span);
       e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
     eng_texstats(evicted ? TS_EVICT : TS_NEW, span, w, h, fmt, offset);
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
@@ -4492,6 +4551,10 @@ static void eng_present(u32 buffer_id)
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
     g.surfaces[target].last_use = g.frames;
+    if (s_texhash_check && g.frames % 600 == 0)
+        fprintf(stderr, "[texhash-check] frame=%u full=%llu changed=%llu mismatches=%llu\n", g.frames,
+                (unsigned long long)s_thc_full, (unsigned long long)s_thc_changed,
+                (unsigned long long)s_thc_mismatch);
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
         u32 current = eng_current_surface();
         fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u\n",
@@ -4554,6 +4617,11 @@ int rsx_draw_engine_init(u32 width, u32 height)
     g.height = height ? height : 720;
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_LANES");
+      s_texhash_lanes = !(e && *e == '0'); }
+    { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_CHECK");
+      s_texhash_check = e && *e && strcmp(e, "0") != 0;
+      s_thc_full = s_thc_changed = s_thc_mismatch = 0; }
     { const char* e = getenv("PS3RECOMP_ENG_DEPTH_VIA_GUEST");
       s_depth_via_guest = e && *e && strcmp(e, "0") != 0; }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);

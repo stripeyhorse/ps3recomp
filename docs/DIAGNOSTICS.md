@@ -1490,3 +1490,20 @@ empty resumes, GET/PUT copies, repark followed by completion, and concurrent
 resume admission. `MFC_TEST_SANITIZE=1` additionally runs them with UBSan on a
 compiler that supports it. The concurrent check verifies this dump's bound;
 it does not assert that unrelated existing diagnostic counters are race-free.
+
+## Draw-engine texture hash (hand-maintained, 2026-11-24)
+
+The full content hash that decides whether a cached texture changed runs eight
+independent FNV chains (word k of every 64-byte block in chain k, folded at the
+end) instead of one. A one-word change still always changes the hash. About 6x
+the throughput on an M4 Pro core; in the held 1080p Crash Course city it took
+the uncapped one-step rate from 63.6 to 66.4 FPS (three runs each) and the RSX thread from 82%
+to 76% busy.
+
+- **`PS3RECOMP_ENG_TEXHASH_LANES`** — `0`: the single chain again. Read at
+  engine init. `libs/video/rsx_draw_engine.c`
+- **`PS3RECOMP_ENG_TEXHASH_CHECK`** — `1` (diagnostic): every full hash also
+  runs the single chain, and each re-hash compares the two verdicts (changed
+  since the last full hash or not). `[texhash-check] frame=N full=N changed=N
+  mismatches=N` every 600 presented frames; a mismatch is a change one of them
+  missed. Read at engine init. `libs/video/rsx_draw_engine.c`

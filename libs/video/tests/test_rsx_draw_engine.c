@@ -800,6 +800,17 @@ static void test_texture_sparse_rehash(void)
     const int late = frames_to_notice(10);
     CHECK(late == 7, "a write between the sampled blocks is noticed by the full hash (%d frames)", late);
 
+    /* The full hash runs eight chains, one per word of a 64-byte block: a
+     * one-byte change at each byte of each chain's word, between the sampled
+     * blocks, is still seen by the full hash. */
+    int missed = 0;
+    for (u32 k = 0; k < 64; k++) {
+        rsx_draw_engine_present();
+        tex[5 * 2048 + 128 + k] ^= 0x01;
+        if (frames_to_notice(8) < 0) missed++;
+    }
+    CHECK(missed == 0, "a one-byte change in any word of a block is noticed by the full hash (%d missed)", missed);
+
     /* A small texture is still hashed in full every frame. */
     rsx_draw_engine_present();
     bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
