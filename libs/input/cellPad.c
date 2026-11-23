@@ -191,6 +191,53 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
     *hi = small_on ? 0xFFFFu : 0u;
 }
 
+/* Player settings, read once from the environment (the port's settings layer
+ * publishes them): PS3_PAD_DEADZONE, stick dead zone in percent, 0-50,
+ * default 10 (SDL backend); PS3_PAD_RUMBLE, motor strength in percent, 0-100,
+ * default 100; PS3_PAD_QUIT, hold-to-quit gesture, default on, "0", "off",
+ * "no", "false" or empty turn it off (SDL backend). A value that is not a
+ * whole number in range is ignored with one log line and the default used. */
+static int pad_env_percent(const char* name, int lo, int hi, int def)
+{
+    const char* e = getenv(name);
+    if (!e) return def;
+    char* end = NULL;
+    const long v = strtol(e, &end, 10);
+    if (end == e || *end || v < lo || v > hi) {
+        fprintf(stderr, "[cellPad] %s=%s: not a whole number %d-%d, using %d\n", name, e, lo, hi, def);
+        return def;
+    }
+    return (int)v;
+}
+static int s_cfg_rumble = -1;
+static int pad_rumble_pct(void)
+{
+    if (s_cfg_rumble < 0) s_cfg_rumble = pad_env_percent("PS3_PAD_RUMBLE", 0, 100, 100);
+    return s_cfg_rumble;
+}
+#if PAD_BACKEND_SDL2
+static int s_cfg_deadzone = -1, s_cfg_quit = -1;
+static int pad_deadzone_pct(void)
+{
+    if (s_cfg_deadzone < 0) s_cfg_deadzone = pad_env_percent("PS3_PAD_DEADZONE", 0, 50, 10);
+    return s_cfg_deadzone;
+}
+static int pad_quit_enabled(void)
+{
+    if (s_cfg_quit < 0) {
+        const char* e = getenv("PS3_PAD_QUIT");
+        s_cfg_quit = !(e && (!*e || !strcmp(e, "0") || !strcmp(e, "off") ||
+                             !strcmp(e, "no") || !strcmp(e, "false")));
+    }
+    return s_cfg_quit;
+}
+#endif
+/* A motor level scaled by PS3_PAD_RUMBLE: 0 never starts a motor. */
+static u16 pad_rumble_scale(u16 level)
+{
+    return (u16)((u32)level * (u32)pad_rumble_pct() / 100u);
+}
+
 /* Keyboard fallback for port 0.
  *
  * On a machine with no controller plugged in a title gets a pad that is reported
@@ -510,11 +557,88 @@ static void pad_shutdown_backend(void)
 
 static u8 pad_sdl_axis_to_u8(int raw)
 {
-    /* SDL axis: -32768..32767 -> 0..255 with center at 128 */
-    int val = ((raw + 32768) * 255) / 65535;
+    /* SDL axis: -32768..32767 -> 0..255, linear, 0 -> 128: the DualShock 3's
+     * centre, and what the keyboard and the virtual pad report at rest. (The
+     * old *255/65535 put the centre at 127.) */
+    int val = (raw + 32768) >> 8;
     if (val < 0) val = 0;
     if (val > 255) val = 255;
     return (u8)val;
+}
+
+/* One stick through the dead zone (dz_pct, PS3_PAD_DEADZONE). Radial: the
+ * stick's distance from centre over both axes, so a diagonal is not cut off
+ * at the axes. Inside it the stick is centred; outside, the distance is
+ * rescaled so it ramps from centre at the edge of the dead zone to full at
+ * full deflection, with no jump. Each axis is clamped afterwards, so a
+ * square-gated corner still reaches both ends. 0 is the plain linear map. */
+static void pad_sdl_stick(int x, int y, int dz_pct, u8* ox, u8* oy)
+{
+    if (dz_pct > 0) {
+        const double fx = x / 32768.0, fy = y / 32768.0, dz = dz_pct / 100.0;
+        const double mag = sqrt(fx * fx + fy * fy);
+        if (mag <= dz) {
+            x = y = 0;
+        } else {
+            const double k = (mag - dz) / (1.0 - dz) / mag * 32768.0;
+            const double vx = fx * k, vy = fy * k;
+            x = (int)(vx < 0 ? vx - 0.5 : vx + 0.5);
+            y = (int)(vy < 0 ? vy - 0.5 : vy + 0.5);
+            if (x > 32767) x = 32767;
+            if (x < -32768) x = -32768;
+            if (y > 32767) y = 32767;
+            if (y < -32768) y = -32768;
+        }
+    }
+    *ox = pad_sdl_axis_to_u8(x);
+    *oy = pad_sdl_axis_to_u8(y);
+}
+
+/* ---- hold to quit (PS3_PAD_QUIT) -------------------------------------------
+ * Holding the PS (Guide) button for PAD_QUIT_GUIDE_MS, or START and SELECT
+ * together for PAD_QUIT_CHORD_MS, on any controller quits the game the way
+ * the window's close button does (cellSysutil.c ps3_host_quit). Only the
+ * controller's own buttons count: PAD_SCRIPT, PAD_FILE and the other injected
+ * inputs are added later, in cellPadGetData, and the keyboard is not a
+ * controller. The PS button is never reported to the guest.
+ *
+ * Masking: from the poll in which START and SELECT are first down together
+ * until both are up again, neither is reported to the guest. Whichever of the
+ * two was pressed first reached the game as an ordinary press (it cannot be
+ * known yet that a chord is coming); the second one never does, and letting go
+ * of one while the other is still held does not produce a fresh press of it,
+ * so the game sees no more than the first button's single press. */
+#define PAD_QUIT_GUIDE_MS 1000
+#define PAD_QUIT_CHORD_MS 2000
+extern void ps3_host_quit(const char* why);   /* libs/system/cellSysutil.c */
+typedef struct {
+    unsigned long long guide_ms, chord_ms;   /* when the hold began */
+    int guide, chord, masked;
+} PadQuitHold;
+static PadQuitHold s_quit_hold[PAD_MAX_HOST_PORTS];
+static int s_quit_sent;
+
+/* Port p's buttons as the guest should see them; quits when a hold is long enough. */
+static u16 pad_quit_watch(int p, u16 btns, int guide, unsigned long long now)
+{
+    const u16 chord = CELL_PAD_CTRL_START | CELL_PAD_CTRL_SELECT;
+    PadQuitHold* q = &s_quit_hold[p];
+    if (guide && !q->guide) q->guide_ms = now;
+    q->guide = guide;
+    const int both = (btns & chord) == chord;
+    if (both && !q->chord) q->chord_ms = now;
+    q->chord = both;
+    if (both) q->masked = 1;
+    else if (!(btns & chord)) q->masked = 0;
+    if (q->masked) btns &= (u16)~chord;
+    const char* how = q->guide && now - q->guide_ms >= PAD_QUIT_GUIDE_MS ? "PS button held 1 s"
+                    : q->chord && now - q->chord_ms >= PAD_QUIT_CHORD_MS ? "START+SELECT held 2 s" : NULL;
+    if (how && !s_quit_sent) {
+        s_quit_sent = 1;
+        fprintf(stderr, "[cellPad] port %d: %s\n", p, how);
+        ps3_host_quit("controller");
+    }
+    return btns;
 }
 
 static u8 pad_sdl_trigger_to_u8(int raw)
@@ -580,6 +704,7 @@ static void pad_sdl_close(int p, int gone)
     s_sdl_controllers[p] = NULL;
     s_sdl_ids[p] = -1;
     memset(&s_rumble[p], 0, sizeof s_rumble[p]);
+    memset(&s_quit_hold[p], 0, sizeof s_quit_hold[p]);
     pad_host_release(&s_host_state[p]);
 }
 
@@ -653,6 +778,7 @@ static void pad_poll_sdl2(void)
         if (!gc) {
             pad_host_release(&s_host_state[i]);
             memset(&s_rumble[i], 0, sizeof s_rumble[i]);
+            memset(&s_quit_hold[i], 0, sizeof s_quit_hold[i]);
             continue;
         }
 
@@ -684,13 +810,19 @@ static void pad_poll_sdl2(void)
         if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
         if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
 
+        if (pad_quit_enabled())
+            btns = pad_quit_watch(i, btns, SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_GUIDE) != 0, pad_now_ms());
+
         s_host_state[i].buttons = btns;
 
-        /* Analog sticks */
-        s_host_state[i].analog_lx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX));
-        s_host_state[i].analog_ly = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY));
-        s_host_state[i].analog_rx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX));
-        s_host_state[i].analog_ry = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
+        /* Analog sticks, through the dead zone (PS3_PAD_DEADZONE) */
+        const int dz = pad_deadzone_pct();
+        pad_sdl_stick(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX),
+                      SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY), dz,
+                      &s_host_state[i].analog_lx, &s_host_state[i].analog_ly);
+        pad_sdl_stick(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX),
+                      SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY), dz,
+                      &s_host_state[i].analog_rx, &s_host_state[i].analog_ry);
 
         /* Triggers */
         s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);
@@ -726,6 +858,15 @@ static void pad_init_backend(void)
              * cared. SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=0 in the
              * environment still wins over this. */
             SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+            /* Rumble on a DualShock 4 or DualSense over Bluetooth needs the
+             * HIDAPI driver's extended reports, off by default in SDL 2
+             * (they stay on until the controller is power-cycled). And face
+             * buttons by position, not label: a Nintendo pad's bottom button
+             * is Cross, as on a DualShock. The same-named environment
+             * variables still win, as above (SDL_SetHint is normal priority). */
+            SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+            SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+            SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
             SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
         }
         s_sdl_inited = 1;
@@ -1482,6 +1623,8 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
     u16 lo, hi;
     pad_rumble_levels(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL],
                       param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE], &lo, &hi);
+    lo = pad_rumble_scale(lo);   /* PS3_PAD_RUMBLE */
+    hi = pad_rumble_scale(hi);
     s_rumble[port_no].lo = lo;
     s_rumble[port_no].hi = hi;
 
