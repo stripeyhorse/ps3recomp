@@ -171,6 +171,7 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 #if AUDIO_BACKEND_SDL2
 
 static SDL_AudioDeviceID s_sdl_audio_dev = 0;
+static int s_sdl_audio_mute = 0;
 #ifndef _WIN32
 /* Leave headroom for CoreAudio's periodic pulls and host scheduling jitter.
  * Prime only the device queue: the guest ring must start at normal cadence. */
@@ -187,6 +188,12 @@ static void audio_backend_prime(void)
 
 static int audio_backend_init(void)
 {
+    /* PS3_MUTE=1: silence at the device, nothing else changes -- the title
+     * still gets a working cellAudio, the device still paces it and
+     * AUDIO_RATE still measures the guest's mix. Unlike PS3_NO_AUDIO, which
+     * sends the title down its no-audio path. */
+    s_sdl_audio_mute = getenv("PS3_MUTE") != NULL;
+    if (s_sdl_audio_mute) printf("[cellAudio] PS3_MUTE -- output silenced\n");
     if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
             printf("[cellAudio] SDL audio init failed: %s\n", SDL_GetError());
@@ -226,7 +233,9 @@ static void audio_backend_shutdown(void)
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
     if (s_sdl_audio_dev) {
-        SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
+        /* Both callers submit exactly one block. */
+        static const float silence[CELL_AUDIO_BLOCK_SAMPLES * 2];
+        SDL_QueueAudio(s_sdl_audio_dev, s_sdl_audio_mute ? silence : stereo_samples,
                        num_samples * 2 * sizeof(float));
     }
 }
