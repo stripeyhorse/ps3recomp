@@ -5275,11 +5275,15 @@ static void eng_dump_frame(id<MTLTexture> src)
     if (f) {
         fprintf(f, "P6\n%zu %zu\n255\n", w, h);
         int bgra = [src pixelFormat] == MTLPixelFormatBGRA8Unorm;
+        /* Pack to RGB in place (pixel p's 3 bytes land at or before its own 4,
+         * so no unread pixel is overwritten) and write it in one call: a
+         * per-pixel fwrite stalled the render thread for 100+ ms at 1080p. */
         for (size_t p = 0; p < w * h; ++p) {
             unsigned char rgb[3] = {rgba[p*4 + (bgra ? 2 : 0)], rgba[p*4+1],
                                     rgba[p*4 + (bgra ? 0 : 2)]};
-            fwrite(rgb, 1, 3, f);
+            memcpy(rgba + p*3, rgb, 3);
         }
+        fwrite(rgba, 1, w * h * 3, f);
         fclose(f);
         fprintf(stderr, "[rsx engine/metal] captured frame %u to %s\n", frame, path);
     }

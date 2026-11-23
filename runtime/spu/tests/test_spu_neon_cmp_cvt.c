@@ -15,6 +15,7 @@
  *   cc -std=gnu17 -O2 -I include -I runtime/spu runtime/spu/tests/test_spu_neon_cmp_cvt.c -o t && ./t
  */
 #include "spu_helpers.h"
+#include "../../../tests/spu_ls_watch_fixture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>

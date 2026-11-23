@@ -5,6 +5,7 @@
  * through the lanes, then random words mixed with edges. arm64 only.
  *   cc -std=gnu17 -O2 -I include -I runtime/spu runtime/spu/tests/test_spu_rz_fused.c -lm */
 #include "spu_helpers.h"
+#include "../../../tests/spu_ls_watch_fixture.h"
 #include <stdio.h>
 #include <stdlib.h>
 
