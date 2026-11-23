@@ -223,6 +223,7 @@ if(APPLE)
         "-framework Foundation"
         "-framework AppKit"
         "-framework ApplicationServices"
+        "-framework IOKit"   # power source in the [host] line
         # PS3_UPSCALE=metalfx (macOS 13+); weak, so older systems still start.
         "-weak_framework MetalFX"
     )

@@ -195,7 +195,7 @@ static void fps_log_threads(void)
     last = now;
     thread_act_array_t threads = NULL; mach_msg_type_number_t count = 0;
     if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
-    struct { char name[24]; double pct; } top[TOP]; unsigned n_top = 0;
+    struct { char name[24]; double pct; int pri; } top[TOP]; unsigned n_top = 0;
     static struct { uint64_t id; uint64_t ns; } cur[MAXT]; unsigned n_cur = 0;
     double total = 0;
     for (mach_msg_type_number_t i = 0; i < count; i++) {
@@ -215,7 +215,7 @@ static void fps_log_threads(void)
                 const unsigned end = n_top < TOP ? n_top : TOP - 1;
                 for (unsigned k = end; k > at; k--) top[k] = top[k - 1];
                 snprintf(top[at].name, sizeof top[at].name, "%s", ext.pth_name[0] ? ext.pth_name : "unnamed");
-                top[at].pct = pct;
+                top[at].pct = pct; top[at].pri = ext.pth_curpri;
                 if (n_top < TOP) n_top++;
             }
         }
@@ -226,8 +226,104 @@ static void fps_log_threads(void)
     if (span <= 0) return;
     char line[512]; int o = snprintf(line, sizeof line, "[threads] total=%.0f%%", total);
     for (unsigned k = 0; k < n_top && o < (int)sizeof line - 40; k++)
-        o += snprintf(line + o, sizeof line - (size_t)o, " %s=%.0f%%", top[k].name, top[k].pct);
+        o += snprintf(line + o, sizeof line - (size_t)o, " %s=%.0f%%@%d", top[k].name, top[k].pct, top[k].pri);
     fprintf(stderr, "%s\n", line);
+}
+
+/* Host state behind a CPU-time gap between two Macs: chip and core mix, power
+ * source, Low Power Mode and thermal state once at init, and with the FPS
+ * option, which core class the process's CPU time ran on and at what clock.
+ * Every heavy thread burning more CPU per frame on a faster chip points at
+ * one of these, and the tester's log is the only place to see which.
+ * Read-only queries; nothing here changes scheduling. */
+#include <sys/sysctl.h>
+#include <libproc.h>
+#include <IOKit/ps/IOPowerSources.h>
+#include <IOKit/ps/IOPSKeys.h>
+static const char *host_thermal_name(void)
+{
+    switch (NSProcessInfo.processInfo.thermalState) {
+    case NSProcessInfoThermalStateNominal:  return "nominal";
+    case NSProcessInfoThermalStateFair:     return "fair";
+    case NSProcessInfoThermalStateSerious:  return "serious";
+    case NSProcessInfoThermalStateCritical: return "critical";
+    }
+    return "unknown";
+}
+static int host_sysctl_int(const char *name)
+{
+    int v = 0; size_t n = sizeof v;
+    return sysctlbyname(name, &v, &n, NULL, 0) == 0 && n == sizeof v ? v : -1;
+}
+/* "AC", "battery 73%", "battery" or "unknown" (UPS and the like). */
+static void host_power_source(char *out, size_t size)
+{
+    snprintf(out, size, "unknown");
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    if (!info) return;
+    CFStringRef type = IOPSGetProvidingPowerSourceType(info);
+    if (type && CFEqual(type, CFSTR(kIOPMACPowerKey))) snprintf(out, size, "AC");
+    else if (type && CFEqual(type, CFSTR(kIOPMBatteryPowerKey))) {
+        int pct = -1;
+        CFArrayRef list = IOPSCopyPowerSourcesList(info);
+        for (CFIndex i = 0; list && i < CFArrayGetCount(list) && pct < 0; i++) {
+            CFDictionaryRef d = IOPSGetPowerSourceDescription(info, CFArrayGetValueAtIndex(list, i));
+            CFNumberRef cur = d ? CFDictionaryGetValue(d, CFSTR(kIOPSCurrentCapacityKey)) : NULL;
+            CFNumberRef max = d ? CFDictionaryGetValue(d, CFSTR(kIOPSMaxCapacityKey)) : NULL;
+            int c = 0, m = 0;
+            if (cur && max && CFNumberGetValue(cur, kCFNumberIntType, &c) &&
+                CFNumberGetValue(max, kCFNumberIntType, &m) && m > 0) pct = c * 100 / m;
+        }
+        if (list) CFRelease(list);
+        if (pct >= 0) snprintf(out, size, "battery %d%%", pct); else snprintf(out, size, "battery");
+    }
+    CFRelease(info);
+}
+static void host_log_startup(void)
+{
+    char chip[128]; size_t n = sizeof chip;
+    if (sysctlbyname("machdep.cpu.brand_string", chip, &n, NULL, 0) != 0) snprintf(chip, sizeof chip, "unknown");
+    int p = host_sysctl_int("hw.perflevel0.physicalcpu"), e = host_sysctl_int("hw.perflevel1.physicalcpu");
+    if (p <= 0) { p = host_sysctl_int("hw.physicalcpu"); e = 0; }
+    if (e < 0) e = 0;
+    uint64_t mem = 0; n = sizeof mem;
+    if (sysctlbyname("hw.memsize", &mem, &n, NULL, 0) != 0) mem = 0;
+    NSProcessInfo *pi = NSProcessInfo.processInfo;
+    const NSOperatingSystemVersion v = pi.operatingSystemVersion;
+    char power[32]; host_power_source(power, sizeof power);
+    fprintf(stderr, "[host] %s, %d P + %d E cores, %llu GB, macOS %ld.%ld.%ld, power %s, low power mode %s, thermal %s\n",
+            chip, p, e, (unsigned long long)(mem >> 30), (long)v.majorVersion, (long)v.minorVersion,
+            (long)v.patchVersion, power, pi.lowPowerModeEnabled ? "on" : "off", host_thermal_name());
+}
+/* Per-process P-core share and effective clocks since the last call, from
+ * proc_pid_rusage. On Apple silicon the ri_*time fields are mach absolute
+ * time units (24 MHz, timebase 125/3), not nanoseconds: one thread spinning
+ * for one second reads 24,000,000 there, measured on an M2. They convert with
+ * the timebase like mach_absolute_time. The first call only takes a sample. */
+static void host_log_cpu(void)
+{
+    static struct rusage_info_v6 prev; static uint64_t prev_at; static int have;
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom && mach_timebase_info(&tb) != KERN_SUCCESS) return;
+    struct rusage_info_v6 ri;
+    const uint64_t at = mach_absolute_time();
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&ri) != 0) { have = 0; return; }
+    const struct rusage_info_v6 a = prev; const uint64_t a_at = prev_at; const int had = have;
+    prev = ri; prev_at = at; have = 1;
+    if (!had) return;
+    const double s = (double)tb.numer / tb.denom / 1e9;   /* mach units -> seconds */
+    const double all = (double)((ri.ri_user_time + ri.ri_system_time) - (a.ri_user_time + a.ri_system_time)) * s;
+    const double pt = (double)((ri.ri_user_ptime + ri.ri_system_ptime) - (a.ri_user_ptime + a.ri_system_ptime)) * s;
+    const double wall = (double)(at - a_at) * s;
+    const double cyc = (double)(ri.ri_cycles - a.ri_cycles), pcyc = (double)(ri.ri_pcycles - a.ri_pcycles);
+    const double et = all - pt;
+    if (all < 0.010 || wall <= 0 || pt < 0 || pt > all * 1.001 || cyc <= 0 || pcyc > cyc) return;   /* no data or not believable */
+    char pf[16] = "-", ef[16] = "-";
+    if (pt >= 0.010) snprintf(pf, sizeof pf, "%.2f", pcyc / pt / 1e9);
+    if (et >= 0.010) snprintf(ef, sizeof ef, "%.2f", (cyc - pcyc) / et / 1e9);
+    fprintf(stderr, "[host-cpu] P-core share %.0f%% of %.2f cores, P %s GHz, E %s GHz, low power %s, thermal %s\n",
+            pt / all * 100.0, all / wall, pf, ef,
+            NSProcessInfo.processInfo.lowPowerModeEnabled ? "on" : "off", host_thermal_name());
 }
 
 /* Main queue timer continues to report zero FPS even when frame submission
@@ -262,6 +358,7 @@ static void fps_start(void)
         fprintf(stderr,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f\n",
             r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds);
         fps_log_threads();
+        host_log_cpu();
     });
     dispatch_resume(s_fps_timer);
 }
@@ -5568,6 +5665,9 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
                 [[s_dev name] UTF8String], s_width, s_height,
                 s_guest_shaders ? "on" : (rsx_hlsl_to_msl_available() ? "off (env)" : "off (translator not built)"),
                 s_eng_active ? "register-file draw engine" : "vtable");
+#if !TARGET_OS_IPHONE
+        host_log_startup();
+#endif
         return 0;
     }
 }
