@@ -1507,3 +1507,21 @@ to 76% busy.
   since the last full hash or not). `[texhash-check] frame=N full=N changed=N
   mismatches=N` every 600 presented frames; a mismatch is a change one of them
   missed. Read at engine init. `libs/video/rsx_draw_engine.c`
+
+## Metal present pacing (hand-maintained, 2026-11-24)
+
+The guest's frame clock is a CPU timer and a windowed frame is shown at the
+first refresh after it is ready, so on a 120 Hz screen a 33.3 ms rhythm whose
+hand-over sits near a refresh boundary shows as 41.7 + 25 ms pairs.
+
+- **`PS3RECOMP_PRESENT_INTERVAL_MS`** — `<ms>` (default unset: plain
+  presents): each windowed frame stays on screen at least `<ms>` minus half a
+  refresh of the window's screen (`presentDrawable:afterMinimumDuration:`),
+  so 33.333 on 120 Hz holds 29.17 ms, four refreshes. Off on a screen that
+  refreshes slower than `<ms>`, when its rate is unknown, and while V-Sync is
+  off; headless and host-surface frames are not affected. Read at window
+  creation; the screen's rate is re-read when the window changes screen.
+  `[RSX metal] present pacing: ...` says what it chose and on which screen.
+  `libs/video/rsx_metal_backend.m`
+- The `[RSX FPS]` line (`PS3RECOMP_METAL_FPS=1`) ends with `uneven=<n>`:
+  presented intervals in that second more than 2 ms from its median.

@@ -16,6 +16,10 @@ exposes the preceding stall. A sample with no new frames reports zero FPS and
 zero interval statistics, while age keeps increasing. The p95 uses nearest
 rank over at most the most recent 256 intervals in the sample; average and
 maximum include every interval. The first frame has no preceding interval.
+The log line ends with `uneven=<n>`: the intervals in that sample (the same
+256-bounded set as the p95) more than 2 ms from the sample's median interval.
+A steady 33.3 ms rhythm reads 0; 41.7 + 25 ms pairs at the same average count
+every one of them. The title does not show it.
 
 The main queue timer updates independently of the frame submission thread.
 If the main queue itself blocks, the title cannot update; log timestamps make

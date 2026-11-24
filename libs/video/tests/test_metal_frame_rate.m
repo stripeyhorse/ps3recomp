@@ -270,6 +270,17 @@ int main(int argc, char **argv) {
    assert(sample.display_fps==75.25);
    assert(fabs(sample.p95_ms-10.0)<0.001);
    assert(fabs(sample.worst_ms-10.0)<0.001);
+   assert(sample.uneven==0);
+   /* 30 FPS on a 120 Hz screen: 41.7 + 25 ms pairs average 33.3 ms but are
+    * uneven; steady 33.3 ms and sub-2 ms jitter are not. */
+   metal_frame_rate_reset(&stats, 30.0);
+   double t=30.0;
+   for (int i=0;i<30;i++) { t+= i<10 ? (i&1 ? 0.025 : 0.04167) : 0.03333; metal_frame_rate_presented(&stats, t); }
+   sample=metal_frame_rate_sample(&stats, 31.0);
+   assert(sample.uneven==9);   /* 29 intervals: nine of the pairs, twenty steady */
+   for (int i=0;i<30;i++) { t+= i&1 ? 0.0343 : 0.0323; metal_frame_rate_presented(&stats, t); }
+   sample=metal_frame_rate_sample(&stats, 32.0);
+   assert(sample.uneven==0);
 #else
    assert(!"Metal frame-rate measurement is missing");
 #endif

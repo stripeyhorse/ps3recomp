@@ -15,7 +15,11 @@ typedef struct {
 } MetalFrameRate;
 typedef struct {
     double display_fps, guest_fps, average_ms, p95_ms, worst_ms, age_seconds;
+    /* Intervals more than METAL_FRAME_RATE_UNEVEN_MS from the sample's median:
+     * uneven frame spacing at a steady average rate (41.7 + 25 ms pairs). */
+    unsigned uneven;
 } MetalFrameRateSample;
+#define METAL_FRAME_RATE_UNEVEN_MS 2.0
 static inline void metal_frame_rate_reset(MetalFrameRate *s, double now) {
     memset(s, 0, sizeof(*s)); s->epoch=now;
 }
@@ -44,6 +48,8 @@ static inline MetalFrameRateSample metal_frame_rate_sample(MetalFrameRate *s, do
         double sorted[METAL_FRAME_RATE_INTERVALS];memcpy(sorted,s->intervals,n*sizeof(double));
         qsort(sorted,n,sizeof(double),metal_frame_rate_compare);
         r.p95_ms=sorted[(95*n+99)/100-1];
+        const double median=sorted[n/2];
+        for (unsigned i=0;i<n;i++) r.uneven+=fabs(sorted[i]-median)>METAL_FRAME_RATE_UNEVEN_MS;
     }
     r.age_seconds=s->last_presented>0?fmax(0,now-s->last_presented):0;
     s->epoch=now; s->displayed=s->guest=s->interval_count=0;

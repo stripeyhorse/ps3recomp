@@ -355,8 +355,8 @@ static void fps_start(void)
         pthread_mutex_unlock(&session->lock);
         window.title=[NSString stringWithFormat:@"%@ | display %.1f FPS | guest %.1f FPS | %.1f ms avg / %.1f p95 / %.1f max | age %.1f s",
             title,r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds];
-        fprintf(stderr,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f\n",
-            r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds);
+        fprintf(stderr,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f uneven=%u\n",
+            r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds,r.uneven);
         fps_log_threads();
         host_log_cpu();
     });
@@ -385,6 +385,92 @@ static id<CAMetalDrawable> acquire_drawable(CAMetalLayer *layer)
     }
 #endif
     return [layer nextDrawable];
+}
+
+/* PS3RECOMP_PRESENT_INTERVAL_MS=<ms> (default off): hold each windowed frame
+ * on screen for at least <ms> minus half a refresh of the window's screen
+ * (presentDrawable:afterMinimumDuration:). The guest's frame clock is a CPU
+ * timer; with plain presents, a frame that becomes ready near a refresh
+ * boundary lands on either side of it, so a 33.3 ms rhythm on a 120 Hz screen
+ * shows as 41.7 + 25 ms pairs. The hold keeps the 25 ms one from happening.
+ * Half a refresh short of the interval asks for the right number of refreshes
+ * on a panel a hair off its nominal rate. A screen that refreshes slower than
+ * the interval, an unknown rate, or V-Sync off: plain presents. Headless and
+ * host-surface frames have no drawable and are not affected. */
+#if !TARGET_OS_IPHONE
+static double s_pace_interval_ms;            /* 0: off, plain presents */
+static _Atomic(double) s_pace_hold_s;        /* 0: plain present on this screen */
+static id s_pace_screen_observer;
+static void pace_update(NSWindow* window, const char* when)
+{
+    NSScreen* screen = window.screen;
+    NSInteger hz = 0;
+    if (@available(macOS 12.0, *)) hz = screen ? screen.maximumFramesPerSecond : 0;
+    double hold_ms = 0;
+    char state[128];
+    if (hz <= 0) {
+        snprintf(state, sizeof state, "off (refresh rate of the screen unknown)");
+    } else if (1000.0 / (double)hz > s_pace_interval_ms) {
+        snprintf(state, sizeof state, "off (a %ld Hz screen refreshes slower than %.2f ms frames)",
+                 (long)hz, s_pace_interval_ms);
+    } else {
+        hold_ms = s_pace_interval_ms - 500.0 / (double)hz;
+        snprintf(state, sizeof state, "%.2f ms frames on a %ld Hz screen (hold %.2f ms)",
+                 s_pace_interval_ms, (long)hz, hold_ms);
+    }
+    atomic_store_explicit(&s_pace_hold_s, hold_ms / 1000.0, memory_order_relaxed);
+    const NSSize px = screen ? [screen convertRectToBacking:screen.frame].size : NSZeroSize;
+    NSString* name = nil;
+    if (@available(macOS 10.15, *)) name = screen.localizedName;
+    fprintf(stderr, "[RSX metal] present pacing: %s%s, %s: screen \"%s\" %.0fx%.0f\n", state,
+            s_layer && !s_layer.displaySyncEnabled ? ", not applied while vsync is off" : "", when,
+            name ? name.UTF8String : "?", px.width, px.height);
+}
+
+static void pace_stop(void)
+{
+    if (s_pace_screen_observer) {
+        [[NSNotificationCenter defaultCenter] removeObserver:s_pace_screen_observer];
+        s_pace_screen_observer = nil;
+    }
+    atomic_store_explicit(&s_pace_hold_s, 0.0, memory_order_relaxed);
+}
+
+/* Main thread, once the window and its layer exist. */
+static void pace_start(NSWindow* window)
+{
+    pace_stop();
+    s_pace_interval_ms = 0;
+    const char* env = getenv("PS3RECOMP_PRESENT_INTERVAL_MS");
+    if (!env || !*env) return;
+    char* end = NULL;
+    const double ms = strtod(env, &end);
+    if (end == env || *end || !isfinite(ms) || ms < 0 || ms > 1000) {
+        fprintf(stderr, "[RSX metal] present pacing: off (PS3RECOMP_PRESENT_INTERVAL_MS=%s is not 0-1000 ms)\n", env);
+        return;
+    }
+    if (ms == 0) return;
+    s_pace_interval_ms = ms;
+    pace_update(window, "start-up");
+    s_pace_screen_observer = [[NSNotificationCenter defaultCenter]
+        addObserverForName:NSWindowDidChangeScreenNotification object:window queue:nil
+        usingBlock:^(NSNotification* note) { pace_update((NSWindow*)note.object, "screen changed"); }];
+}
+#endif
+
+/* The windowed hand-over. With the switch off this is the plain present. */
+static void present_drawable(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable)
+{
+#if !TARGET_OS_IPHONE
+    if (s_pace_interval_ms > 0) {
+        const double hold = atomic_load_explicit(&s_pace_hold_s, memory_order_relaxed);
+        if (hold > 0 && s_layer.displaySyncEnabled) {
+            [cb presentDrawable:drawable afterMinimumDuration:hold];
+            return;
+        }
+    }
+#endif
+    [cb presentDrawable:drawable];
 }
 
 /* ---- vertex layout ----------------------------------------------------------
@@ -1114,6 +1200,7 @@ static int create_window_impl(const char* title)
     [s_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     if (was_fullscreen) [s_window toggleFullScreen:nil];
+    pace_start(s_window);
     fps_start();
     /* PS3RECOMP_FULLSCREEN=1, the same for every backend: start in fullscreen (a window handed over from another
      * executable keeps the state it had); the picture is letterboxed as in a resized window. */
@@ -5421,7 +5508,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         const u32 ft_nrec = s_eng_rec_count;
         eng_encode_records(cb, stage);
         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
-        if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
+        if (drawable) { fps_track_drawable(drawable); present_drawable(cb, drawable); }
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
         if (windowed_present) {
             dispatch_semaphore_t sem = s_inflight;
@@ -5848,6 +5935,7 @@ void rsx_metal_backend_shutdown(void)
         if (fps_session() || s_window || s_window_close_observer) {
             void (^stop_window)(void) = ^{
                 if (fps_session()) fps_stop();
+                pace_stop();
                 window_close_observer_stop();
                 if (s_window) { [s_window close]; s_window = nil; }
             };
@@ -6037,7 +6125,7 @@ void rsx_metal_backend_present(void)
         }
         if (enc) [enc endEncoding];
 
-        if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
+        if (drawable) { fps_track_drawable(drawable); present_drawable(cb, drawable); }
 
         if (s_headless) {
             /* The readback below must see a completed frame. */
