@@ -2164,7 +2164,11 @@ static int spurs_admit_lane(struct SpursInst* si, struct SpursPmSlot* slot, u32 
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
-    ps3_thread_name("spurs pm");
+    struct SpursInst* si = slot->instance;
+    /* Named by instance ("spurs pm MainSpurs:2", or "spurs pm 3spu:2" without
+     * a prefix), so the per-thread CPU line tells the instances apart. */
+    if (si->prefix[0]) ps3_thread_name("spurs pm %s:%u", si->prefix, slot->spu_num);
+    else               ps3_thread_name("spurs pm %uspu:%u", si->nspus, slot->spu_num);
 #if defined(__APPLE__)
     /* PS3_THREAD_QOS=1: run SPURS lanes at user-interactive QoS. A lane is a
      * guest SPU, and when it has work the frame is waiting on it; at the
@@ -2174,7 +2178,6 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     { const char* e = getenv("PS3_THREAD_QOS");
       if (e && *e == '1') pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); }
 #endif
-    struct SpursInst* si = slot->instance;
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif

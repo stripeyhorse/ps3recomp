@@ -178,7 +178,7 @@ void rsx_metal_backend_note_guest_frame(void)
     pthread_mutex_unlock(&session->lock);
 }
 
-/* With the FPS option on, once a second: the eight busiest threads by name
+/* With the FPS option on, once a second: the twelve busiest threads by name
  * and the share of one core each used since the last line. A frame rate that
  * does not follow CPU speed is a question about which threads are saturated on
  * that machine, and this answers it from a player's log without a profiler.
@@ -186,7 +186,7 @@ void rsx_metal_backend_note_guest_frame(void)
 #include <mach/mach.h>
 static void fps_log_threads(void)
 {
-    enum { MAXT = 96, TOP = 8 };
+    enum { MAXT = 96, TOP = 12 };
     static struct { uint64_t id; uint64_t ns; } prev[MAXT];
     static unsigned n_prev;
     static CFTimeInterval last;
@@ -224,7 +224,7 @@ static void fps_log_threads(void)
     vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
     memcpy(prev, cur, sizeof(prev[0]) * n_cur); n_prev = n_cur;
     if (span <= 0) return;
-    char line[512]; int o = snprintf(line, sizeof line, "[threads] total=%.0f%%", total);
+    char line[768]; int o = snprintf(line, sizeof line, "[threads] total=%.0f%%", total);
     for (unsigned k = 0; k < n_top && o < (int)sizeof line - 40; k++)
         o += snprintf(line + o, sizeof line - (size_t)o, " %s=%.0f%%@%d", top[k].name, top[k].pct, top[k].pri);
     fprintf(stderr, "%s\n", line);
