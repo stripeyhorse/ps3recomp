@@ -1120,6 +1120,11 @@ static int create_window_impl(const char* title)
 {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    {   /* PS3RECOMP_APP_ICON: the Dock icon, such as one a launcher made from the player's own disc art. */
+        const char* icon = getenv("PS3RECOMP_APP_ICON");
+        NSImage* image = icon && *icon ? [[NSImage alloc] initWithContentsOfFile:[NSString stringWithUTF8String:icon]] : nil;
+        if (image) [NSApp setApplicationIconImage:image];
+    }
     {   /* A plain run loop has no menu bar, so the app menu was empty: a "Quit <title>" item is all it gets. */
         s_quit_target = [RsxQuitTarget new];
         NSMenu* bar = [NSMenu new];
@@ -1156,6 +1161,9 @@ static int create_window_impl(const char* title)
                       defer:NO];
     if (!s_window) return -1;
     window_close_observer_start(s_window);
+    /* Black until the first frame (and behind the letterbox), not the light
+     * grey window background a Light Mode Mac would show for an empty layer. */
+    [s_window setBackgroundColor:[NSColor blackColor]];
 
     [s_window setTitle:[NSString stringWithUTF8String:(title ? title : "ps3recomp")]];
     [s_window center];
@@ -1174,6 +1182,8 @@ static int create_window_impl(const char* title)
     s_layer.device          = s_dev;
     s_layer.pixelFormat     = MTLPixelFormatBGRA8Unorm;
     s_layer.framebufferOnly = YES;
+    s_layer.opaque          = YES;
+    s_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
     const char* vsync = getenv("PS3RECOMP_VSYNC");
     const char* aspect = getenv("PS3RECOMP_ASPECT");
     s_layer.displaySyncEnabled = !(vsync && !strcmp(vsync, "0"));

@@ -798,3 +798,58 @@ void ps3_host_quit(const char* why)
     fflush(NULL);
     exit(0);
 }
+
+/* SIGTERM and SIGINT quit the way the window's close button does. The handler
+ * only writes the signal number to a pipe (async-signal-safe); a thread reads
+ * it and calls ps3_host_quit, which ignores every request after the first, so
+ * a second signal neither restarts nor shortens the wait. SIGKILL and the
+ * crash signals are not touched. */
+#ifndef _WIN32
+#include <fcntl.h>
+#include <signal.h>
+static int s_quit_pipe[2] = { -1, -1 };
+
+static void quit_signal(int sig)
+{
+    const int saved = errno;
+    const unsigned char b = (unsigned char)sig;
+    const ssize_t r = write(s_quit_pipe[1], &b, 1);   /* full pipe: one is already queued */
+    (void)r;
+    errno = saved;
+}
+
+static void* quit_signal_thread(void* unused)
+{
+    (void)unused;
+    for (;;) {
+        unsigned char sig;
+        const ssize_t n = read(s_quit_pipe[0], &sig, 1);
+        if (n == 1) ps3_host_quit(sig == SIGINT ? "signal SIGINT" : "signal SIGTERM");
+        else if (n < 0 && errno == EINTR) continue;
+        else return NULL;
+    }
+}
+#endif
+
+void ps3_host_quit_on_signals(void)
+{
+#ifndef _WIN32
+    if (s_quit_pipe[0] >= 0 || pipe(s_quit_pipe) != 0) return;
+    for (int i = 0; i < 2; ++i) fcntl(s_quit_pipe[i], F_SETFD, FD_CLOEXEC);
+    fcntl(s_quit_pipe[1], F_SETFL, O_NONBLOCK);
+    pthread_t th;
+    if (pthread_create(&th, NULL, quit_signal_thread, NULL) != 0) {
+        close(s_quit_pipe[0]); close(s_quit_pipe[1]);
+        s_quit_pipe[0] = s_quit_pipe[1] = -1;
+        return;
+    }
+    pthread_detach(th);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = quit_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+#endif
+}

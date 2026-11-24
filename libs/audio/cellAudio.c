@@ -195,6 +195,7 @@ static int audio_backend_init(void)
     s_sdl_audio_mute = getenv("PS3_MUTE") != NULL;
     if (s_sdl_audio_mute) printf("[cellAudio] PS3_MUTE -- output silenced\n");
     if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
+        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");   /* SIGTERM/SIGINT: ps3_host_quit_on_signals */
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
             printf("[cellAudio] SDL audio init failed: %s\n", SDL_GetError());
             return -1;

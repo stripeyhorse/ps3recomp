@@ -171,6 +171,33 @@ s32 g_sys_process_exit_code   = 0;
 
 void sys_process_exit(s32 exitcode)
 {
+    /* The first exit wins. exit() tears the host down while the title's other
+     * threads still run; one of them can trip the title's own abort() and
+     * call this again, and a second exit() racing the first is undefined and
+     * replaced PAIN's clean 0 with 1 after a quit. Later callers wait for
+     * the first exit to end the process. */
+    static int s_exiting;
+    if (__atomic_exchange_n(&s_exiting, 1, __ATOMIC_ACQ_REL)) {
+        printf("[sysPrxForUser] sys_process_exit(code=%d) while exiting with %d -- ignored\n",
+               exitcode, g_sys_process_exit_code);
+        fflush(stdout);
+        for (;;) {
+#ifdef _WIN32
+            Sleep(1000);
+#else
+            struct timespec ts = {1,0}; nanosleep(&ts,0);
+#endif
+        }
+    }
+    /* After the host asked the title to quit (window closed, hold to quit,
+     * SIGTERM), PAIN shuts down and then a thread still running trips its own
+     * abort(): exit 1, where a PS3 would already have ended the process. The
+     * quit was asked for and the title shut down, so the status is 0. */
+    extern int ps3_host_quitting(void);   /* cellSysutil.c */
+    if (exitcode != 0 && ps3_host_quitting()) {
+        printf("[sysPrxForUser] sys_process_exit(code=%d) during a host quit -- exiting 0\n", exitcode);
+        exitcode = 0;
+    }
     g_sys_process_exit_code   = exitcode;
     g_sys_process_exit_called = 1;
     printf("[sysPrxForUser] sys_process_exit(code=%d)\n", exitcode);

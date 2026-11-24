@@ -876,8 +876,13 @@ extern "C" void ppu_hle_register_all(void) __attribute__((weak));
 extern "C" void ppu_hle_register_all(void) {}
 #endif
 
+extern "C" void ps3_host_quit_on_signals(void);   /* libs/system/cellSysutil.c */
+
 extern "C" void ppu_hle_init(void)
 {
+    /* Before the title starts any thread or SDL subsystem: SIGTERM and SIGINT
+     * quit through the same path as the window's close button. */
+    ps3_host_quit_on_signals();
     ppu_hle_register_all();
 
     /* The generated registration unit is per-game and easy to leave out: the

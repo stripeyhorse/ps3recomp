@@ -1525,3 +1525,12 @@ hand-over sits near a refresh boundary shows as 41.7 + 25 ms pairs.
   `libs/video/rsx_metal_backend.m`
 - The `[RSX FPS]` line (`PS3RECOMP_METAL_FPS=1`) ends with `uneven=<n>`:
   presented intervals in that second more than 2 ms from its median.
+
+## Metal app icon (hand-maintained, 2026-11-24)
+
+- **`PS3RECOMP_APP_ICON`** — `<path>` (default unset: the default icon) to
+  an image file NSImage can read. The windowed backend sets it as the Dock
+  and app-switcher icon when it creates the window. A file that is missing
+  or unreadable leaves the default icon. The PAIN launcher passes one it made
+  from the player's own `ICON0.PNG`, so no game art ships with the app.
+  `libs/video/rsx_metal_backend.m`

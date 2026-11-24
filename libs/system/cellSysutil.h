@@ -137,6 +137,11 @@ void cellSysutilQueueEvent(int slot, u32 status, u32 param);
  * does nothing. ps3_host_quitting(): 1 once asked. */
 void ps3_host_quit(const char* why);
 int  ps3_host_quitting(void);
+/* SIGTERM and SIGINT call ps3_host_quit("signal SIGTERM"/"signal SIGINT")
+ * (POSIX; nothing on Windows). Installed once by ppu_hle_init; the SDL
+ * subsystems are started with SDL_HINT_NO_SIGNAL_HANDLERS so they leave
+ * these signals alone. */
+void ps3_host_quit_on_signals(void);
 
 /* value_ea / buf_ea are GUEST addresses, not host pointers: both write into
  * the title's own memory through vm_write*. Spelt u32 so a caller cannot

@@ -6,7 +6,11 @@
  * REQUEST_EXITGAME on the next poll; a title that does not exit by itself is
  * ended with status 0 after PS3_QUIT_GRACE_MS, but not while a save is being
  * written. The process exits from the quit thread, so the checks that need
- * the end run in an atexit handler; main returning means it never ended. */
+ * the end run in an atexit handler; main returning means it never ended.
+ *
+ * With the argument "signal" the quit is asked for by SIGTERM instead
+ * (ps3_host_quit_on_signals), and a SIGINT after it changes nothing: one
+ * request, the same wait, the same exit 0. */
 #include "../cellSysutil.h"
 #include "ps3emu/guest_call.h"
 #include <stdint.h>
@@ -14,6 +18,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
+#include <string.h>
+#include <signal.h>
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 void np_psnr_pump(void) {}
@@ -50,8 +56,9 @@ static unsigned long long ms_now(void)
     return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
+    const int by_signal = argc > 1 && !strcmp(argv[1], "signal");
     setvbuf(stdout, NULL, _IONBF, 0);
     g_ps3_guest_caller = caller;
     if (cellSysutilRegisterCallback(0, (CellSysutilCallback)(uintptr_t)0x100u,
@@ -60,8 +67,16 @@ int main(void)
     }
     atexit(at_end);
     if (ps3_host_quitting()) { puts("[FAIL] quitting before asked"); return 1; }
-    ps3_host_quit("test");
-    ps3_host_quit("test again");          /* ignored */
+    if (by_signal) {
+        ps3_host_quit_on_signals();
+        ps3_host_quit_on_signals();       /* installs once */
+        kill(getpid(), SIGTERM);
+        for (int i = 0; i < 400 && !ps3_host_quitting(); ++i) usleep(5000);
+        kill(getpid(), SIGINT);           /* ignored: a quit is under way */
+    } else {
+        ps3_host_quit("test");
+        ps3_host_quit("test again");      /* ignored */
+    }
     if (!ps3_host_quitting()) { puts("[FAIL] not quitting after asked"); return 1; }
 
     /* The title keeps polling and never exits by itself. The grace is 100 ms

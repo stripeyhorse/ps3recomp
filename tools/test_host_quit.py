@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ps3_host_quit (cellSysutil.c) sends REQUEST_EXITGAME, then ends a title
-that does not exit by itself with status 0, after any save in flight."""
+that does not exit by itself with status 0, after any save in flight; asked
+directly, and by SIGTERM (a later SIGINT is ignored)."""
 import os
 from pathlib import Path
 import subprocess
@@ -26,8 +27,12 @@ with tempfile.TemporaryDirectory(prefix="host-quit-") as temporary:
         str(root / "libs/system/cellSysutil.c"),
         "-pthread", gc_flag, "-o", str(binary),
     ], check=True, timeout=60, env=env, cwd=temporary)
-    result = subprocess.run([str(binary)], timeout=10, env=env, cwd=temporary,
-                            capture_output=True, text=True)
-    print(result.stdout.strip())
-    if result.returncode != 0 or "[PASS]" not in result.stdout:
-        raise SystemExit("test_host_quit failed (exit %d)" % result.returncode)
+    for mode in ([], ["signal"]):
+        result = subprocess.run([str(binary)] + mode, timeout=10, env=env, cwd=temporary,
+                                capture_output=True, text=True)
+        print(result.stdout.strip())
+        requested = result.stdout.count("[quit] requested")
+        if result.returncode != 0 or "[PASS]" not in result.stdout or requested != 1 or (
+                mode and "[quit] requested (signal SIGTERM)" not in result.stdout):
+            raise SystemExit("test_host_quit %s failed (exit %d, %d quit requests)"
+                             % (mode[0] if mode else "direct", result.returncode, requested))

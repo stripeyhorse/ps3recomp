@@ -233,6 +233,14 @@ int main(int argc, char **argv) {
     assert(!"Metal drawable tracking is missing");
 #endif
    } else {
+   /* Before its first frame the window is black and its layer opaque: no light-grey flash. */
+   NSColor *background=[s_window.backgroundColor colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+   assert(background && background.redComponent==0 && background.greenComponent==0 &&
+       background.blueComponent==0 && background.alphaComponent==1);
+   assert(s_window.contentView.layer==s_layer && s_layer.opaque);
+   const CGFloat *black=CGColorGetComponents(s_layer.backgroundColor);
+   assert(black && black[0]==0 && CGColorGetAlpha(s_layer.backgroundColor)==1);
+   fprintf(stderr,"[FPS fixture] window background black, layer opaque and black\n");
    /* No rendering thread is running: the title must still update on a stall. */
    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1.2]];
    assert([s_window.title containsString:@"display 0.0 FPS"]);

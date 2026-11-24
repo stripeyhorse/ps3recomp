@@ -66,6 +66,7 @@ int rsx_vk_platform_output_open(const char* title, uint32_t default_width,
                                 uint32_t default_height, rsx_vk_output* output)
 {
     if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return -1;
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");   /* SIGTERM/SIGINT: ps3_host_quit_on_signals */
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
         return -1;
