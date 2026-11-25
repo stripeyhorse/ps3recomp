@@ -62,6 +62,8 @@
 
 #include <pthread.h>
 #include "metal_frame_rate.h"
+#include <os/lock.h>
+#include "rsx_frame_lock.h"
 #include <stdatomic.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -156,13 +158,21 @@ static MetalFrameRateSession *fps_session(void)
     return session;
 }
 
+static unsigned pace_take_shed(void);
+
+/* When the RSX thread began the present that is in progress (before it asked
+ * for a drawable, which can block): the start of a frame's wait for the screen. */
+static CFTimeInterval s_present_began;
+
 static void fps_track_drawable(id<CAMetalDrawable> drawable)
 {
     MetalFrameRateSession *session=fps_session();
     if (!session || !drawable) return;
+    const CFTimeInterval began=s_present_began;
     [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
         pthread_mutex_lock(&session->lock);
         metal_frame_rate_presented(&session->stats,shown.presentedTime);
+        metal_frame_rate_waited(&session->stats,began,shown.presentedTime);
         pthread_mutex_unlock(&session->lock);
     }];
 }
@@ -355,8 +365,10 @@ static void fps_start(void)
         pthread_mutex_unlock(&session->lock);
         window.title=[NSString stringWithFormat:@"%@ | display %.1f FPS | guest %.1f FPS | %.1f ms avg / %.1f p95 / %.1f max | age %.1f s",
             title,r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds];
-        fprintf(stderr,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f uneven=%u\n",
-            r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds,r.uneven);
+        fprintf(stderr,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f uneven=%u "
+            "wait_ms=%.1f wait_max_ms=%.1f shed=%u\n",
+            r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds,r.uneven,
+            r.wait_ms,r.wait_worst_ms,pace_take_shed());
         fps_log_threads();
         host_log_cpu();
     });
@@ -374,6 +386,7 @@ void rsx_metal_backend_note_guest_frame(void) {}
 static id<CAMetalDrawable> acquire_drawable(CAMetalLayer *layer)
 {
 #if !TARGET_OS_IPHONE
+    s_present_began=CACurrentMediaTime();
     if (fps_session()) {
         const CFTimeInterval start=CACurrentMediaTime();
         id<CAMetalDrawable> drawable=[layer nextDrawable];
@@ -387,38 +400,95 @@ static id<CAMetalDrawable> acquire_drawable(CAMetalLayer *layer)
     return [layer nextDrawable];
 }
 
-/* PS3RECOMP_PRESENT_INTERVAL_MS=<ms> (default off): hold each windowed frame
- * on screen for at least <ms> minus half a refresh of the window's screen
- * (presentDrawable:afterMinimumDuration:). The guest's frame clock is a CPU
- * timer; with plain presents, a frame that becomes ready near a refresh
- * boundary lands on either side of it, so a 33.3 ms rhythm on a 120 Hz screen
- * shows as 41.7 + 25 ms pairs. The hold keeps the 25 ms one from happening.
- * Half a refresh short of the interval asks for the right number of refreshes
- * on a panel a hair off its nominal rate. A screen that refreshes slower than
- * the interval, an unknown rate, or V-Sync off: plain presents. Headless and
- * host-surface frames have no drawable and are not affected. */
+/* PS3RECOMP_PRESENT_INTERVAL_MS=<ms> (default off): show windowed frames in
+ * step with the screen (rsx_frame_lock.h has the arithmetic and the reasons).
+ *
+ * The guest's frame clock is a CPU timer; with plain presents, a frame that
+ * becomes ready near a refresh boundary lands on either side of it, so a
+ * 33.3 ms rhythm on a 120 Hz screen shows as 41.7 + 25 ms pairs. With the
+ * switch on, and <ms> a whole number of the screen's refreshes:
+ *   - each frame is shown at a refresh of its own, <ms> after the frame
+ *     before (the plan in rsx_frame_lock.h; pace_present below times the
+ *     present to land there), which keeps the 25 ms one from happening;
+ *   - the plan keeps the delay between a finished frame and the screen as
+ *     short as the GPU and the compositor allow, a refresh at a time;
+ *   - rsx_metal_backend_refresh_phase reports when the screen last showed a
+ *     frame, for a host that keeps its frame timer in step with the screen.
+ * A screen where <ms> is not a whole number of refreshes (144 Hz for 33.3 ms
+ * frames), one slower than the frames, an unknown rate, or V-Sync off: plain
+ * presents and no phase. Headless and host-surface frames have no drawable and
+ * are not affected. */
 #if !TARGET_OS_IPHONE
 static double s_pace_interval_ms;            /* 0: off, plain presents */
-static _Atomic(double) s_pace_hold_s;        /* 0: plain present on this screen */
+static _Atomic(double) s_pace_refresh_s;     /* the screen's refresh period while pacing applies on it, else 0 */
+static _Atomic(double) s_pace_shown_at;      /* when the screen last showed a paced frame (CACurrentMediaTime) */
+static atomic_uint s_pace_handed, s_pace_shown;   /* paced frames handed over; the latest of them shown */
 static id s_pace_screen_observer;
+/* The show time of every frame (rsx_frame_plan), and what it needs to know
+ * about the frames before: when the GPU finished each of the last few, and
+ * how long the GPU took for the latest. The RSX thread plans; Metal's
+ * completion and presentation callbacks report. */
+static os_unfair_lock s_plan_lock = OS_UNFAIR_LOCK_INIT;
+static rsx_frame_plan s_plan;
+static unsigned s_plan_changes_logged;
+static struct { unsigned seq; double at; } s_plan_gpu_done[16];
+static double s_plan_gpu_took[8];
+static unsigned s_plan_gpu_n;
+/* How a planned frame is handed to the compositor (PS3RECOMP_PACE_MODE):
+ *   timer   (default) presented plainly by a timer of our own, in the middle
+ *           of the refresh two before the planned one;
+ *   attime  presentDrawable:atTime: for the planned refresh;
+ *   hold    no plan: presentDrawable:afterMinimumDuration:, the compositor's
+ *           own count from the frame before.
+ * PS3RECOMP_PACE_MODE=a,b (diagnostics) alternates two of them every 256
+ * frames, for a comparison inside one run. */
+enum { PACE_TIMER, PACE_ATTIME, PACE_HOLD };
+static int s_pace_modes[2];
+static dispatch_queue_t s_pace_queue;
+static int pace_mode_named(const char* name, size_t n)
+{
+    if (n == 6 && !strncmp(name, "attime", 6)) return PACE_ATTIME;
+    if (n == 4 && !strncmp(name, "hold", 4)) return PACE_HOLD;
+    return PACE_TIMER;
+}
+static unsigned pace_take_shed(void)
+{
+    os_unfair_lock_lock(&s_plan_lock);
+    const unsigned n = s_plan.changes - s_plan_changes_logged;
+    s_plan_changes_logged = s_plan.changes;
+    os_unfair_lock_unlock(&s_plan_lock);
+    return n;
+}
 static void pace_update(NSWindow* window, const char* when)
 {
     NSScreen* screen = window.screen;
     NSInteger hz = 0;
     if (@available(macOS 12.0, *)) hz = screen ? screen.maximumFramesPerSecond : 0;
-    double hold_ms = 0;
-    char state[128];
+    const double interval_s = s_pace_interval_ms / 1000.0, refresh_s = hz > 0 ? 1.0 / (double)hz : 0;
+    const unsigned refreshes = rsx_frame_lock_refreshes(interval_s, refresh_s);
+    char state[160];
     if (hz <= 0) {
         snprintf(state, sizeof state, "off (refresh rate of the screen unknown)");
-    } else if (1000.0 / (double)hz > s_pace_interval_ms) {
+    } else if (refresh_s * 1000.0 > s_pace_interval_ms * (1.0 + RSX_FRAME_LOCK_TOLERANCE)) {
         snprintf(state, sizeof state, "off (a %ld Hz screen refreshes slower than %.2f ms frames)",
                  (long)hz, s_pace_interval_ms);
+    } else if (!refreshes) {
+        snprintf(state, sizeof state, "off (%.2f ms frames are not a whole number of refreshes of a %ld Hz screen)",
+                 s_pace_interval_ms, (long)hz);
     } else {
-        hold_ms = s_pace_interval_ms - 500.0 / (double)hz;
-        snprintf(state, sizeof state, "%.2f ms frames on a %ld Hz screen (hold %.2f ms)",
-                 s_pace_interval_ms, (long)hz, hold_ms);
+        snprintf(state, sizeof state, "%.2f ms frames on a %ld Hz screen (%u refresh%s a frame%s)",
+                 s_pace_interval_ms, (long)hz, refreshes, refreshes == 1 ? "" : "es",
+                 s_pace_modes[0] != s_pace_modes[1] ? ", two modes in turn"
+                 : s_pace_modes[0] == PACE_HOLD ? ", minimum-duration mode"
+                 : s_pace_modes[0] == PACE_ATTIME ? ", presented for a time" : "");
     }
-    atomic_store_explicit(&s_pace_hold_s, hold_ms / 1000.0, memory_order_relaxed);
+    atomic_store_explicit(&s_pace_refresh_s, refreshes ? refresh_s : 0.0, memory_order_relaxed);
+    os_unfair_lock_lock(&s_plan_lock);
+    s_plan.interval_s = interval_s;
+    s_plan.refresh_s = refresh_s;
+    rsx_frame_plan_reset(&s_plan);
+    s_plan_gpu_n = 0;
+    os_unfair_lock_unlock(&s_plan_lock);
     const NSSize px = screen ? [screen convertRectToBacking:screen.frame].size : NSZeroSize;
     NSString* name = nil;
     if (@available(macOS 10.15, *)) name = screen.localizedName;
@@ -433,7 +503,7 @@ static void pace_stop(void)
         [[NSNotificationCenter defaultCenter] removeObserver:s_pace_screen_observer];
         s_pace_screen_observer = nil;
     }
-    atomic_store_explicit(&s_pace_hold_s, 0.0, memory_order_relaxed);
+    atomic_store_explicit(&s_pace_refresh_s, 0.0, memory_order_relaxed);
 }
 
 /* Main thread, once the window and its layer exist. */
@@ -451,10 +521,170 @@ static void pace_start(NSWindow* window)
     }
     if (ms == 0) return;
     s_pace_interval_ms = ms;
+    const char* mode = getenv("PS3RECOMP_PACE_MODE");
+    if (!mode) mode = "";
+    const char* comma = strchr(mode, ',');
+    s_pace_modes[0] = pace_mode_named(mode, comma ? (size_t)(comma - mode) : strlen(mode));
+    s_pace_modes[1] = comma ? pace_mode_named(comma + 1, strlen(comma + 1)) : s_pace_modes[0];
+    if (!s_pace_queue)
+        s_pace_queue = dispatch_queue_create("rsx.pace", dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     pace_update(window, "start-up");
     s_pace_screen_observer = [[NSNotificationCenter defaultCenter]
         addObserverForName:NSWindowDidChangeScreenNotification object:window queue:nil
         usingBlock:^(NSNotification* note) { pace_update((NSWindow*)note.object, "screen changed"); }];
+}
+
+/* RSX thread. Hands the frame over for its planned refresh and notes when it
+ * is shown. */
+static void pace_present(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable, double refresh_s)
+{
+    /* Sequence numbers, not a count: a frame the screen never reports (window
+     * hidden) is made up for by the next one that it does. */
+    const unsigned handed = atomic_fetch_add_explicit(&s_pace_handed, 1u, memory_order_relaxed) + 1u;
+    const CFTimeInterval now = CACurrentMediaTime();
+    const double anchor = atomic_load_explicit(&s_pace_shown_at, memory_order_relaxed);
+    /* Nothing shown lately (the first frames, a window that was hidden): there
+     * is no grid to plan on, so this frame goes out plainly and starts one. */
+    const int have_grid = anchor > 0 && now - anchor <= 0.25;
+    unsigned seq = 0;
+    double slot = 0, lead = 0, latch = 0;
+    const int mode = s_pace_modes[(handed >> 8) & 1u];
+    os_unfair_lock_lock(&s_plan_lock);
+    if (!have_grid || mode == PACE_HOLD) {
+        rsx_frame_plan_reset(&s_plan);
+    } else {
+        double gpu = 0;
+        for (unsigned i = 0; i < s_plan_gpu_n && i < 8; i++) if (s_plan_gpu_took[i] > gpu) gpu = s_plan_gpu_took[i];
+        /* What a frame needs to make its refresh, as measured on macOS 27
+         * (windowed, 120 Hz):
+         *   a plain present is shown at the first refresh that comes a whole
+         *   refresh after it (8.5 ms at the least, of 3,298), with the GPU
+         *   done 3 ms before; timer mode allows 2.5 ms more for the command
+         *   buffer to be scheduled;
+         *   a present for a time needs the GPU done a whole refresh before. */
+        s_plan.lead_s  = mode == PACE_TIMER ? refresh_s + 0.0025 : 0.0;
+        s_plan.latch_s = mode == PACE_TIMER ? 0.003 : refresh_s + 0.0005;
+        lead = s_plan.lead_s; latch = s_plan.latch_s;
+        slot = rsx_frame_plan_next(&s_plan, now, anchor, gpu, &seq);
+    }
+    os_unfair_lock_unlock(&s_plan_lock);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        const CFTimeInterval at = done.GPUEndTime;
+        if (!(at > 0)) return;
+        os_unfair_lock_lock(&s_plan_lock);
+        s_plan_gpu_took[s_plan_gpu_n++ % 8] = at - now;
+        if (slot > 0) { s_plan_gpu_done[seq % 16].seq = seq; s_plan_gpu_done[seq % 16].at = at; }
+        os_unfair_lock_unlock(&s_plan_lock);
+    }];
+    [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+        unsigned latest = atomic_load_explicit(&s_pace_shown, memory_order_relaxed);
+        while ((int)(handed - latest) > 0 &&
+               !atomic_compare_exchange_weak_explicit(&s_pace_shown, &latest, handed,
+                                                      memory_order_relaxed, memory_order_relaxed)) {}
+        const CFTimeInterval at = shown.presentedTime;
+        if (!(at > 0)) return;                   /* dropped, never on screen */
+        double newest = atomic_load_explicit(&s_pace_shown_at, memory_order_relaxed);
+        while (at > newest &&
+               !atomic_compare_exchange_weak_explicit(&s_pace_shown_at, &newest, at,
+                                                      memory_order_relaxed, memory_order_relaxed)) {}
+        if (!(slot > 0)) return;
+        os_unfair_lock_lock(&s_plan_lock);
+        const double gpu_done = s_plan_gpu_done[seq % 16].seq == seq ? s_plan_gpu_done[seq % 16].at : 0;
+        /* How much later it could have been handed over and still made its
+         * refresh: by the hand-over itself, and by the GPU finishing it. */
+        double slack = slot - now - lead;
+        if (gpu_done > 0 && slot - gpu_done - latch < slack) slack = slot - gpu_done - latch;
+        rsx_frame_plan_shown(&s_plan, seq, slot, at, slack);
+        os_unfair_lock_unlock(&s_plan_lock);
+    }];
+    if (slot > 0 && mode == PACE_ATTIME) {
+        /* Half a refresh before it: the first refresh after that moment is the
+         * planned one, on a panel a hair off its nominal rate too. */
+        [cb presentDrawable:drawable atTime:slot - 0.5 * refresh_s];
+        return;
+    }
+    if (slot > 0) {
+        /* A plain present is shown at the first refresh that comes a whole
+         * refresh after it, so it is made in the middle of the refresh two
+         * before the planned one: late enough not to be shown a refresh
+         * early, and with half a refresh in hand. The middle, not the start:
+         * at two refreshes a frame the start is the moment the frame before
+         * appears, and a present made within a couple of milliseconds of
+         * that is shown a refresh late (1.8% of 3,297 frames when made
+         * 1.5 ms after it). A frame already past the moment goes at once.
+         * The drawable is presented from Metal's scheduled callback or from
+         * the timer, never from here: the command buffer must have been
+         * scheduled first. */
+        const double fire_at = slot - 1.46 * refresh_s;
+        dispatch_queue_t queue = s_pace_queue;
+        [cb addScheduledHandler:^(id<MTLCommandBuffer> scheduled) {
+            (void)scheduled;
+            const double wait_s = fire_at - CACurrentMediaTime();
+            if (wait_s <= 0.0002) { [drawable present]; return; }
+            dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, DISPATCH_TIMER_STRICT, 0, queue);
+            dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait_s * 1e9)),
+                                      DISPATCH_TIME_FOREVER, 0);
+            dispatch_source_set_event_handler(timer, ^{
+                [drawable present];
+                dispatch_source_cancel(timer);
+            });
+            dispatch_resume(timer);
+        }];
+        return;
+    }
+    const double hold = mode == PACE_HOLD ? rsx_frame_lock_hold(s_pace_interval_ms / 1000.0, refresh_s, 0) : 0;
+    if (hold > 0) [cb presentDrawable:drawable afterMinimumDuration:hold];
+    else [cb presentDrawable:drawable];
+}
+#else
+static unsigned pace_take_shed(void) { return 0; }
+#endif
+
+int rsx_metal_backend_refresh_phase(double* since_shown_s, double* refresh_s)
+{
+#if !TARGET_OS_IPHONE
+    const double refresh = atomic_load_explicit(&s_pace_refresh_s, memory_order_relaxed);
+    const double at = atomic_load_explicit(&s_pace_shown_at, memory_order_relaxed);
+    if (!(refresh > 0) || !(at > 0)) return 0;
+    const double since = CACurrentMediaTime() - at;
+    if (!(since >= 0) || since > 0.25) return 0;   /* hidden, locked, or V-Sync turned off */
+    if (since_shown_s) *since_shown_s = since;
+    if (refresh_s) *refresh_s = refresh;
+    return 1;
+#else
+    (void)since_shown_s; (void)refresh_s;
+    return 0;
+#endif
+}
+
+/* PS3RECOMP_PACE_TRACE=1 (diagnostics): one line per frame shown, with the
+ * time from the start of its present to the present call, to the GPU
+ * finishing it and to the screen showing it, and the interval since the frame
+ * shown before it. Two lines, "g" and "s", joined by the frame number. */
+#if !TARGET_OS_IPHONE
+static void pace_trace(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_PACE_TRACE"); on = e && *e && *e != '0'; }
+    if (!on) return;
+    static atomic_uint frames;
+    static _Atomic(double) last_shown;
+    const unsigned frame = atomic_fetch_add_explicit(&frames, 1u, memory_order_relaxed);
+    const CFTimeInterval began = s_present_began, called = CACurrentMediaTime();
+    const unsigned handed = atomic_load_explicit(&s_pace_handed, memory_order_relaxed);
+    const unsigned shown_seq = atomic_load_explicit(&s_pace_shown, memory_order_relaxed);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        fprintf(stderr, "[pace] g %u gpu_ms=%.2f\n", frame, (done.GPUEndTime - began) * 1000.0);
+    }];
+    [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+        const double at = shown.presentedTime;
+        const double prev = at > 0 ? atomic_exchange_explicit(&last_shown, at, memory_order_relaxed) : 0;
+        fprintf(stderr, "[pace] s %u call_ms=%.2f wait_ms=%.2f interval_ms=%.2f waiting=%d mode=%d\n", frame,
+                (called - began) * 1000.0, at > 0 ? (at - began) * 1000.0 : -1.0,
+                prev > 0 ? (at - prev) * 1000.0 : 0.0, (int)(handed - shown_seq),
+                s_pace_modes[((handed + 1u) >> 8) & 1u]);
+    }];
 }
 #endif
 
@@ -462,10 +692,11 @@ static void pace_start(NSWindow* window)
 static void present_drawable(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable)
 {
 #if !TARGET_OS_IPHONE
+    pace_trace(cb, drawable);
     if (s_pace_interval_ms > 0) {
-        const double hold = atomic_load_explicit(&s_pace_hold_s, memory_order_relaxed);
-        if (hold > 0 && s_layer.displaySyncEnabled) {
-            [cb presentDrawable:drawable afterMinimumDuration:hold];
+        const double refresh_s = atomic_load_explicit(&s_pace_refresh_s, memory_order_relaxed);
+        if (refresh_s > 0 && s_layer.displaySyncEnabled) {
+            pace_present(cb, drawable, refresh_s);
             return;
         }
     }
@@ -1209,6 +1440,11 @@ static int create_window_impl(const char* title)
     [s_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
     [s_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+    /* macOS only activates an app on request when the app in front agrees, and
+     * for one started from a shell it does not: the window then opened behind
+     * the others, where the compositor shows none of its frames. This puts the
+     * window in front without taking the keyboard. */
+    [s_window orderFrontRegardless];
     if (was_fullscreen) [s_window toggleFullScreen:nil];
     pace_start(s_window);
     fps_start();

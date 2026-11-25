@@ -289,6 +289,18 @@ int main(int argc, char **argv) {
    for (int i=0;i<30;i++) { t+= i&1 ? 0.0343 : 0.0323; metal_frame_rate_presented(&stats, t); }
    sample=metal_frame_rate_sample(&stats, 32.0);
    assert(sample.uneven==0);
+   /* Wait from the start of a present to the screen showing it: average and
+    * longest per sample; nonsense pairs are ignored; a sample without any reads 0. */
+   assert(sample.wait_ms==0 && sample.wait_worst_ms==0);
+   metal_frame_rate_waited(&stats, 40.000, 40.010);
+   metal_frame_rate_waited(&stats, 40.030, 40.060);
+   metal_frame_rate_waited(&stats, 40.070, 40.060);   /* shown before it began */
+   metal_frame_rate_waited(&stats, 0, 40.060);        /* no start recorded */
+   metal_frame_rate_waited(&stats, 40.070, NAN);
+   sample=metal_frame_rate_sample(&stats, 41.0);
+   assert(fabs(sample.wait_ms-20.0)<0.001 && fabs(sample.wait_worst_ms-30.0)<0.001);
+   sample=metal_frame_rate_sample(&stats, 42.0);
+   assert(sample.wait_ms==0 && sample.wait_worst_ms==0);
 #else
    assert(!"Metal frame-rate measurement is missing");
 #endif

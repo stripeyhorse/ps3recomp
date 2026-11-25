@@ -21,6 +21,14 @@ The log line ends with `uneven=<n>`: the intervals in that sample (the same
 A steady 33.3 ms rhythm reads 0; 41.7 + 25 ms pairs at the same average count
 every one of them. The title does not show it.
 
+After it come `wait_ms=<avg> wait_max_ms=<longest>`: for the frames shown in
+that sample, the time from the start of the present (before the drawable was
+asked for, which can block) to the moment the screen showed the frame. It is
+the display's share of the delay between a finished frame and the picture.
+`shed=<n>` counts frames that present pacing (`PS3RECOMP_PRESENT_INTERVAL_MS`,
+see `rsx_frame_lock.h`) showed a refresh early or late on purpose, to shorten
+the delay or to stop frames missing their refresh; always 0 with pacing off.
+
 The main queue timer updates independently of the frame submission thread.
 If the main queue itself blocks, the title cannot update; log timestamps make
 that gap visible. No image readback, GPU wait, rendering change, or per-frame

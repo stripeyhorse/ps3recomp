@@ -78,6 +78,16 @@ void rsx_metal_backend_present(void);
  * does not claim any display presentations and leaves the tracker disabled. */
 void rsx_metal_backend_note_guest_frame(void);
 
+/* For a host that keeps its frame timer in step with the screen (see
+ * rsx_frame_lock.h, rsx_frame_lock_next). Only with PS3RECOMP_PRESENT_INTERVAL_MS
+ * set and that interval a whole number of the screen's refreshes: how long ago
+ * the window's screen last showed one of this backend's frames, and the
+ * screen's refresh period, both in seconds. Returns 0 and writes nothing when
+ * there is nothing to go by: pacing off or not applicable on this screen, no
+ * frame shown in the last quarter second (window hidden, screen locked, V-Sync
+ * off), headless. Any thread. */
+int rsx_metal_backend_refresh_phase(double* since_shown_s, double* refresh_s);
+
 /* --- test hooks ---------------------------------------------------------- */
 
 /* The clear colour most recently set via NV4097_SET_COLOR_CLEAR_VALUE, in the
