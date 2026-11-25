@@ -477,6 +477,11 @@ struct SpursPmSlot {
      * instance condition, so an admission wakes only the lane it fills.
      * Kept across scheduler restarts (a POSIX slot owns a heap object). */
     CONDITION_VARIABLE wake;
+    /* Where this lane's worker is, for the shutdown wait below (under
+     * si->lock): 0 asleep or not yet started on its admission, 1 inside the
+     * policy module since `since_ms`, 2 back and re-taking the lock. */
+    int phase;
+    u64 since_ms;
 };
 /* Scheduler counters (PS3_SPURS_SCHED_STATS=1), all changed under si->lock. */
 struct SpursSchedStats {
@@ -2188,9 +2193,11 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         while (!slot->busy && !si->stopping)
             SleepConditionVariableSRW(self_admit ? &slot->wake : &si->wake, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
+        slot->phase = 1; slot->since_ms = spurs_now_ms();
         ReleaseSRWLockExclusive(&si->lock);
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
+        __atomic_store_n(&slot->phase, 2, __ATOMIC_RELAXED);   /* read by the report only */
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
         AcquireSRWLockExclusive(&si->lock);
@@ -2204,7 +2211,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         ef_line_end(slot->ea);
         if (polls) si->idle[wid] = 0;
         else if (si->idle[wid] < spurs_idle_max()) si->idle[wid]++;
-        slot->busy = 0;
+        slot->busy = 0; slot->phase = 0;
         if (!self_admit) { WakeAllConditionVariable(&si->wake); continue; }
 
         int admitted = 0;
@@ -3727,11 +3734,43 @@ s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid)
     // under both locks. Drop the registry lock before waiting.
     ReleaseSRWLockExclusive(&s_workload_registry_lock);
     const u32 state_ea = (u32)spurs_ea + wkl_state_off(wid);
+    /* The wait ends when the last lane running the workload returns. It was
+     * untimed, so a lane that never returned (or was admitted and never woke)
+     * froze the caller for good with nothing in the log: PAIN's boot graphics
+     * thread, and with it the boot (1 in ~50). Wait in slices instead. A slice
+     * that ends with no lane returning wakes again every lane that is admitted
+     * but has not started -- its worker re-checks slot->busy, so a wake too many
+     * costs nothing -- and after 2 s, then at doubling intervals, says where
+     * every lane is. */
+    const u64 wait_t0 = spurs_now_ms();
+    u64 next_report = 2000;
     while (si->ea == (u32)spurs_ea && si->kernel_live && !si->stopping &&
            vm_read8(state_ea) == WKL_SHUTTING_DOWN) {
         si->shutdown_waiters++;
-        SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+        const BOOL woke = SleepConditionVariableSRW(&si->wake, &si->lock, 100, 0);
         si->shutdown_waiters--;
+        if (woke) continue;
+        const u32 lanes = spurs_host_lanes(si);
+        for (u32 sn = 0; sn < lanes; sn++)
+            if (si->slots[sn].busy && si->slots[sn].phase == 0)
+                WakeAllConditionVariable(&si->slots[sn].wake);
+        const u64 now = spurs_now_ms();
+        if (now - wait_t0 < next_report) continue;
+        next_report *= 2;
+        fprintf(stderr, "[cellSpurs] WaitForWorkloadShutdown(spurs=0x%08X wid=%u) waiting %llu ms: "
+                "state=%u active=%u free_lanes=%d ready=%u |", si->ea, wid,
+                (unsigned long long)(now - wait_t0), vm_read8(state_ea), si->active[wid],
+                si->free_lanes, vm_read8(si->ea + wkl_ready_off(wid)));
+        for (u32 sn = 0; sn < lanes; sn++) {
+            const struct SpursPmSlot* l = &si->slots[sn];
+            const int ph = __atomic_load_n(&l->phase, __ATOMIC_RELAXED);
+            if (!l->busy) fprintf(stderr, " lane%u=free", sn);
+            else fprintf(stderr, " lane%u=wid%u:%s(%llu ms)", sn, l->wid,
+                         ph == 0 ? "ADMITTED-NOT-STARTED" : ph == 1 ? "in-policy-module" : "returning",
+                         ph ? (unsigned long long)(now - l->since_ms) : 0ull);
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
     }
     const int stopped = si->ea == (u32)spurs_ea && vm_read8(state_ea) == WKL_REMOVABLE;
     ReleaseSRWLockExclusive(&si->lock);
