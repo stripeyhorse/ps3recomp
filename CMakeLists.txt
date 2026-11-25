@@ -383,6 +383,12 @@ endif()
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
+# The runtime's optimisation level, stated here because it is appended after the
+# per-configuration defaults and so overrides them (a Release -O3 becomes this).
+# PS3RECOMP_RUNTIME_EXTRA_FLAGS is a list of further flags for the runtime alone
+# (for example -flto=thin).
+set(PS3RECOMP_RUNTIME_OPT "-O2" CACHE STRING "Optimisation level of the runtime library (GNU-style compilers)")
+set(PS3RECOMP_RUNTIME_EXTRA_FLAGS "" CACHE STRING "Extra compile flags for the runtime library (semicolon-separated)")
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
         -Wall -Wextra -Wno-unused-parameter
@@ -400,7 +406,8 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # Every configuration but Debug, including none: a port configured
         # without CMAKE_BUILD_TYPE matched neither name and compiled the whole
         # runtime -- the FIFO walker, the draw engine, the MFC -- at -O0.
-        $<$<NOT:$<CONFIG:Debug>>:-O2>
+        $<$<NOT:$<CONFIG:Debug>>:${PS3RECOMP_RUNTIME_OPT}>
+        ${PS3RECOMP_RUNTIME_EXTRA_FLAGS}
     )
     # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
     # hottest SPU op in lifted audio code. Probed rather than assumed: recent
